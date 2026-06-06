@@ -1,0 +1,53 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Env / config (do not commit secrets)
+.env
+.env.local
+configs/config.yaml
+configs/config.local.yaml
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+data/
+storage/
+
+# Logs
+*.log
+logs/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage.out
+coverage.html
+
+# Build cache
+.cache/
+
+# openspec archive (keep proposals, not archive)
+/openspec/changes/archive/

@@ -1,0 +1,22 @@
+# huan-agent configuration template
+# Copy to config.yaml and adjust as needed.
+#
+# Environment variable override:
+#   HUAN_SERVER_HOST=0.0.0.0
+#   HUAN_SERVER_PORT=9000
+#   HUAN_LOGGING_LEVEL=debug
+#   HUAN_LOGGING_FORMAT=json
+
+server:
+  host: "127.0.0.1"
+  port: 8080
+
+logging:
+  level: "info"      # debug | info | warn | error
+  format: "console"  # console | json
+
+# LLM section is a placeholder for Phase 1.
+# Will be expanded with: default_provider, providers map (deepseek, qwen, glm, openai, ollama)
+llm:
+  default_provider: ""
+  providers: {}
