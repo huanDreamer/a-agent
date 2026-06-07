@@ -23,6 +23,9 @@ func TestDefault(t *testing.T) {
 	if c.Logging.Format != "console" {
 		t.Errorf("default logging.format = %q, want console", c.Logging.Format)
 	}
+	if c.Database.Path == "" {
+		t.Error("default database.path should not be empty")
+	}
 }
 
 func TestLoad_DefaultsWhenNoFile(t *testing.T) {

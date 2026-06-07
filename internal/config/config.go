@@ -17,9 +17,15 @@ const EnvPrefix = "HUAN"
 
 // Config is the root configuration tree.
 type Config struct {
-	Server  ServerConfig  `mapstructure:"server" json:"server"`
-	Logging LoggingConfig `mapstructure:"logging" json:"logging"`
-	LLM     LLMConfig     `mapstructure:"llm" json:"llm"`
+	Server   ServerConfig   `mapstructure:"server" json:"server"`
+	Logging  LoggingConfig  `mapstructure:"logging" json:"logging"`
+	LLM      LLMConfig      `mapstructure:"llm" json:"llm"`
+	Database DatabaseConfig `mapstructure:"database" json:"database"`
+}
+
+// DatabaseConfig configures the SQLite database.
+type DatabaseConfig struct {
+	Path string `mapstructure:"path" json:"path"`
 }
 
 // ServerConfig controls the admin HTTP server (placeholder for Phase 5).
@@ -61,6 +67,9 @@ func Default() *Config {
 		LLM: LLMConfig{
 			DefaultProvider: "",
 			Providers:       map[string]LLMProvider{},
+		},
+		Database: DatabaseConfig{
+			Path: "./data/huan-agent.db",
 		},
 	}
 }
@@ -129,4 +138,5 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "console")
+	v.SetDefault("database.path", "./data/huan-agent.db")
 }

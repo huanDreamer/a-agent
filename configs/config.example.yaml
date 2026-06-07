@@ -6,6 +6,9 @@
 #   HUAN_SERVER_PORT=9000
 #   HUAN_LOGGING_LEVEL=debug
 #   HUAN_LOGGING_FORMAT=json
+#   HUAN_LLM_DEFAULT_PROVIDER=qwen
+#   HUAN_LLM_PROVIDERS_DEEPSEEK_API_KEY=sk-...
+#   HUAN_DATABASE_PATH=./data/huan-agent.db
 
 server:
   host: "127.0.0.1"
@@ -15,8 +18,29 @@ logging:
   level: "info"      # debug | info | warn | error
   format: "console"  # console | json
 
-# LLM section is a placeholder for Phase 1.
-# Will be expanded with: default_provider, providers map (deepseek, qwen, glm, openai, ollama)
+database:
+  path: "./data/huan-agent.db"
+
+# LLM providers (OpenAI-compatible protocol).
+# base_url and model default to the built-in tables when omitted (see
+# internal/llm/registry.go). api_key can be empty for local providers like
+# ollama. Set default_provider to pick one for `huan-agent chat`.
 llm:
-  default_provider: ""
-  providers: {}
+  default_provider: "deepseek"
+  providers:
+    deepseek:
+      api_key: ""    # set via env: HUAN_LLM_PROVIDERS_DEEPSEEK_API_KEY
+      # base_url defaults to https://api.deepseek.com/v1
+      # model defaults to deepseek-chat
+    qwen:
+      api_key: ""
+      # base_url defaults to https://dashscope.aliyuncs.com/compatible-mode/v1
+      # model defaults to qwen-plus
+    glm:
+      api_key: ""
+    openai:
+      api_key: ""
+    ollama:
+      api_key: ""    # ollama ignores api_key but the field is required by config schema
+      base_url: "http://localhost:11434/v1"
+      model: "llama3.2"
