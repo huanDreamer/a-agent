@@ -48,6 +48,3 @@ coverage.html
 
 # Build cache
 .cache/
-
-# openspec archive (keep proposals, not archive)
-/openspec/changes/archive/
