@@ -33,6 +33,23 @@ var migrations = []migration{
 		CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_logs(provider);
 		CREATE INDEX IF NOT EXISTS idx_usage_created  ON usage_logs(created_at);`,
 	},
+	{
+		version: 2,
+		name:    "create_tool_invocations",
+		up: `CREATE TABLE IF NOT EXISTS tool_invocations (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id  TEXT    NOT NULL,
+			tool_name   TEXT    NOT NULL,
+			arguments   TEXT    NOT NULL,
+			result      TEXT    NOT NULL DEFAULT '',
+			err         TEXT    NOT NULL DEFAULT '',
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_inv_session ON tool_invocations(session_id);
+		CREATE INDEX IF NOT EXISTS idx_inv_tool    ON tool_invocations(tool_name);
+		CREATE INDEX IF NOT EXISTS idx_inv_created ON tool_invocations(created_at);`,
+	},
 }
 
 // Migrate applies any pending migrations idempotently.

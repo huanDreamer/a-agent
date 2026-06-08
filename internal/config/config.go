@@ -21,6 +21,9 @@ type Config struct {
 	Logging  LoggingConfig  `mapstructure:"logging" json:"logging"`
 	LLM      LLMConfig      `mapstructure:"llm" json:"llm"`
 	Database DatabaseConfig `mapstructure:"database" json:"database"`
+	Agent    AgentConfig    `mapstructure:"agent" json:"agent"`
+	MCP      MCPConfig      `mapstructure:"mcp" json:"mcp"`
+	Skills   SkillsConfig   `mapstructure:"skills" json:"skills"`
 }
 
 // DatabaseConfig configures the SQLite database.
@@ -53,6 +56,40 @@ type LLMProvider struct {
 	Model   string `mapstructure:"model" json:"model"`
 }
 
+// AgentConfig configures the ReAct agent loop. Empty values fall back
+// to internal defaults at construction time.
+type AgentConfig struct {
+	// MaxSteps caps model→tool→model iterations. 0 means default (12);
+	// the agent package clamps the upper bound to 25.
+	MaxSteps int `mapstructure:"max_steps" json:"max_steps"`
+	// AllowedTools optionally restricts the registry to a subset. When
+	// empty, all registered tools are exposed to the LLM.
+	AllowedTools []string `mapstructure:"allowed_tools" json:"allowed_tools"`
+}
+
+// MCPConfig groups the MCP servers the agent should spawn at startup.
+// Each entry mirrors mcp.ServerSpec; the package-level Servers list is
+// keyed by display name for YAML readability.
+type MCPConfig struct {
+	Servers []MCPServer `mapstructure:"servers" json:"servers"`
+}
+
+// MCPServer describes a single stdio MCP server. Env entries follow
+// the "KEY=value" shape and are merged onto os.Environ() at spawn.
+type MCPServer struct {
+	Name    string   `mapstructure:"name" json:"name"`
+	Command string   `mapstructure:"command" json:"command"`
+	Args    []string `mapstructure:"args" json:"args"`
+	Env     []string `mapstructure:"env" json:"env"`
+}
+
+// SkillsConfig configures the on-disk skill loader.
+type SkillsConfig struct {
+	// Dir is the directory scanned for *.md skill files. Empty disables
+	// skill loading entirely.
+	Dir string `mapstructure:"dir" json:"dir"`
+}
+
 // Default returns the default configuration.
 func Default() *Config {
 	return &Config{
@@ -70,6 +107,15 @@ func Default() *Config {
 		},
 		Database: DatabaseConfig{
 			Path: "./data/huan-agent.db",
+		},
+		Agent: AgentConfig{
+			MaxSteps: 12,
+		},
+		MCP: MCPConfig{
+			Servers: nil,
+		},
+		Skills: SkillsConfig{
+			Dir: "./configs/skills",
 		},
 	}
 }
@@ -139,4 +185,6 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "console")
 	v.SetDefault("database.path", "./data/huan-agent.db")
+	v.SetDefault("agent.max_steps", 12)
+	v.SetDefault("skills.dir", "./configs/skills")
 }

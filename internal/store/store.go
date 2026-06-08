@@ -22,6 +22,10 @@ type Store interface {
 	RecordUsage(ctx context.Context, e UsageEvent) error
 	QueryUsage(ctx context.Context, f UsageFilter) ([]UsageRecord, error)
 
+	// Tool invocation audit log (Phase 2).
+	RecordInvocation(ctx context.Context, e InvocationEvent) error
+	QueryInvocations(ctx context.Context, f InvocationFilter) ([]InvocationRecord, error)
+
 	// Underlying handle, used sparingly (e.g. health checks).
 	DB() *sql.DB
 }
@@ -54,6 +58,35 @@ type UsageRecord struct {
 type UsageFilter struct {
 	SessionID string
 	Provider  string
+	Limit     int // default 100, max 1000
+}
+
+// InvocationEvent is the input shape for recording a tool call.
+type InvocationEvent struct {
+	SessionID  string
+	ToolName   string
+	Arguments  string
+	Result     string
+	Err        string
+	DurationMs int64
+}
+
+// InvocationRecord is the persisted view of a tool call.
+type InvocationRecord struct {
+	ID         int64
+	SessionID  string
+	ToolName   string
+	Arguments  string
+	Result     string
+	Err        string
+	DurationMs int64
+	CreatedAt  string
+}
+
+// InvocationFilter narrows QueryInvocations results. Zero-value fields are ignored.
+type InvocationFilter struct {
+	SessionID string
+	ToolName  string
 	Limit     int // default 100, max 1000
 }
 

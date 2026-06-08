@@ -19,10 +19,15 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
+	"github.com/huan/huan-agent/internal/agent"
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/llm"
+	"github.com/huan/huan-agent/internal/mcp"
 	"github.com/huan/huan-agent/internal/obs"
+	"github.com/huan/huan-agent/internal/skill"
 	"github.com/huan/huan-agent/internal/store"
+	"github.com/huan/huan-agent/internal/tool"
+	"github.com/huan/huan-agent/internal/tool/builtin"
 	"github.com/huan/huan-agent/internal/usage"
 )
 
@@ -30,9 +35,11 @@ var (
 	chatProvider string
 	chatModel    string
 	chatSystem   string
+	chatTools    bool
+	chatSkill    string
 	chatCmd      = &cobra.Command{
 		Use:   "chat",
-		Short: "Interactive chat REPL with the configured LLM (Phase 1)",
+		Short: "Interactive chat REPL with the configured LLM",
 		Long: `Start an interactive REPL that streams responses from the configured LLM.
 
 Examples:
@@ -45,10 +52,18 @@ Examples:
   # Inject a system prompt
   huan-agent chat --system "You are a helpful assistant. Answer in Chinese."
 
+  # Enable the ReAct agent with built-in tools (time, calc, echo) and MCP tools
+  huan-agent chat --tools
+
+  # Load a skill (markdown + frontmatter) from configs/skills/<name>.md as the
+  # system prompt and tool allow-list
+  huan-agent chat --tools --skill daily-summary
+
 Commands inside the REPL:
   /quit, /exit, Ctrl+D   exit the chat
   /reset                  clear conversation history
   /provider               print current provider/model
+  /tools                  list tools available to the agent (when --tools is on)
 `,
 		RunE: runChat,
 	}
@@ -58,6 +73,8 @@ func init() {
 	chatCmd.Flags().StringVar(&chatProvider, "provider", "", "override default provider")
 	chatCmd.Flags().StringVar(&chatModel, "model", "", "override default model")
 	chatCmd.Flags().StringVar(&chatSystem, "system", "", "system prompt")
+	chatCmd.Flags().BoolVar(&chatTools, "tools", false, "enable the ReAct agent loop with tools (built-in + MCP)")
+	chatCmd.Flags().StringVar(&chatSkill, "skill", "", "load named skill from configs/skills/ as system prompt + tool allow-list (implies --tools)")
 	rootCmd.AddCommand(chatCmd)
 }
 
@@ -114,8 +131,6 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	if chatModel != "" {
-		// Override model on the resolved model: we rebuild it via the
-		// registry to honour the new model name.
 		prov, _ := registry.Provider(chosen)
 		prov.Model = chatModel
 		cm, err = llm.New(prov)
@@ -124,24 +139,74 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	// Resolve skill (loads from cfg.Skills.Dir, errors only if --skill is set).
+	var chosenSkill *skill.Skill
+	if chatSkill != "" {
+		loader := skill.NewLoader(cfg.Skills.Dir)
+		if _, lErr := loader.LoadAll(); lErr != nil {
+			logger.Warn("skill load reported errors", zap.Error(lErr))
+		}
+		s, ok := loader.Get(chatSkill)
+		if !ok {
+			return fmt.Errorf("skill %q not found in %s", chatSkill, cfg.Skills.Dir)
+		}
+		chosenSkill = s
+		chatTools = true // skills imply tool support
+	}
+
+	// Auto-enable tools when MCP servers are configured but the user did not
+	// explicitly opt out.
+	if !chatTools && len(cfg.MCP.Servers) > 0 {
+		chatTools = true
+	}
+
 	sessionID := uuid.NewString()
 	logger.Info("chat session starting",
 		zap.String("session_id", sessionID),
 		zap.String("provider", chosen),
-		zap.String("model", effectiveModel(registry, chosen, chatModel)))
+		zap.String("model", effectiveModel(registry, chosen, chatModel)),
+		zap.Bool("tools", chatTools),
+		zap.String("skill", chatSkill),
+	)
 
-	fmt.Println(banner(chosen, effectiveModel(registry, chosen, chatModel)))
+	fmt.Println(banner(chosen, effectiveModel(registry, chosen, chatModel), chatTools, chatSkill))
 	fmt.Println()
 
 	// Build initial message history.
 	var history []*schema.Message
-	if chatSystem != "" {
+	switch {
+	case chosenSkill != nil:
+		history = append(history, &schema.Message{Role: schema.System, Content: chosenSkill.SystemPrompt()})
+	case chatSystem != "":
 		history = append(history, &schema.Message{Role: schema.System, Content: chatSystem})
 	}
 
 	// Signal handler: cancels the in-flight stream when the user hits Ctrl+C.
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Build the agent if tools are enabled. Tool registry + MCP clients live
+	// for the duration of the REPL.
+	var (
+		ag         *agent.Agent
+		toolReg    *tool.Registry
+		mcpClients []*mcp.Client
+	)
+	if chatTools {
+		ag, toolReg, mcpClients, err = buildAgent(ctx, cm, cfg, chosenSkill, st, logger, sessionID)
+		if err != nil {
+			return fmt.Errorf("build agent: %w", err)
+		}
+		defer func() {
+			for _, c := range mcpClients {
+				_ = c.Close()
+			}
+		}()
+		if names := toolReg.AllowList(); len(names) > 0 {
+			fmt.Println("tools available:", strings.Join(names, ", "))
+			fmt.Println()
+		}
+	}
 
 	in := bufio.NewScanner(os.Stdin)
 	in.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -163,29 +228,166 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		case "/quit", "/exit":
 			return nil
 		case "/reset":
-			history = history[:0]
-			if chatSystem != "" {
-				history = append(history, &schema.Message{Role: schema.System, Content: chatSystem})
-			}
+			history = resetHistory(history, chosenSkill, chatSystem)
 			fmt.Println("(conversation reset)")
 			continue
 		case "/provider":
-			fmt.Printf("provider=%s model=%s\n", chosen, effectiveModel(registry, chosen, chatModel))
+			fmt.Printf("provider=%s model=%s tools=%v skill=%s\n",
+				chosen, effectiveModel(registry, chosen, chatModel), chatTools, chatSkill)
+			continue
+		case "/tools":
+			if toolReg == nil {
+				fmt.Println("(tools disabled — restart with --tools to enable)")
+			} else {
+				fmt.Println("tools:", strings.Join(toolReg.AllowList(), ", "))
+			}
 			continue
 		}
 
 		history = append(history, &schema.Message{Role: schema.User, Content: line})
 
-		if err := streamOnce(ctx, cm, registry, chosen, chatModel, history, sessionID, recorder, logger); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			// drop the last user message so the conversation stays sane
-			history = history[:len(history)-1]
-			if errors.Is(err, context.Canceled) {
+		var runErr error
+		if ag != nil {
+			runErr = agentOnce(ctx, ag, &history)
+		} else {
+			runErr = streamOnce(ctx, cm, registry, chosen, chatModel, &history, sessionID, recorder, logger)
+		}
+		if runErr != nil {
+			fmt.Fprintln(os.Stderr, "error:", runErr)
+			history = history[:len(history)-1] // drop user message so context stays sane
+			if errors.Is(runErr, context.Canceled) {
 				return nil
 			}
 		}
 		fmt.Println()
 	}
+}
+
+// buildAgent constructs the tool registry (builtin + MCP), applies the
+// allow-list (skill takes precedence over config), and returns a ready
+// agent.Agent plus the MCP clients to close on exit.
+func buildAgent(
+	ctx context.Context,
+	cm model.BaseChatModel,
+	cfg *config.Config,
+	sk *skill.Skill,
+	st store.Store,
+	logger *zap.Logger,
+	sessionID string,
+) (*agent.Agent, *tool.Registry, []*mcp.Client, error) {
+	tcm, ok := cm.(model.ToolCallingChatModel)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("provider does not support tool calling")
+	}
+
+	reg := tool.NewRegistry()
+	if err := registerBuiltinTools(reg); err != nil {
+		return nil, nil, nil, fmt.Errorf("register builtin tools: %w", err)
+	}
+
+	var clients []*mcp.Client
+	for _, s := range cfg.MCP.Servers {
+		c, err := mcp.Connect(ctx, mcp.ServerSpec{
+			Name:    s.Name,
+			Command: s.Command,
+			Args:    s.Args,
+			Env:     s.Env,
+		})
+		if err != nil {
+			// Roll back on failure: kill the servers we already started.
+			for _, prev := range clients {
+				_ = prev.Close()
+			}
+			return nil, nil, nil, fmt.Errorf("connect mcp %s: %w", s.Name, err)
+		}
+		clients = append(clients, c)
+		n, rErr := mcp.RegisterMCPTools(ctx, reg, c, logger)
+		if rErr != nil {
+			for _, prev := range clients {
+				_ = prev.Close()
+			}
+			return nil, nil, nil, fmt.Errorf("register mcp tools %s: %w", s.Name, rErr)
+		}
+		logger.Info("mcp server connected", zap.String("name", s.Name), zap.Int("tools", n))
+	}
+
+	// Apply allow-list: skill wins, then config, else "allow all".
+	switch {
+	case sk != nil && len(sk.Frontmatter.Tools) > 0:
+		if err := reg.SetAllowList(sk.Frontmatter.Tools); err != nil {
+			for _, c := range clients {
+				_ = c.Close()
+			}
+			return nil, nil, nil, fmt.Errorf("apply skill allow-list: %w", err)
+		}
+	case len(cfg.Agent.AllowedTools) > 0:
+		if err := reg.SetAllowList(cfg.Agent.AllowedTools); err != nil {
+			for _, c := range clients {
+				_ = c.Close()
+			}
+			return nil, nil, nil, fmt.Errorf("apply config allow-list: %w", err)
+		}
+	}
+
+	ag, err := agent.New(ctx, agent.Config{
+		Model:       tcm,
+		Tools:       reg,
+		MaxSteps:    cfg.Agent.MaxSteps,
+		Audit:       st,
+		SessionIDFn: func() string { return sessionID },
+		Logger:      logger,
+	})
+	if err != nil {
+		for _, c := range clients {
+			_ = c.Close()
+		}
+		return nil, nil, nil, err
+	}
+	return ag, reg, clients, nil
+}
+
+func registerBuiltinTools(reg *tool.Registry) error {
+	makers := []func() (tool.Tool, error){
+		func() (tool.Tool, error) { return builtin.NewTimeTool() },
+		func() (tool.Tool, error) { return builtin.NewCalcTool() },
+		func() (tool.Tool, error) { return builtin.NewEchoTool() },
+	}
+	for _, m := range makers {
+		t, err := m()
+		if err != nil {
+			return err
+		}
+		if err := reg.Register(t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func resetHistory(history []*schema.Message, sk *skill.Skill, sys string) []*schema.Message {
+	out := history[:0]
+	switch {
+	case sk != nil:
+		return append(out, &schema.Message{Role: schema.System, Content: sk.SystemPrompt()})
+	case sys != "":
+		return append(out, &schema.Message{Role: schema.System, Content: sys})
+	}
+	return out
+}
+
+func agentOnce(ctx context.Context, ag *agent.Agent, history *[]*schema.Message) error {
+	fmt.Print("ai> ")
+	out, err := ag.Generate(ctx, *history)
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		fmt.Println("(empty response)")
+		return nil
+	}
+	fmt.Println(out.Content)
+	*history = append(*history, out)
+	return nil
 }
 
 func streamOnce(
@@ -194,13 +396,13 @@ func streamOnce(
 	reg *llm.Registry,
 	providerName string,
 	modelOverride string,
-	history []*schema.Message,
+	history *[]*schema.Message,
 	sessionID string,
 	rec *usage.Recorder,
 	logger *zap.Logger,
 ) error {
 	start := time.Now()
-	stream, err := cm.Stream(ctx, history)
+	stream, err := cm.Stream(ctx, *history)
 	if err != nil {
 		return err
 	}
@@ -232,8 +434,7 @@ func streamOnce(
 	}
 	fmt.Println()
 
-	// Append assistant reply to history.
-	history = append(history, &schema.Message{
+	*history = append(*history, &schema.Message{
 		Role:    schema.Assistant,
 		Content: assistant.String(),
 		ResponseMeta: &schema.ResponseMeta{
@@ -241,8 +442,6 @@ func streamOnce(
 		},
 	})
 
-	// We don't always have token counts in streamed responses; emit 0s and let
-	// future phases (or the provider itself) populate them. Recorder tolerates 0s.
 	dur := time.Since(start)
 	recErr := rec.Record(usage.Event{
 		SessionID:  sessionID,
@@ -266,6 +465,14 @@ func effectiveModel(reg *llm.Registry, name, override string) string {
 	return "<unknown>"
 }
 
-func banner(provider, model string) string {
-	return fmt.Sprintf("huan-agent chat (provider=%s model=%s)\nType /quit to exit, /reset to clear, /provider to inspect.", provider, model)
+func banner(provider, modelName string, tools bool, skill string) string {
+	mode := "chat"
+	if tools {
+		mode = "agent"
+	}
+	suffix := ""
+	if skill != "" {
+		suffix = fmt.Sprintf(" skill=%s", skill)
+	}
+	return fmt.Sprintf("huan-agent %s (provider=%s model=%s%s)\nType /quit to exit, /reset to clear, /provider /tools to inspect.", mode, provider, modelName, suffix)
 }

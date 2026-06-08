@@ -9,6 +9,8 @@
 #   HUAN_LLM_DEFAULT_PROVIDER=qwen
 #   HUAN_LLM_PROVIDERS_DEEPSEEK_API_KEY=sk-...
 #   HUAN_DATABASE_PATH=./data/huan-agent.db
+#   HUAN_AGENT_MAX_STEPS=8
+#   HUAN_SKILLS_DIR=./configs/skills
 
 server:
   host: "127.0.0.1"
@@ -44,3 +46,30 @@ llm:
       api_key: ""    # ollama ignores api_key but the field is required by config schema
       base_url: "http://localhost:11434/v1"
       model: "llama3.2"
+
+# Agent (ReAct loop) settings. Used by `huan-agent chat --tools` and by
+# any platform integrations that build an agent.Agent.
+agent:
+  max_steps: 12              # capped to 25 internally
+  # allowed_tools restricts which registered tools the LLM can call.
+  # Empty list (default) = allow every registered tool.
+  # Names must match the tools registered by the agent (built-ins:
+  # time, calc, echo; MCP tools use their server-declared names).
+  allowed_tools: []
+
+# MCP (Model Context Protocol) servers spawned at chat startup. Each
+# server is a separate subprocess. Set `command` to an executable on
+# PATH (or an absolute path); args + env are forwarded as-is.
+mcp:
+  servers: []
+  # Example: filesystem MCP server (uvx-installed)
+  # servers:
+  #   - name: "fs"
+  #     command: "uvx"
+  #     args: ["mcp-server-filesystem", "/home/me/notes"]
+  #     env: []
+
+# Skills (markdown + YAML frontmatter) loaded by `huan-agent chat --skill <name>`.
+skills:
+  dir: "./configs/skills"
+

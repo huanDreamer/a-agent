@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -194,5 +195,51 @@ func TestApplyOptions(t *testing.T) {
 	}
 	if req.MaxTokens != 256 {
 		t.Errorf("max_tokens = %v, want 256", req.MaxTokens)
+	}
+}
+
+func TestWithTools_Immutability(t *testing.T) {
+	base := &openAIModel{provider: Provider{Name: "p", Model: "m"}}
+	ti := &schema.ToolInfo{Name: "echo", Desc: "echoes"}
+	got, err := base.WithTools([]*schema.ToolInfo{ti})
+	if err != nil {
+		t.Fatalf("WithTools: %v", err)
+	}
+	if got == base {
+		t.Error("WithTools must return a new instance, not the receiver")
+	}
+	if len(base.tools) != 0 {
+		t.Errorf("base.tools mutated: %+v", base.tools)
+	}
+}
+
+func TestToOpenAITools(t *testing.T) {
+	specs := []*schema.ToolInfo{
+		{Name: "echo", Desc: "echoes"},
+	}
+	got := toOpenAITools(specs)
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1", len(got))
+	}
+	if got[0].Function.Name != "echo" {
+		t.Errorf("name = %q", got[0].Function.Name)
+	}
+	if got[0].Type != openai.ToolTypeFunction {
+		t.Errorf("type = %q, want function", got[0].Type)
+	}
+
+	// nil specs slice: zero result, no panic
+	if got := toOpenAITools(nil); len(got) != 0 {
+		t.Errorf("nil specs produced %d tools", len(got))
+	}
+
+	// With a real ParamsOneOf, the JSON schema should be non-empty.
+	specs[0].ParamsOneOf = schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+		"text": {Desc: "input", Type: schema.String},
+	})
+	got = toOpenAITools(specs)
+	raw, ok := got[0].Function.Parameters.(json.RawMessage)
+	if !ok || len(raw) == 0 {
+		t.Errorf("expected non-empty json.RawMessage parameters, got %T %v", got[0].Function.Parameters, got[0].Function.Parameters)
 	}
 }

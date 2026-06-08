@@ -44,8 +44,8 @@ func TestOpenAndMigrate(t *testing.T) {
 			name    string
 		}{v, n})
 	}
-	if len(got) != 1 || got[0].version != 1 {
-		t.Errorf("migrations = %+v, want exactly one v1 row", got)
+	if len(got) != 2 || got[0].version != 1 || got[1].version != 2 {
+		t.Errorf("migrations = %+v, want v1 and v2", got)
 	}
 }
 
@@ -155,7 +155,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := rows.Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Errorf("count = %d, want 1", n)
+	if n != 2 {
+		t.Errorf("count = %d, want 2 (v1 + v2)", n)
 	}
 }

@@ -147,3 +147,57 @@ func TestLoad_MissingExplicitPath(t *testing.T) {
 		t.Fatal("Load of missing explicit path should fail")
 	}
 }
+
+func TestLoad_AgentAndMCP(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	yaml := `
+agent:
+  max_steps: 8
+  allowed_tools: ["time", "calc"]
+mcp:
+  servers:
+    - name: "fs"
+      command: "/bin/echo"
+      args: ["hello"]
+      env: ["FOO=bar"]
+skills:
+  dir: "/tmp/skills"
+`
+	if err := os.WriteFile(cfgFile, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Agent.MaxSteps != 8 {
+		t.Errorf("max_steps = %d", c.Agent.MaxSteps)
+	}
+	if len(c.Agent.AllowedTools) != 2 || c.Agent.AllowedTools[0] != "time" {
+		t.Errorf("allowed_tools = %v", c.Agent.AllowedTools)
+	}
+	if len(c.MCP.Servers) != 1 {
+		t.Fatalf("mcp.servers len = %d", len(c.MCP.Servers))
+	}
+	s := c.MCP.Servers[0]
+	if s.Name != "fs" || s.Command != "/bin/echo" || len(s.Args) != 1 || s.Args[0] != "hello" || len(s.Env) != 1 {
+		t.Errorf("mcp.servers[0] = %+v", s)
+	}
+	if c.Skills.Dir != "/tmp/skills" {
+		t.Errorf("skills.dir = %q", c.Skills.Dir)
+	}
+}
+
+func TestDefault_AgentMCPSkills(t *testing.T) {
+	c := Default()
+	if c.Agent.MaxSteps != 12 {
+		t.Errorf("default agent.max_steps = %d, want 12", c.Agent.MaxSteps)
+	}
+	if c.Skills.Dir == "" {
+		t.Error("default skills.dir should not be empty")
+	}
+	if len(c.MCP.Servers) != 0 {
+		t.Errorf("default mcp.servers len = %d, want 0", len(c.MCP.Servers))
+	}
+}

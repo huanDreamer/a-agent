@@ -5,6 +5,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -63,6 +64,45 @@ func New(p Provider) (model.BaseChatModel, error) {
 type openAIModel struct {
 	provider Provider
 	client   *openai.Client
+	tools    []*schema.ToolInfo // bound tools (immutable; use WithTools to derive)
+}
+
+// WithTools returns a copy of m with the given tools bound. It
+// implements model.ToolCallingChatModel so the same model can be
+// reused by the ReAct agent (which calls WithTools per request)
+// without mutating shared state.
+func (m *openAIModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	cp := *m
+	cp.tools = append([]*schema.ToolInfo(nil), tools...)
+	return &cp, nil
+}
+
+// toOpenAITools converts eino ToolInfo into the openai SDK shape used
+// by ChatCompletionRequest.Tools. Parameters are serialized from
+// the eino ParamsOneOf via ToJSONSchema, which handles both
+// struct-derived and raw-JSON-Schema tool definitions.
+func toOpenAITools(specs []*schema.ToolInfo) []openai.Tool {
+	out := make([]openai.Tool, 0, len(specs))
+	for _, s := range specs {
+		var params json.RawMessage
+		if s.ParamsOneOf != nil {
+			js, err := s.ParamsOneOf.ToJSONSchema()
+			if err == nil && js != nil {
+				if b, mErr := json.Marshal(js); mErr == nil {
+					params = b
+				}
+			}
+		}
+		out = append(out, openai.Tool{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        s.Name,
+				Description: s.Desc,
+				Parameters:  params,
+			},
+		})
+	}
+	return out
 }
 
 func (m *openAIModel) toOpenAIMessages(msgs []*schema.Message) []openai.ChatCompletionMessage {
@@ -105,6 +145,9 @@ func (m *openAIModel) Generate(ctx context.Context, msgs []*schema.Message, opts
 		Model:    m.provider.Model,
 		Messages: m.toOpenAIMessages(msgs),
 	}
+	if len(m.tools) > 0 {
+		req.Tools = toOpenAITools(m.tools)
+	}
 	m.applyOptions(&req, opts)
 
 	resp, err := m.client.CreateChatCompletion(ctx, req)
@@ -127,6 +170,9 @@ func (m *openAIModel) Generate(ctx context.Context, msgs []*schema.Message, opts
 			Usage:        toTokenUsage(resp.Usage),
 		},
 	}
+	if len(c.Message.ToolCalls) > 0 {
+		out.ToolCalls = toEinoToolCalls(c.Message.ToolCalls)
+	}
 	return out, nil
 }
 
@@ -136,6 +182,9 @@ func (m *openAIModel) Stream(ctx context.Context, msgs []*schema.Message, opts .
 		Model:    m.provider.Model,
 		Messages: m.toOpenAIMessages(msgs),
 		Stream:   true,
+	}
+	if len(m.tools) > 0 {
+		req.Tools = toOpenAITools(m.tools)
 	}
 	m.applyOptions(&req, opts)
 
@@ -169,6 +218,9 @@ func (m *openAIModel) Stream(ctx context.Context, msgs []*schema.Message, opts .
 				Role:    schema.Assistant,
 				Content: c.Delta.Content,
 			}
+			if len(c.Delta.ToolCalls) > 0 {
+				msg.ToolCalls = toEinoToolCalls(c.Delta.ToolCalls)
+			}
 			if c.FinishReason != "" {
 				msg.ResponseMeta = &schema.ResponseMeta{
 					FinishReason: string(c.FinishReason),
@@ -191,4 +243,25 @@ func toTokenUsage(u openai.Usage) *schema.TokenUsage {
 		CompletionTokens: u.CompletionTokens,
 		TotalTokens:      u.TotalTokens,
 	}
+}
+
+// toEinoToolCalls adapts the streaming delta ToolCalls from go-openai
+// into the eino schema representation. The openai SDK emits one chunk
+// per call index per delta; eino passes each delta through to its
+// own ReAct loop, which is responsible for merging same-index chunks.
+func toEinoToolCalls(deltas []openai.ToolCall) []schema.ToolCall {
+	out := make([]schema.ToolCall, 0, len(deltas))
+	for _, d := range deltas {
+		tc := schema.ToolCall{
+			ID:       d.ID,
+			Type:     string(d.Type),
+			Function: schema.FunctionCall{Name: d.Function.Name, Arguments: d.Function.Arguments},
+		}
+		if d.Index != nil {
+			idx := *d.Index
+			tc.Index = &idx
+		}
+		out = append(out, tc)
+	}
+	return out
 }
