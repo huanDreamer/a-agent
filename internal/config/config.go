@@ -24,6 +24,8 @@ type Config struct {
 	Agent    AgentConfig    `mapstructure:"agent" json:"agent"`
 	MCP      MCPConfig      `mapstructure:"mcp" json:"mcp"`
 	Skills   SkillsConfig   `mapstructure:"skills" json:"skills"`
+	Memory   MemoryConfig   `mapstructure:"memory" json:"memory"`
+	Context  ContextConfig  `mapstructure:"context" json:"context"`
 }
 
 // DatabaseConfig configures the SQLite database.
@@ -90,6 +92,30 @@ type SkillsConfig struct {
 	Dir string `mapstructure:"dir" json:"dir"`
 }
 
+// MemoryConfig configures short/long-term memory.
+type MemoryConfig struct {
+	// Dir is the root directory where long-term memory files (JSONL) are stored.
+	Dir string `mapstructure:"dir" json:"dir"`
+	// Enable turns memory on/off. When false the chat loop keeps no memory.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// MaxTurns is the short-term buffer cap (most recent N turns kept in memory).
+	MaxTurns int `mapstructure:"max_turns" json:"max_turns"`
+}
+
+// ContextConfig configures the LLM context-window budget and compression.
+type ContextConfig struct {
+	// MaxTokens is the hard ceiling for the assembled window. 0 disables
+	// auto-compression.
+	MaxTokens int `mapstructure:"max_tokens" json:"max_tokens"`
+	// KeepRecent is the number of most recent messages retained verbatim
+	// after a compression pass.
+	KeepRecent int `mapstructure:"keep_recent" json:"keep_recent"`
+	// Summarize hooks the LLM itself to summarize the rolled-up older turns.
+	// When true, a summarizer is wired into the agent loop (if a model is
+	// available). Otherwise older turns are dropped with a placeholder.
+	Summarize bool `mapstructure:"summarize" json:"summarize"`
+}
+
 // Default returns the default configuration.
 func Default() *Config {
 	return &Config{
@@ -116,6 +142,16 @@ func Default() *Config {
 		},
 		Skills: SkillsConfig{
 			Dir: "./configs/skills",
+		},
+		Memory: MemoryConfig{
+			Dir:      "./data/memory",
+			Enable:   true,
+			MaxTurns: 20,
+		},
+		Context: ContextConfig{
+			MaxTokens:  0, // 0 = disabled (no auto-compression) by default
+			KeepRecent: 10,
+			Summarize:  true,
 		},
 	}
 }

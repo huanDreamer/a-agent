@@ -25,7 +25,7 @@ go run ./cmd/huan-agent chat
 - 飞书 IM 接入（WebSocket 长连接）
 - 通用 MCP 工具调用
 - Skill 机制（提示词 + 工具组合）
-- 短期 / 长期记忆
+- 短期 / 长期记忆 + 上下文自动压缩（Phase 3）
 - Token 用量统计
 - Web Admin UI
 

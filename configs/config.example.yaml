@@ -73,3 +73,24 @@ mcp:
 skills:
   dir: "./configs/skills"
 
+# Memory (Phase 3): short-term + long-term. Long-term entries are append-only
+# JSONL files under `dir`, one per user/session namespace. Short-term keeps the
+# most recent `max_turns` turns in memory.
+#   HUAN_MEMORY_DIR=./data/memory
+#   HUAN_MEMORY_ENABLE=true
+#   HUAN_MEMORY_MAX_TURNS=20
+memory:
+  dir: "./data/memory"
+  enable: true            # false disables memory in the chat loop
+  max_turns: 20           # short-term buffer cap (most recent N turns)
+
+# Context (Phase 3): token-budget + auto-compression so a long session doesn't
+# blow up the LLM context window.
+#   HUAN_CONTEXT_MAX_TOKENS=8000
+#   HUAN_CONTEXT_KEEP_RECENT=10
+#   HUAN_CONTEXT_SUMMARIZE=true
+context:
+  max_tokens: 0           # 0 = disabled (no auto-compression). Set e.g. 8000 to enable.
+  keep_recent: 10         # messages kept verbatim after a compression pass
+  summarize: true         # use the LLM to summarize rolled-up turns (else drop + placeholder)
+
