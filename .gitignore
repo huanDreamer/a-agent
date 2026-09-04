@@ -1,6 +1,7 @@
 # Binaries
 /bin/
 /dist/
+/huan-agent
 *.exe
 *.dll
 *.so

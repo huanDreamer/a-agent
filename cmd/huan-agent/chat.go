@@ -172,14 +172,16 @@ func runChat(cmd *cobra.Command, _ []string) error {
 	fmt.Println(banner(chosen, effectiveModel(registry, chosen, chatModel), chatTools, chatSkill))
 	fmt.Println()
 
-	// Build initial message history.
-	var history []*schema.Message
-	switch {
-	case chosenSkill != nil:
-		history = append(history, &schema.Message{Role: schema.System, Content: chosenSkill.SystemPrompt()})
-	case chatSystem != "":
-		history = append(history, &schema.Message{Role: schema.System, Content: chatSystem})
+	// Build the system prompt (skill or --system) and wire memory + context.
+	systemPrompt := chatSystem
+	if chosenSkill != nil {
+		systemPrompt = chosenSkill.SystemPrompt()
 	}
+	mem, err := newSessionMemory(cfg, cm, systemPrompt, sessionID, logger)
+	if err != nil {
+		return fmt.Errorf("init memory: %w", err)
+	}
+	defer mem.close()
 
 	// Signal handler: cancels the in-flight stream when the user hits Ctrl+C.
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
@@ -224,27 +226,60 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		if line == "" {
 			continue
 		}
-		switch strings.ToLower(line) {
-		case "/quit", "/exit":
+		lower := strings.ToLower(line)
+		switch {
+		case lower == "/quit" || lower == "/exit":
 			return nil
-		case "/reset":
-			history = resetHistory(history, chosenSkill, chatSystem)
+		case lower == "/reset":
+			mem.buffer.Reset()
 			fmt.Println("(conversation reset)")
 			continue
-		case "/provider":
-			fmt.Printf("provider=%s model=%s tools=%v skill=%s\n",
-				chosen, effectiveModel(registry, chosen, chatModel), chatTools, chatSkill)
+		case lower == "/provider":
+			fmt.Printf("provider=%s model=%s tools=%v skill=%s memory=%v\n",
+				chosen, effectiveModel(registry, chosen, chatModel), chatTools, chatSkill, cfg.Memory.Enable)
 			continue
-		case "/tools":
+		case lower == "/tools":
 			if toolReg == nil {
 				fmt.Println("(tools disabled — restart with --tools to enable)")
 			} else {
 				fmt.Println("tools:", strings.Join(toolReg.AllowList(), ", "))
 			}
 			continue
+		case strings.HasPrefix(lower, "/remember "):
+			keyVal := strings.TrimSpace(line[len("/remember "):])
+			if keyVal == "" {
+				fmt.Println("usage: /remember key: value")
+				continue
+			}
+			key, val, ok := strings.Cut(keyVal, ": ")
+			if !ok {
+				key, val = keyVal, keyVal
+			}
+			if err := mem.addFact(key, val); err != nil {
+				fmt.Fprintln(os.Stderr, "remember failed:", err)
+			} else {
+				fmt.Printf("(remembered %q)\n", key)
+			}
+			continue
+		case strings.HasPrefix(lower, "/recall "):
+			facts, _ := mem.recallFacts(strings.TrimSpace(line[len("/recall "):]), 5)
+			if len(facts) == 0 {
+				fmt.Println("(no matching memories)")
+			} else {
+				for _, f := range facts {
+					fmt.Println("- " + f.Content())
+				}
+			}
+			continue
 		}
 
-		history = append(history, &schema.Message{Role: schema.User, Content: line})
+		// Record the user message and assemble (and possibly compress) the window.
+		mem.addUserMessage(line)
+		history, err := mem.history()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "history error:", err)
+			continue
+		}
 
 		var runErr error
 		if ag != nil {
@@ -254,9 +289,16 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		}
 		if runErr != nil {
 			fmt.Fprintln(os.Stderr, "error:", runErr)
-			history = history[:len(history)-1] // drop user message so context stays sane
+			mem.buffer.Reset() // drop the failed user turn so context stays sane
 			if errors.Is(runErr, context.Canceled) {
 				return nil
+			}
+		} else if len(history) > 0 {
+			// The model/agent appended an assistant reply at the end of the
+			// assembled window; sync it into short + long-term memory.
+			last := history[len(history)-1]
+			if last.Role == schema.Assistant {
+				mem.addAssistantMessage(last)
 			}
 		}
 		fmt.Println()
@@ -364,11 +406,7 @@ func registerBuiltinTools(reg *tool.Registry) error {
 	return nil
 }
 
-func resetHistory(history []*schema.Message, sk *skill.Skill, sys string) []*schema.Message {
-	out := history[:0]
-	switch {
-	case sk != nil:
-		return append(out, &schema.Message{Role: schema.System, Content: sk.SystemPrompt()})
+)
 	case sys != "":
 		return append(out, &schema.Message{Role: schema.System, Content: sys})
 	}
