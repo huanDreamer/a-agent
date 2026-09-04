@@ -406,13 +406,6 @@ func registerBuiltinTools(reg *tool.Registry) error {
 	return nil
 }
 
-)
-	case sys != "":
-		return append(out, &schema.Message{Role: schema.System, Content: sys})
-	}
-	return out
-}
-
 func agentOnce(ctx context.Context, ag *agent.Agent, history *[]*schema.Message) error {
 	fmt.Print("ai> ")
 	out, err := ag.Generate(ctx, *history)
