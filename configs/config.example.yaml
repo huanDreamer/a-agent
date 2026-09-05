@@ -90,7 +90,23 @@ memory:
 #   HUAN_CONTEXT_KEEP_RECENT=10
 #   HUAN_CONTEXT_SUMMARIZE=true
 context:
-  max_tokens: 0           # 0 = disabled (no auto-compression). Set e.g. 8000 to enable.
+  max_tokens: 0           # 0 = disabled (no compression). Set e.g. 8000 to enable.
   keep_recent: 10         # messages kept verbatim after a compression pass
   summarize: true         # use the LLM to summarize rolled-up turns (else drop + placeholder)
+
+# Feishu (Lark) IM bot (Phase 4).
+# Enable the bot by filling app_id / app_secret from the Feishu developer
+# console (https://open.feishu.cn -> 开发者后台 -> 凭证与基础信息). Requires
+# the "im:message" scopes and the im.message.receive_v1 event subscription.
+# huan-agent uses the WebSocket long-connection so no public callback URL is
+# needed. Leave app_id empty to keep the bot disabled.
+#   HUAN_FEISHU_APP_ID=cli_xxx
+#   HUAN_FEISHU_APP_SECRET=xxx
+#   HUAN_FEISHU_DOMAIN=https://open.feishu.cn
+feishu:
+  app_id: ""
+  app_secret: ""
+  domain: ""    # empty = Feishu default; use https://open.larksuite.com for Lark
+  verification_token: ""
+  encrypt_key: ""
 

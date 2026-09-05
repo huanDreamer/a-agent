@@ -26,6 +26,7 @@ type Config struct {
 	Skills   SkillsConfig   `mapstructure:"skills" json:"skills"`
 	Memory   MemoryConfig   `mapstructure:"memory" json:"memory"`
 	Context  ContextConfig  `mapstructure:"context" json:"context"`
+	Feishu   FeishuConfig   `mapstructure:"feishu" json:"feishu"`
 }
 
 // DatabaseConfig configures the SQLite database.
@@ -116,6 +117,23 @@ type ContextConfig struct {
 	Summarize bool `mapstructure:"summarize" json:"summarize"`
 }
 
+// FeishuConfig configures the Feishu (Lark) IM bot integration. Leave
+// AppID empty to disable the bot.
+type FeishuConfig struct {
+	// AppID is the Feishu app's client id ("cli_..." from the developer
+	// console). Empty disables the bot.
+	AppID string `mapstructure:"app_id" json:"app_id"`
+	// AppSecret is the Feishu app secret. Never commit real values.
+	AppSecret string `mapstructure:"app_secret" json:"app_secret"`
+	// Domain overrides the Feishu API domain. Empty uses the SDK default
+	// (Feishu). Use "https://open.larksuite.com" for the overseas Lark.
+	Domain string `mapstructure:"domain" json:"domain"`
+	// VerifyToken and EncryptKey are only needed for HTTP event/card
+	// callbacks; WebSocket long-connection does not require them.
+	VerificationToken string `mapstructure:"verification_token" json:"verification_token"`
+	EncryptKey        string `mapstructure:"encrypt_key" json:"encrypt_key"`
+}
+
 // Default returns the default configuration.
 func Default() *Config {
 	return &Config{
@@ -152,6 +170,10 @@ func Default() *Config {
 			MaxTokens:  0, // 0 = disabled (no auto-compression) by default
 			KeepRecent: 10,
 			Summarize:  true,
+		},
+		Feishu: FeishuConfig{
+			AppID:     "", // empty = bot disabled until configured
+			AppSecret: "",
 		},
 	}
 }
@@ -223,4 +245,7 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("database.path", "./data/huan-agent.db")
 	v.SetDefault("agent.max_steps", 12)
 	v.SetDefault("skills.dir", "./configs/skills")
+	v.SetDefault("feishu.app_id", "")
+	v.SetDefault("feishu.app_secret", "")
+	v.SetDefault("feishu.domain", "")
 }
