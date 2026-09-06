@@ -18,14 +18,11 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
-	"github.com/huan/huan-agent/internal/agent"
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/llm"
-	"github.com/huan/huan-agent/internal/mcp"
 	"github.com/huan/huan-agent/internal/obs"
 	"github.com/huan/huan-agent/internal/platform/feishu"
 	"github.com/huan/huan-agent/internal/store"
-	"github.com/huan/huan-agent/internal/tool"
 	"github.com/huan/huan-agent/internal/usage"
 )
 
@@ -68,7 +65,6 @@ type botSession struct {
 	sync.Mutex
 	sid string
 	mem *sessionMemory
-	ag  *agent.Agent
 }
 
 // newBotHandler builds the handler; sender is set by the caller after wiring.
@@ -190,10 +186,6 @@ func (h *botHandler) answer(ctx context.Context, in feishu.Inbound, text string)
 	}
 
 	sess.Lock()
-	if sess.ag == nil {
-		sess.ag = h.buildAgent(in.OpenID, sess.sid)
-	}
-	ag := sess.ag
 	sess.mem.addUserMessage(text)
 	history, err := sess.mem.history()
 	sess.Unlock()
@@ -209,12 +201,14 @@ func (h *botHandler) answer(ctx context.Context, in feishu.Inbound, text string)
 	// messages and clear stale ToolCalls/ToolCallID.
 	history = sanitizeBotHistory(history)
 
+	// Use the plain chat model (no ReAct agent) for the bot conversation. The
+	// ReAct agent manages tool_calls in its own message stream, which DeepSeek
+	// rejects with `missing field tool_call_id` unless every assistant
+	// tool_call has a paired tool result in the same request. For a plain
+	// conversational IM bot we don't need tools, so bypass the agent to keep
+	// the OpenAI-compatible message stream clean.
 	var out *schema.Message
-	if ag != nil {
-		out, err = ag.Generate(ctx, history)
-	} else {
-		out, err = h.cm.Generate(ctx, history)
-	}
+	out, err = h.cm.Generate(ctx, history)
 	if err != nil {
 		h.logger.Error("generate", zap.Error(err))
 		sess.Lock()
@@ -232,54 +226,6 @@ func (h *botHandler) answer(ctx context.Context, in feishu.Inbound, text string)
 	sess.mem.addAssistantMessage(out)
 	sess.Unlock()
 	return h.reply(ctx, in, out.Content)
-}
-
-// buildAgent constructs a per-user ReAct agent (once). If the model does not
-// support tool calling, nil is returned (plain generate is used instead).
-func (h *botHandler) buildAgent(uid, sid string) *agent.Agent {
-	tcm, ok := h.cm.(model.ToolCallingChatModel)
-	if !ok {
-		return nil
-	}
-	reg := tool.NewRegistry()
-	if err := registerBuiltinTools(reg); err != nil {
-		h.logger.Error("register builtin tools", zap.Error(err))
-		return nil
-	}
-	// MCP servers are optional for a session; connection failures are logged.
-	for _, s := range h.cfg.MCP.Servers {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		c, err := mcp.Connect(ctx, mcp.ServerSpec{
-			Name:    s.Name,
-			Command: s.Command,
-			Args:    s.Args,
-			Env:     s.Env,
-		})
-		if err != nil {
-			cancel()
-			h.logger.Error("mcp connect", zap.String("name", s.Name), zap.Error(err))
-			continue
-		}
-		if _, err := mcp.RegisterMCPTools(ctx, reg, c, h.logger); err != nil {
-			h.logger.Error("register mcp tools", zap.String("name", s.Name), zap.Error(err))
-		}
-		cancel()
-	}
-	ag, err := agent.New(context.Background(), agent.Config{
-		Model:       tcm,
-		Tools:       reg,
-		MaxSteps:    h.cfg.Agent.MaxSteps,
-		Recorder:    h.recorder,
-		Audit:       h.st,
-		SessionIDFn: func() string { return sid },
-		Logger:      h.logger,
-	})
-	if err != nil {
-		h.logger.Error("agent new", zap.Error(err))
-		return nil
-	}
-	_ = uid
-	return ag
 }
 
 // systemPrompt returns the default system prompt.
