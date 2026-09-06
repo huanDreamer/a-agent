@@ -60,9 +60,24 @@ func NewApp(cfg Config, handler Handler) (*App, error) {
 	dis := dispatcher.NewEventDispatcher(cfg.VerificationToken, cfg.EncryptKey).
 		OnP2MessageReceiveV1(
 			func(ctx context.Context, ev *im.P2MessageReceiveV1) error {
+				if ev == nil {
+					logger.Warn("feishu: received nil message event")
+					return nil
+				}
 				in := parseInboundMessage(ev)
+				// Always log what we got at info level so a missing reply is
+				// distinguishable from "event never arrived". Include enough
+				// to see whether the payload was parsed (chat/open/type).
+				logger.Info("feishu message received",
+					zap.String("msg_type", in.MsgType),
+					zap.String("open_id", in.OpenID),
+					zap.String("chat_id", in.ChatID),
+					zap.String("chat_type", in.ChatType),
+					zap.Int("text_len", len(in.Text)),
+				)
 				if !in.IsText() {
-					logger.Debug("ignoring non-text message", zap.String("type", in.MsgType))
+					logger.Info("feishu: ignoring non-text message",
+						zap.String("type", in.MsgType))
 					return nil
 				}
 				if err := handler.Handle(ctx, in); err != nil {

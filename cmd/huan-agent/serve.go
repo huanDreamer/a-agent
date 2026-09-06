@@ -87,10 +87,17 @@ func newBotHandler(cfg *config.Config, logger *zap.Logger, cm model.BaseChatMode
 }
 
 func (h *botHandler) Handle(ctx context.Context, in feishu.Inbound) error {
+	// Trim + bound the text for the log so secrets/长文本 don't flood.
+	text := strings.TrimSpace(in.Text)
+	h.logger.Info("bot handler received",
+		zap.String("open_id", in.OpenID),
+		zap.String("chat_id", in.ChatID),
+		zap.String("msg_type", in.MsgType),
+		zap.Int("text_len", len(text)),
+	)
 	if !in.IsText() {
 		return nil
 	}
-	text := strings.TrimSpace(in.Text)
 	if text == "" {
 		return nil
 	}
@@ -194,6 +201,14 @@ func (h *botHandler) answer(ctx context.Context, in feishu.Inbound, text string)
 		return h.reply(ctx, in, "上下文错误: "+err.Error())
 	}
 
+	// Strip any leftover tool-call metadata from the assembled history before
+	// sending to the model. memory can persist an assistant message that still
+	// carries ToolCalls; without a paired tool result the OpenAI/DeepSeek
+	// protocol rejects it with `missing field tool_call_id`. For this
+	// conversational bot we only need the plain text, so drop tool-only
+	// messages and clear stale ToolCalls/ToolCallID.
+	history = sanitizeBotHistory(history)
+
 	var out *schema.Message
 	if ag != nil {
 		out, err = ag.Generate(ctx, history)
@@ -280,7 +295,36 @@ func (h *botHandler) reply(ctx context.Context, in feishu.Inbound, text string) 
 	return h.sender.ReplyText(ctx, in, text)
 }
 
-// runServe is the serve command entrypoint.
+// sanitizeBotHistory removes tool-only message fragments and clears stale
+// tool-call metadata so a conversational model (DeepSeek/OpenAI protocol)
+// does not reject the history with "missing field tool_call_id". It returns a
+// new slice; the input is not mutated.
+func sanitizeBotHistory(history []*schema.Message) []*schema.Message {
+	out := history[:0:0] // fresh backing array
+	for _, m := range history {
+		if m == nil {
+			continue
+		}
+		// Tool result messages have no conversational value here and, if the
+		// matching assistant tool_call is not present, break the protocol.
+		if m.Role == schema.Tool {
+			continue
+		}
+		cp := *m
+		// An assistant message that only announced tool calls carries no
+		// content for this bot; drop it entirely (no paired tool result).
+		if cp.Role == schema.Assistant && len(cp.ToolCalls) > 0 && cp.Content == "" {
+			continue
+		}
+		// Clear leftover tool metadata regardless of role; only plaintext is sent.
+		cp.ToolCalls = nil
+		cp.ToolCallID = ""
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// runServe is the serve entrypoint.
 func runServe(cmd *cobra.Command, _ []string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
