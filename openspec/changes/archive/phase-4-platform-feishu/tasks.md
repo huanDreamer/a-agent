@@ -35,3 +35,12 @@
 - [x] `go vet ./...`
 - [x] `go test ./...`
 - [x] Conventional Commit：`feat(feishu): add Feishu (Lark) IM bot integration via WebSocket`
+- [x] 归档本 phase proposal
+
+## 8. 上线后修复（归档时追加）
+
+- [x] 多飞书应用 + `active` 选择（`feishu.apps` / `FeishuConfig.Resolve`）
+- [x] env 覆盖嵌套 provider map（`HUAN_LLM_PROVIDERS_<NAME>_API_KEY` 生效）
+- [x] bot 改用纯聊天模型（绕开 ReAct agent 的 tool_call_id 协议问题）
+- [x] `sanitizeBotHistory` 清洗历史 tool 碎片 + 接收日志
+- [x] 回归测试（config env-override / sanitizeBotHistory）
