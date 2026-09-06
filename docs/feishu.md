@@ -33,26 +33,42 @@ step is needed to actually talk to the agent.
 
 ## 3. Configure huan-agent
 
-Edit `configs/config.example.yaml` → copy to `configs/config.yaml` and fill:
+Edit `configs/config.example.yaml` → copy to `configs/config.yaml`. Multiple
+Feishu apps are supported (like `llm.providers`); pick the active one with
+`feishu.active`. The legacy single `app_id`/`app_secret` block still works.
 
 ```yaml
 feishu:
-  app_id: "cli_xxxxxxxx"
-  app_secret: "xxxxxxxx"
-  domain: ""            # empty = Feishu; use https://open.larksuite.com for Lark
-  verification_token: ""
-  encrypt_key: ""
+  active: "primary"     # whichever app in `apps` to run
+  apps:
+    primary:
+      app_id: "cli_xxxxxxxx"
+      app_secret: "xxxxxxxx"
+      domain: ""         # empty = Feishu; use https://open.larksuite.com for Lark
+      verification_token: ""
+      encrypt_key: ""
+    secondary:
+      app_id: "cli_yyyyyyyy"
+      app_secret: "yyyyyyyy"
+      domain: "https://open.larksuite.com"   # Lark (international)
+      verification_token: ""
+      encrypt_key: ""
+
+  # Legacy single-app alternative to `apps` + `active`:
+  # app_id: "cli_xxxxxxxx"
+  # app_secret: "xxxxxxxx"
 ```
 
-Or via environment (the Viper prefix is `HUAN`):
+Secrets can also come from environment (Viper prefix `HUAN`, path separator
+`_`):
 
 ```bash
-export HUAN_FEISHU_APP_ID=cli_xxxxxxxx
-export HUAN_FEISHU_APP_SECRET=xxxxxxxx
-export HUAN_FEISHU_APP_ID=...
+export HUAN_FEISHU_ACTIVE=primary
+export HUAN_FEISHU_APPS_PRIMARY_APP_ID=cli_xxxxxxxx
+export HUAN_FEISHU_APPS_PRIMARY_APP_SECRET=xxxxxxxx
 ```
 
-An empty `app_id` keeps the bot disabled.
+If the active app has an empty `app_id`, the bot stays disabled.
 
 ## 4. Run the bot
 

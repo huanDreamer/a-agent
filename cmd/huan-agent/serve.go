@@ -292,8 +292,11 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	}
 	defer func() { _ = logger.Sync() }()
 
-	if cfg.Feishu.AppID == "" {
-		logger.Warn("feishu.app_id is empty; serve has nothing to do. Set feishu.app_id + app_secret (or HUAN_FEISHU_APP_ID/HUAN_FEISHU_APP_SECRET).")
+	// Resolve the active Feishu app (multi-app via feishu.active, or legacy
+	// single app_id/app_secret).
+	fsApp := cfg.Feishu.Resolve()
+	if !cfg.Feishu.Enabled() {
+		logger.Warn("no enabled feishu app; serve has nothing to do. Set feishu.apps.<name> with app_id/app_secret (or feishu.app_id / env HUAN_FEISHU_*).")
 		return nil
 	}
 
@@ -325,7 +328,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	sender, err := feishu.RealSender(cfg.Feishu.AppID, cfg.Feishu.AppSecret, cfg.Feishu.Domain)
+	sender, err := feishu.RealSender(fsApp.AppID, fsApp.AppSecret, fsApp.Domain)
 	if err != nil {
 		return err
 	}
@@ -333,9 +336,9 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	handler.sender = sender
 
 	app, err := feishu.NewApp(feishu.Config{
-		AppID:     cfg.Feishu.AppID,
-		AppSecret: cfg.Feishu.AppSecret,
-		Domain:    cfg.Feishu.Domain,
+		AppID:     fsApp.AppID,
+		AppSecret: fsApp.AppSecret,
+		Domain:    fsApp.Domain,
 		Sender:    sender,
 	}, handler)
 	if err != nil {

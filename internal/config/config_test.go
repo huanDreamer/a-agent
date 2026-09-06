@@ -201,3 +201,58 @@ func TestDefault_AgentMCPSkills(t *testing.T) {
 		t.Errorf("default mcp.servers len = %d, want 0", len(c.MCP.Servers))
 	}
 }
+
+func TestFeishuResolve_ActiveApp(t *testing.T) {
+	c := FeishuConfig{
+		Active: "prod",
+		Apps: map[string]FeishuApp{
+			"dev":  {AppID: "cli_dev", AppSecret: "s_dev"},
+			"prod": {AppID: "cli_prod", AppSecret: "s_prod", Domain: "https://open.larksuite.com"},
+		},
+	}
+	got := c.Resolve()
+	if got.AppID != "cli_prod" || got.AppSecret != "s_prod" {
+		t.Errorf("Resolve(active=prod) = %+v, want prod app", got)
+	}
+	if got.Domain != "https://open.larksuite.com" {
+		t.Errorf("prod domain = %q", got.Domain)
+	}
+	if !c.Enabled() {
+		t.Error("Enabled() should be true for a configured app")
+	}
+}
+
+func TestFeishuResolve_LegacyFlat(t *testing.T) {
+	c := FeishuConfig{AppID: "cli_flat", AppSecret: "s_flat"}
+	if !c.Enabled() {
+		t.Error("legacy flat app should be enabled")
+	}
+	if got := c.Resolve(); got.AppID != "cli_flat" || got.AppSecret != "s_flat" {
+		t.Errorf("legacy Resolve = %+v", got)
+	}
+}
+
+func TestFeishuResolve_FirstWhenUnset(t *testing.T) {
+	c := FeishuConfig{Apps: map[string]FeishuApp{
+		"a": {AppID: "cli_a"},
+		"b": {AppID: "cli_b"},
+	}}
+	if !c.Enabled() {
+		t.Error("should be enabled when apps present")
+	}
+	got := c.Resolve()
+	if got.AppID != "cli_a" && got.AppID != "cli_b" {
+		t.Errorf("expected first of apps, got %+v", got)
+	}
+}
+
+func TestFeishuResolve_Disabled(t *testing.T) {
+	// Empty config -> disabled, zero app.
+	c := FeishuConfig{}
+	if c.Enabled() {
+		t.Error("empty feishu config should be disabled")
+	}
+	if got := c.Resolve(); got.AppID != "" {
+		t.Errorf("empty Resolve = %+v, want zero", got)
+	}
+}

@@ -117,22 +117,71 @@ type ContextConfig struct {
 	Summarize bool `mapstructure:"summarize" json:"summarize"`
 }
 
-// FeishuConfig configures the Feishu (Lark) IM bot integration. Leave
-// AppID empty to disable the bot.
+// FeishuConfig configures the Feishu (Lark) IM bot integration. Multiple
+// apps can be declared under Apps (keyed by name) and the active one picked
+// via Active (mirroring llm.providers / llm.default_provider). The legacy
+// single-app fields (AppID/AppSecret/...) are still honoured when no app is
+// selected. Leave the active app's AppID empty to disable the bot.
 type FeishuConfig struct {
-	// AppID is the Feishu app's client id ("cli_..." from the developer
-	// console). Empty disables the bot.
+	// Active selects which named app from Apps is used. Empty falls back to
+	// the legacy AppID/AppSecret (or the first entry if the legacy fields are
+	// also empty and len(Apps) > 0).
+	Active string `mapstructure:"active" json:"active"`
+	// Apps maps a display name to a Feishu app.
+	Apps map[string]FeishuApp `mapstructure:"apps" json:"apps"`
+
+	// Legacy single-app fields (still honoured when Active is empty).
+	AppID             string `mapstructure:"app_id" json:"app_id"`
+	AppSecret         string `mapstructure:"app_secret" json:"app_secret"`
+	Domain            string `mapstructure:"domain" json:"domain"`
+	VerificationToken string `mapstructure:"verification_token" json:"verification_token"`
+	EncryptKey        string `mapstructure:"encrypt_key" json:"encrypt_key"`
+}
+
+// FeishuApp is a single Feishu application entry.
+type FeishuApp struct {
+	// AppID is the Feishu app's client id ("cli_xxx"). Empty disables it.
 	AppID string `mapstructure:"app_id" json:"app_id"`
 	// AppSecret is the Feishu app secret. Never commit real values.
 	AppSecret string `mapstructure:"app_secret" json:"app_secret"`
-	// Domain overrides the Feishu API domain. Empty uses the SDK default
-	// (Feishu). Use "https://open.larksuite.com" for the overseas Lark.
+	// Domain overrides the Feishu API domain. Empty uses the SDK default.
 	Domain string `mapstructure:"domain" json:"domain"`
 	// VerifyToken and EncryptKey are only needed for HTTP event/card
 	// callbacks; WebSocket long-connection does not require them.
 	VerificationToken string `mapstructure:"verification_token" json:"verification_token"`
 	EncryptKey        string `mapstructure:"encrypt_key" json:"encrypt_key"`
 }
+
+// Resolve returns the active Feishu app. When Active names an entry in Apps it
+// is returned; otherwise it falls back to the legacy single-app fields.
+func (c FeishuConfig) Resolve() FeishuApp {
+	if c.Active != "" {
+		if a, ok := c.Apps[c.Active]; ok {
+			return a
+		}
+	}
+	// Legacy flat fields (or first app if no flat values and Active empty).
+	if a, ok := c.Apps[c.Active]; ok && c.Active != "" {
+		return a
+	}
+	if c.AppID != "" || c.AppSecret != "" {
+		return FeishuApp{
+			AppID:             c.AppID,
+			AppSecret:         c.AppSecret,
+			Domain:            c.Domain,
+			VerificationToken: c.VerificationToken,
+			EncryptKey:        c.EncryptKey,
+		}
+	}
+	// No explicit selection and no flat fields: pick the first entry.
+	for _, a := range c.Apps {
+		return a
+	}
+	return FeishuApp{}
+}
+
+// Enabled reports whether the active Feishu app has an AppID set.
+func (c FeishuConfig) Enabled() bool { return c.Resolve().AppID != "" }
 
 // Default returns the default configuration.
 func Default() *Config {
@@ -172,8 +221,7 @@ func Default() *Config {
 			Summarize:  true,
 		},
 		Feishu: FeishuConfig{
-			AppID:     "", // empty = bot disabled until configured
-			AppSecret: "",
+			Apps: make(map[string]FeishuApp), // empty = bot disabled until configured
 		},
 	}
 }
@@ -245,6 +293,7 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("database.path", "./data/huan-agent.db")
 	v.SetDefault("agent.max_steps", 12)
 	v.SetDefault("skills.dir", "./configs/skills")
+	v.SetDefault("feishu.active", "")
 	v.SetDefault("feishu.app_id", "")
 	v.SetDefault("feishu.app_secret", "")
 	v.SetDefault("feishu.domain", "")

@@ -104,9 +104,25 @@ context:
 #   HUAN_FEISHU_APP_SECRET=xxx
 #   HUAN_FEISHU_DOMAIN=https://open.feishu.cn
 feishu:
-  app_id: ""
-  app_secret: ""
-  domain: ""    # empty = Feishu default; use https://open.larksuite.com for Lark
-  verification_token: ""
-  encrypt_key: ""
+  # Multiple apps supported (like llm.providers). `active` picks one by name.
+  # The legacy flat app_id/app_secret block still works when `active` is empty.
+  active: "primary"     # which app in `apps` to run; empty = use app_id/app_secret below, or first `apps` entry
+  apps:
+    primary:
+      app_id: "cli_xxx"
+      app_secret: ""    # NEVER commit real secrets; set via env:
+      # HUAN_FEISHU_APPS_PRIMARY_APP_SECRET=...
+      domain: ""        # empty = Feishu default; use https://open.larksuite.com for Lark
+      verification_token: ""
+      encrypt_key: ""
+    secondary:
+      app_id: "cli_yyy"
+      app_secret: ""
+      domain: "https://open.larksuite.com"   # Lark (international)
+      verification_token: ""
+      encrypt_key: ""
+  # Legacy single-app form (alternative to `apps` + `active`):
+  # app_id: "cli_xxx"
+  # app_secret: ""
+  # domain: ""
 
