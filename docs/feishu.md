@@ -19,13 +19,20 @@ step is needed to actually talk to the agent.
    messages:
    - `im:message` (read)
    - `im:message:send_as_bot` (send as the bot)
-   - `im:message.p2p_msg:readonly` (optional, for richer event payloads)
+   - `im:message.p2p_msg:readonly` — **required** to receive private-chat
+     messages. Without it the WebSocket connects but `im.message.receive_v1`
+     events for p2p chats are never delivered (the most common "connected but
+     nothing arrives" cause).
 2. **事件与回调 / Events** — subscribe to the event:
    - `im.message.receive_v1` (`接收消息`)
    - Request URL: **URL verification is NOT needed** — the WebSocket
      long-connection mode pushes events directly, so leave the callback URL empty.
-3. Publish a version of the app (**版本管理与发布 → 创建版本 → 申请发布/刷新**) so the
-   permissions take effect.
+   - If you set an **加解密密钥 (Encrypt Key)** here, it must match
+     `encrypt_key` in config, or events fail decryption and are silently dropped.
+3. **发布应用**: every permission/scope/event change requires creating a new
+   version and publishing it (**版本管理与发布 → 创建版本 → 申请发布/刷新**). An app
+   that is built but not republished after adding scopes will keep running with
+   the old permissions.
 
 > On the overseas **Lark** platform the endpoints/domain differ. Set
 > `feishu.domain: "https://open.larksuite.com"` (and use the Lark console) in that
@@ -70,6 +77,12 @@ export HUAN_FEISHU_APPS_PRIMARY_APP_SECRET=xxxxxxxx
 
 If the active app has an empty `app_id`, the bot stays disabled.
 
+> **Env vs file (LLM keys)** — for nested `llm.providers.*`, a non-empty env
+> value always wins over an empty YAML value, so you can keep secrets purely in
+> the environment (e.g. `HUAN_LLM_PROVIDERS_DEEPSEEK_API_KEY`) and leave
+> `api_key: ""` in the file. `configs/config.yaml` is gitignored, so real
+> secrets should never be committed.
+
 ## 4. Run the bot
 
 ```bash
@@ -96,9 +109,25 @@ Supported in-chat commands:
 
 ## Troubleshooting
 
-- **No messages arrive** — ensure `im.message.receive_v1` is subscribed and the app
-  is **published**; grant the bot the required scopes, and make sure you are
-  messaging the bot in a **single (p2p) chat**, not a group.
+- **No messages arrive even though connected** — the WebSocket reports
+  `connected to wss://...` but events never reach the handler. Check, in order:
+  1. `im:message.p2p_msg:readonly` is granted and the app **republished**.
+  2. `im.message.receive_v1` is subscribed (WebSocket mode, no callback URL).
+  3. You are messaging the bot in a **single (p2p) chat**, not a group
+     (groups need `im:message.group_msg:readonly` + `@` the bot).
+  4. No Encrypt Key mismatch (see §2).
+  5. There is only **one** serve process — running two instances on the same
+     app splits the single connection, so events appear to go nowhere.
+- **`missing field tool_call_id` (HTTP 400)** — a stale assistant `tool_call`
+  without a matching tool result was sent to the model. The bot now strips these
+  via `sanitizeBotHistory` and uses a plain chat model, so this should not recur.
+- **401 `Authentication Fails (governor)`** — the LLM API key is wrong, empty, or
+  not reaching the code. Set it in config *or* as
+  `HUAN_LLM_PROVIDERS_<NAME>_API_KEY` (e.g. `HUAN_LLM_PROVIDERS_DEEPSEEK_API_KEY`);
+  env now overrides an empty YAML value (see §3).
+- **Event arrives but no reply** — enable `HUAN_LOGGING_LEVEL=debug` to see
+  `feishu message received` + `bot handler received`; a line in the log for every
+  inbound message tells you whether the event reached the handler.
 - **Send fails with scope error** — re-add `im:message:send_as_bot` and re-publish.
 - **Domain/endpoint** — on Lark (international), set `feishu.domain =
   https://open.larksuite.com`.
