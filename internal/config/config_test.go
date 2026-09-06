@@ -256,3 +256,44 @@ func TestFeishuResolve_Disabled(t *testing.T) {
 		t.Errorf("empty Resolve = %+v, want zero", got)
 	}
 }
+
+func TestLoad_EnvOverridesNestedProviderMap(t *testing.T) {
+	// Regression: Viper's Unmarshal copies nested map values (llm.providers.*)
+	// straight from the file, bypassing AutomaticEnv. A provider declared with
+	// an empty api_key in YAML must still pick up the env override.
+	const key = "HUAN_LLM_PROVIDERS_DEEPSEEK_API_KEY"
+	old, ok := os.LookupEnv(key)
+	if ok {
+		t.Cleanup(func() { _ = os.Setenv(key, old) })
+	} else {
+		t.Cleanup(func() { _ = os.Unsetenv(key) })
+	}
+	_ = os.Setenv(key, "sk-env-secret")
+
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	yaml := `
+server:
+  port: 9099
+llm:
+  default_provider: "deepseek"
+  providers:
+    deepseek:
+      api_key: ""          # empty in YAML -> env should fill it
+      base_url: ""
+    qwen:
+      api_key: ""
+`
+	if err := os.WriteFile(cfgFile, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	c, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	p := c.LLM.Providers["deepseek"]
+	if p.APIKey != "sk-env-secret" {
+		t.Errorf("deepseek api_key = %q, want env value sk-env-secret (nested map env override failed)", p.APIKey)
+	}
+}

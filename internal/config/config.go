@@ -281,6 +281,28 @@ func Load(explicitPath string) (*Config, error) {
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
+
+	// Viper's Unmarshal copies nested map entries straight from the config
+	// file, so a provider's env override (e.g. HUAN_LLM_PROVIDERS_DEEPSEEK_API_KEY)
+	// is NOT applied to map contents here. Re-read each provider field via
+	// GetString, which does consult AutomaticEnv, so a non-empty env value
+	// wins even when the YAML field is empty.
+	for name, p := range cfg.LLM.Providers {
+		// Apply env override to api_key / base_url / model when the config
+		// file value is empty (or the field is absent). GetString consults
+		// AutomaticEnv, so a non-empty env var wins over an empty YAML value.
+		if s := v.GetString("llm.providers." + name + ".api_key"); s != "" {
+			p.APIKey = s
+		}
+		if s := v.GetString("llm.providers." + name + ".base_url"); s != "" {
+			p.BaseURL = s
+		}
+		if s := v.GetString("llm.providers." + name + ".model"); s != "" {
+			p.Model = s
+		}
+		cfg.LLM.Providers[name] = p
+	}
+
 	return cfg, nil
 }
 
