@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Local Vite output (NOT the embedded bundle).
+# The bundle embedded into the Go binary lives in
+# internal/server/webui/dist and MUST be committed.
+dist/
+
+# Local caches / logs / editor droppings
+.vite/
+*.log
+.DS_Store
