@@ -147,14 +147,20 @@ function cancelTitle() {
   titleDraft.value = ''
 }
 
-async function onClear(confirmed = true) {
+/**
+ * 清空 is two-step, and the two steps are separate functions so neither can be
+ * reached by accident: `armClear` asks, `runClear` performs. An earlier single
+ * boolean parameter defaulted to "perform", which let the toolbar button clear
+ * a conversation outright and made the confirmation unreachable.
+ */
+function armClear() {
   if (!session.value) return
-  if (confirmed && !confirmClear.value) {
-    // Two-step: the first click only asks.
-    confirmClear.value = true
-    return
-  }
+  confirmClear.value = true
+}
+
+async function runClear() {
   confirmClear.value = false
+  if (!session.value) return
   await clearSession(session.value.id)
 }
 
@@ -302,14 +308,14 @@ onMounted(() => {
         <span class="spacer" />
 
         <template v-if="!confirmClear">
-          <button type="button" class="btn ghost sm" title="清空该对话的消息" @click="onClear(false)">
+          <button type="button" class="btn ghost sm" title="清空该对话的消息" @click="armClear()">
             <Icon name="eraser" :size="15" />
             清空
           </button>
         </template>
         <template v-else>
           <span class="dimmer nowrap">确认清空？</span>
-          <button type="button" class="btn sm danger" @click="onClear(true)">清空</button>
+          <button type="button" class="btn sm danger" @click="runClear()">清空</button>
           <button type="button" class="btn sm ghost" @click="confirmClear = false">取消</button>
         </template>
       </header>

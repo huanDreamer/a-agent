@@ -104,9 +104,24 @@ trace 由服务端代理读取，浏览器不会拿到 Langfuse 的 secret key�
 - **依赖极简**：运行时只有 `vue`，不引入图表库 / CSS 框架 / router / pinia / axios。
   图表全部是手写内联 SVG（`src/components/DailyTrendChart.vue`），状态用 reactive store
   （`src/state.js`），请求用 `fetch`（`src/api.js`）。
-- **暗色主题**：与 `docs/status.html` 保持一致的色板（背景 `#0b0f17`、卡片 `#131a26`、
-  边框 `#243044`、蓝色 `#58a6ff`、绿色 `#3fb950` 等），卡片圆角 14px。
-- **中文界面**，响应式支持到约 380px 宽度；对话框在 900px 以下把会话列表收成抽屉。
+- **主题与设计令牌**：抄自 DeepSeek harness 的 shadcn 风格中性色板，全部用 `oklch`
+  定义在 `src/styles.css` 的 `:root` 里（`--background` / `--foreground` / `--card` /
+  `--muted` / `--muted-foreground` / `--border` / `--ring` / `--destructive` …），
+  `--radius: .625rem`。**样式表里没有任何字面色值**：语义色（`--success` / `--warning` /
+  `--info` / `--accent-purple` 及图表色 `--chart-1..3`）也是令牌，亮/暗各一套。
+- **亮色为默认**：`src/theme.js` 按「localStorage 里的显式选择 → `prefers-color-scheme`
+  → 亮色」解析，并把 `class="dark"` 与 `data-theme` 写到 `<html>`；`styles.css` 同时保留
+  `@media (prefers-color-scheme: dark)` 分支（首屏 / 无 JS 时不闪错主题），显式选择优先。
+  侧边栏右上角提供 跟随系统 / 亮色 / 暗色 三态切换，选择持久化。
+- **图标**：`src/components/Icon.vue` 手写内联 SVG，几何与属性约定（`viewBox="0 0 24 24"`、
+  `fill="none"`、`stroke="currentColor"`、`stroke-width="2"`、圆角端点/连接）跟随
+  Lucide —— 也就是 harness 使用的那套图标；不引入任何图标库。
+- **中文界面**，响应式支持到约 380px 宽度。
+- **布局：对话优先、满屏高**：整壳高 `100svh`（回退 `100vh`），只有内部面板滚动。
+  左侧 264px 侧边栏承载品牌、provider/model、主题切换、会话列表、管理页导航与账号操作；
+  900px 以下侧边栏变成抽屉，由主区上下文头部的按钮打开。时间范围选择器与「刷新」不再是
+  全局控件，而是只出现在用量类视图（总览 / 按模型 / 按用户 / 调用记录 / 审计日志）各自的
+  工具条里；对话与技能没有，链路追踪用自己的过滤条件。
 - **手写渲染**：助手回答的 markdown 子集（``` 代码块、行内 `code`、**加粗**、换行）由
   `src/markdown.js` 解析成 token，再用文本节点渲染（不使用 `v-html`，模型输出无法注入标记）；
   trace 瀑布流由 `src/components/TraceWaterfall.vue` 用普通 DOM + 百分比定位手写，
@@ -133,9 +148,16 @@ web/
     ├── sse.js                     # SSE 分帧解析（纯函数，可单独测试）
     ├── markdown.js                # markdown 子集解析（代码块 / 行内 code / 加粗）
     ├── chatStore.js               # 对话状态：会话列表、消息、流式一轮的生命周期
-    ├── styles.css                 # 全站样式（暗色主题）
+    ├── theme.js                   # 跟随系统 / 亮色 / 暗色（localStorage + <html> 开关）
+    ├── ui.js                      # 壳层 UI 状态（移动端抽屉）
+    ├── styles.css                 # 全站设计令牌 + 样式（亮/暗两套，无字面色值）
     └── components/
-        ├── AppHeader.vue          # 顶栏：品牌、meta、时间范围、刷新、退出、标签页
+        ├── AppSidebar.vue         # 侧边栏：品牌、主题、新建对话、会话列表、导航、账号
+        ├── ViewHead.vue           # 主区上下文头部（标题 + 该视图的工具条插槽）
+        ├── ViewToolbar.vue        # 用量视图的时间范围 + 刷新
+        ├── DrawerButton.vue       # ≤900px 的抽屉开关（只在窄屏显示）
+        ├── ThemeToggle.vue        # 跟随系统 / 亮色 / 暗色
+        ├── Icon.vue               # 内联图标（Lucide 几何 + 属性约定）
         ├── AsyncBlock.vue         # 骨架屏 / 错误重试 / 空状态
         ├── StatCard.vue           # 汇总卡片
         ├── DailyTrendChart.vue    # 手写 SVG 折线+面积图
@@ -148,8 +170,7 @@ web/
         ├── RecentView.vue         # 调用记录
         ├── AuditView.vue          # 审计日志
         ├── SkillsView.vue         # 技能开关
-        ├── ChatView.vue           # 对话（会话侧栏 + 流式消息区）
-        ├── ChatSidebar.vue        # 会话列表 + 改名 / 清空 / 删除（二次确认）
+        ├── ChatView.vue           # 对话（上下文头部 + 满高消息区 + 固定输入框）
         ├── ChatMessage.vue        # 消息气泡：思考过程 / 工具卡片 / 用量 / 复制
         ├── ChatComposer.vue       # 输入框（Enter 发送、Shift+Enter 换行、停止）
         ├── MarkdownText.vue       # markdown 块级渲染（纯文本节点）
