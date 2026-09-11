@@ -469,7 +469,10 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	}
 	providers := make(map[string]llm.Provider, len(cfg.LLM.Providers))
 	for name, p := range cfg.LLM.Providers {
-		providers[name] = llm.Provider{Name: name, BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model}
+		providers[name] = llm.Provider{
+			Name: name, BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model,
+			DisableUsageRequest: p.DisableUsageRequest,
+		}
 	}
 	reg := llm.NewRegistry(providers, cfg.LLM.DefaultProvider)
 	cm, err := reg.Get(cfg.LLM.DefaultProvider)

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -12,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	einotool "github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/schema"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 
@@ -138,5 +141,112 @@ func requireStatus(t *testing.T, resp *http.Response, want int) {
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(resp.Body)
 		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, want, buf.String())
+	}
+}
+
+// buildOpts configures the shared test server.
+type buildOpts struct {
+	seed func(store.Store)
+	chat ChatDeps
+}
+
+// buildServerWith constructs a Server with optional chat wiring.
+func buildServerWith(t *testing.T, opts buildOpts) (*Server, store.Store) {
+	t.Helper()
+
+	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if opts.seed != nil {
+		opts.seed(st)
+	}
+
+	hash, err := HashPassword(adminPassword)
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+
+	srv, err := New(Config{
+		Host:          "127.0.0.1",
+		Port:          0,
+		MetricsEnable: true,
+		Version:       "test-version",
+		Provider:      "deepseek",
+		Model:         "deepseek-chat",
+		ChatMaxSteps:  4,
+		Chat:          opts.chat,
+		Logger:        zap.NewNop(),
+	}, st, pricing.NewTable(map[string]pricing.Rate{
+		"deepseek/deepseek-chat": {PromptPer1K: 0.001, CompletionPer1K: 0.002},
+	}, pricing.Rate{}), config.AdminConfig{
+		Username:     "admin",
+		PasswordHash: hash,
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	return srv, st
+}
+
+// patchJSON issues a PATCH with a JSON body.
+func (h *harness) patchJSON(t *testing.T, path string, body any) *http.Response {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatalf("encode body: %v", err)
+		}
+	}
+	req, err := http.NewRequest(http.MethodPatch, h.base+path, &buf)
+	if err != nil {
+		t.Fatalf("new PATCH request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := h.client.Do(req)
+	if err != nil {
+		t.Fatalf("PATCH %s: %v", path, err)
+	}
+	return resp
+}
+
+// deleteJSON issues a DELETE.
+func (h *harness) deleteJSON(t *testing.T, path string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodDelete, h.base+path, nil)
+	if err != nil {
+		t.Fatalf("new DELETE request: %v", err)
+	}
+	resp, err := h.client.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE %s: %v", path, err)
+	}
+	return resp
+}
+
+// stubTool is a minimal tool.Tool for the chat tests.
+type stubTool struct {
+	name string
+	desc string
+	run  func(ctx context.Context, args string) (string, error)
+}
+
+// Info implements tool.Tool.
+func (s *stubTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{Name: s.name, Desc: s.desc}, nil
+}
+
+// InvokableRun implements tool.Tool.
+func (s *stubTool) InvokableRun(ctx context.Context, args string, _ ...einotool.Option) (string, error) {
+	return s.run(ctx, args)
+}
+
+// decode unmarshals a response body and closes it.
+func decode(t *testing.T, resp *http.Response, v any) {
+	t.Helper()
+	defer func() { _ = resp.Body.Close() }()
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		t.Fatalf("decode response: %v", err)
 	}
 }

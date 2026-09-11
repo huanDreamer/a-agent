@@ -9,19 +9,88 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
+	"golang.org/x/term"
 
+	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/config"
+	"github.com/huan/huan-agent/internal/langfuse"
+	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/metrics"
 	"github.com/huan/huan-agent/internal/obs"
 	"github.com/huan/huan-agent/internal/pricing"
 	"github.com/huan/huan-agent/internal/server"
 	"github.com/huan/huan-agent/internal/store"
+	"github.com/huan/huan-agent/internal/tool"
 	"github.com/huan/huan-agent/internal/version"
-	"golang.org/x/term"
 )
+
+// buildChatDeps assembles the web-chat wiring: a model registry, the built-in
+// tools and a runner bound to the default model. Per-session model choices are
+// resolved later by the server through the model builder.
+func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
+	logger *zap.Logger) server.ChatDeps {
+
+	if !cfg.Chat.Enable {
+		logger.Info("web chat disabled (chat.enable = false)")
+		return server.ChatDeps{}
+	}
+	if cfg.LLM.DefaultProvider == "" {
+		logger.Warn("web chat disabled: no llm.default_provider configured")
+		return server.ChatDeps{}
+	}
+
+	providers := make(map[string]llm.Provider, len(cfg.LLM.Providers))
+	for name, p := range cfg.LLM.Providers {
+		providers[name] = llm.Provider{
+			Name: name, BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model,
+			DisableUsageRequest: p.DisableUsageRequest,
+		}
+	}
+	reg := llm.NewRegistry(providers, cfg.LLM.DefaultProvider)
+	cm, err := reg.Get(cfg.LLM.DefaultProvider)
+	if err != nil {
+		logger.Warn("web chat disabled: cannot build the default model", zap.Error(err))
+		return server.ChatDeps{}
+	}
+
+	// Tools are shared with the chat REPL so the web UI can do what the CLI can.
+	registry := tool.NewRegistry()
+	if err := registerBuiltinTools(registry); err != nil {
+		logger.Warn("web chat: builtin tools unavailable", zap.Error(err))
+	}
+
+	maxSteps := cfg.Chat.MaxSteps
+	if maxSteps <= 0 {
+		maxSteps = chat.DefaultMaxSteps
+	}
+	runner, err := chat.New(chat.Config{
+		Model:    cm,
+		Tools:    registry,
+		Tracer:   tracer,
+		MaxSteps: maxSteps,
+		Logger:   logger,
+	})
+	if err != nil {
+		logger.Warn("web chat disabled: cannot build the runner", zap.Error(err))
+		return server.ChatDeps{}
+	}
+
+	logger.Info("web chat enabled",
+		zap.String("provider", cfg.LLM.DefaultProvider),
+		zap.Int("tools", len(registry.Names())),
+		zap.Int("max_steps", maxSteps),
+	)
+	return server.ChatDeps{
+		Runner:       runner,
+		Builder:      server.NewModelBuilder(reg),
+		Tools:        registry,
+		SystemPrompt: cfg.Chat.SystemPrompt,
+	}
+}
 
 var (
 	adminCmd = &cobra.Command{
@@ -94,20 +163,52 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	// Always publish build info so /metrics is never empty on a fresh process.
 	m.SetBuildInfo(version.String())
 
+	// Tracing is optional and must never stop the admin server from running.
+	lf := langfuse.New(langfuse.Config{
+		Host:        cfg.Langfuse.Host,
+		PublicKey:   cfg.Langfuse.PublicKey,
+		SecretKey:   cfg.Langfuse.SecretKey,
+		Environment: cfg.Langfuse.Environment,
+		Release:     cfg.Langfuse.Release,
+	}, logger)
+	if !cfg.Langfuse.Enable {
+		lf = langfuse.New(langfuse.Config{}, logger) // explicitly disabled
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = lf.Close(closeCtx)
+	}()
+	if lf.Enabled() {
+		logger.Info("langfuse tracing enabled", zap.String("host", cfg.Langfuse.Host))
+	} else if cfg.Langfuse.Enable {
+		logger.Warn("langfuse.enable is set but the host or API keys are missing; tracing stays off")
+	}
+	tracer := langfuse.NewTracer(lf)
+
+	// The chat feature needs a model registry and a tool set.
+	chatDeps := buildChatDeps(cfg, tracer, st, logger)
+
 	srv, err := server.New(server.Config{
-		Host:          cfg.Server.Host,
-		Port:          cfg.Server.Port,
-		SessionTTL:    cfg.Server.SessionTTL(),
-		MetricsPath:   cfg.Server.MetricsPath,
-		MetricsEnable: cfg.Server.MetricsEnable,
-		Metrics:       m,
-		Version:       version.String(),
-		Provider:      cfg.LLM.DefaultProvider,
-		Model:         adminDisplayModel(cfg),
-		FeishuEnabled: cfg.Feishu.Enabled(),
-		SkillsDir:     cfg.Skills.Dir,
-		StatePath:     server.StatePathFor(cfg.Database.Path),
-		Logger:        logger,
+		Host:             cfg.Server.Host,
+		Port:             cfg.Server.Port,
+		SessionTTL:       cfg.Server.SessionTTL(),
+		MetricsPath:      cfg.Server.MetricsPath,
+		MetricsEnable:    cfg.Server.MetricsEnable,
+		Metrics:          m,
+		Version:          version.String(),
+		Provider:         cfg.LLM.DefaultProvider,
+		Model:            adminDisplayModel(cfg),
+		FeishuEnabled:    cfg.Feishu.Enabled(),
+		SkillsDir:        cfg.Skills.Dir,
+		StatePath:        server.StatePathFor(cfg.Database.Path),
+		ChatMaxSteps:     cfg.Chat.MaxSteps,
+		ChatHistoryLimit: cfg.Chat.HistoryLimitOr(),
+		ChatEnable:       cfg.Chat.Enable,
+		Chat:             chatDeps,
+		Tracer:           tracer,
+		Traces:           tracer,
+		Logger:           logger,
 	}, st, pricingTable(cfg), cfg.Admin)
 	if err != nil {
 		return err

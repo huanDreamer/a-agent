@@ -50,6 +50,10 @@ type Config struct {
 	MetricsEnable bool
 	// Metrics may be nil, in which case instrumentation is skipped.
 	Metrics *metrics.Metrics
+	// Tracer receives conversation traces. A nil value disables tracing.
+	Tracer chatTracer
+	// Traces reads traces back for the trace UI. Nil hides the endpoints.
+	Traces TraceReader
 	// Version is reported by /api/health and /api/meta.
 	Version string
 	// Provider and Model are the active LLM target, reported by /api/meta.
@@ -59,6 +63,14 @@ type Config struct {
 	// file recording which of them are disabled.
 	SkillsDir string
 	StatePath string
+	// ChatMaxSteps caps tool iterations per chat turn (0 = default).
+	ChatMaxSteps int
+	// ChatHistoryLimit bounds how many stored messages are replayed.
+	ChatHistoryLimit int
+	// ChatEnable turns the web chat endpoints on.
+	ChatEnable bool
+	// Chat carries the chat wiring. A nil Runner disables the chat endpoints.
+	Chat ChatDeps
 	// FeishuEnabled reports whether the IM bot is configured.
 	FeishuEnabled bool
 	Logger        *zap.Logger
@@ -73,6 +85,12 @@ type Server struct {
 	pricing *pricing.Table
 
 	skillState *skillState
+
+	// chat holds the chat dependencies; Runner == nil disables the feature.
+	chat        ChatDeps
+	tracer      chatTracer
+	traces      TraceReader
+	runnerCache runnerCache
 
 	hertz  *server.Hertz
 	ln     net.Listener
@@ -99,6 +117,9 @@ func New(cfg Config, st store.Store, table *pricing.Table, adminCfg config.Admin
 	if cfg.MetricsPath == "" {
 		cfg.MetricsPath = "/metrics"
 	}
+	if cfg.Tracer == nil {
+		cfg.Tracer = nopTracer{}
+	}
 
 	auth, err := newAuthenticator(adminCfg.Username, adminCfg.PasswordHash, cfg.SessionTTL, logger)
 	if err != nil {
@@ -112,6 +133,9 @@ func New(cfg Config, st store.Store, table *pricing.Table, adminCfg config.Admin
 		auth:       auth,
 		pricing:    table,
 		skillState: newSkillState(cfg.SkillsDir, cfg.StatePath),
+		chat:       cfg.Chat,
+		tracer:     cfg.Tracer,
+		traces:     cfg.Traces,
 		startT:     time.Now(),
 	}
 
@@ -161,6 +185,8 @@ func (s *Server) registerRoutes(h *server.Hertz) {
 	authed.GET("/audit", s.handleAudit)
 	authed.GET("/skills", s.handleSkills)
 	authed.POST("/skills/:name", s.handleSetSkill)
+	s.registerChatRoutes(authed)
+	s.registerTraceRoutes(authed)
 
 	s.registerUI(h)
 }
