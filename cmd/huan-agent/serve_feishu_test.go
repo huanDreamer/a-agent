@@ -19,7 +19,12 @@ type fakeSender struct {
 	updates []sentCard
 	recalls []string
 
-	sendErr   error
+	sendErr error
+	// cardErr fails only card sends, so the plain-text fallback stays testable.
+	cardErr error
+	// cardFailN fails the first N card sends, to exercise the fallback ladder.
+	cardFailN int
+	cardSends int
 	updateErr error
 }
 
@@ -29,10 +34,11 @@ type sentText struct {
 }
 
 type sentCard struct {
-	chatID  string
-	message string
-	title   string
-	body    string
+	chatID   string
+	message  string
+	title    string
+	body     string
+	elements []feishu.CardElement
 }
 
 func (f *fakeSender) ReplyText(_ context.Context, in feishu.Inbound, text string) error {
@@ -60,8 +66,8 @@ func (f *fakeSender) SendText(_ context.Context, chatID, text string) (string, e
 }
 
 func (f *fakeSender) SendCard(_ context.Context, chatID, title, markdown string) (string, error) {
-	if f.sendErr != nil {
-		return "", f.sendErr
+	if err := firstErr(f.sendErr, f.cardErr); err != nil {
+		return "", err
 	}
 	f.cards = append(f.cards, sentCard{chatID: chatID, title: title, body: markdown})
 	return "om_placeholder", nil
@@ -75,9 +81,70 @@ func (f *fakeSender) UpdateCard(_ context.Context, messageID, title, markdown st
 	return nil
 }
 
+func (f *fakeSender) SendCardElements(_ context.Context, chatID, title string, elements []feishu.CardElement) (string, error) {
+	f.cardSends++
+	if f.cardFailN > 0 && f.cardSends <= f.cardFailN {
+		return "", errors.New("platform rejected the card")
+	}
+	if err := firstErr(f.sendErr, f.cardErr); err != nil {
+		return "", err
+	}
+	f.cards = append(f.cards, sentCard{
+		chatID: chatID, title: title, body: renderElements(elements), elements: elements,
+	})
+	return "om_" + itoa(len(f.cards)), nil
+}
+
+func (f *fakeSender) UpdateCardElements(_ context.Context, messageID, title string, elements []feishu.CardElement) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	f.updates = append(f.updates, sentCard{
+		message: messageID, title: title, body: renderElements(elements), elements: elements,
+	})
+	return nil
+}
+
 func (f *fakeSender) Recall(_ context.Context, messageID string) error {
 	f.recalls = append(f.recalls, messageID)
 	return nil
+}
+
+// renderElements flattens card elements into a searchable string so tests can
+// assert on the delivered content.
+func renderElements(els []feishu.CardElement) string {
+	var b strings.Builder
+	for _, el := range els {
+		if el.Text != nil {
+			b.WriteString(el.Text.Content)
+			b.WriteString("\n")
+		}
+		for _, c := range el.Columns {
+			b.WriteString(c.DisplayName)
+			b.WriteString(" ")
+		}
+		for _, row := range el.Rows {
+			for _, v := range row {
+				b.WriteString(v)
+				b.WriteString(" ")
+			}
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// itoa is a tiny local helper to avoid an extra import.
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b []byte
+	for i > 0 {
+		b = append([]byte{byte('0' + i%10)}, b...)
+		i /= 10
+	}
+	return string(b)
 }
 
 // fakeDownloader records downloads and returns a deterministic path.
@@ -189,8 +256,11 @@ func TestFinish_UpdatesPlaceholder(t *testing.T) {
 	if len(s.updates) != 1 {
 		t.Fatalf("updates = %d, want 1", len(s.updates))
 	}
-	if s.updates[0].message != "om_ph" || s.updates[0].body != "the answer" {
-		t.Errorf("unexpected update: %+v", s.updates[0])
+	if s.updates[0].message != "om_ph" {
+		t.Errorf("updated message = %q, want om_ph", s.updates[0].message)
+	}
+	if !strings.Contains(s.updates[0].body, "the answer") {
+		t.Errorf("updated card lost the answer: %q", s.updates[0].body)
 	}
 	if len(s.texts) != 0 || len(s.cards) != 0 {
 		t.Error("finish should update in place, not send another message")
@@ -207,20 +277,38 @@ func TestFinish_FallsBackToNewCardWhenUpdateFails(t *testing.T) {
 	if len(s.cards) != 1 {
 		t.Fatalf("cards = %d, want 1 fallback card", len(s.cards))
 	}
-	if s.cards[0].body != "answer" {
-		t.Errorf("fallback card body = %q, want answer", s.cards[0].body)
+	if !strings.Contains(s.cards[0].body, "answer") {
+		t.Errorf("fallback card body = %q, want it to contain the answer", s.cards[0].body)
 	}
 }
 
-func TestFinish_NoPlaceholderSendsText(t *testing.T) {
+func TestFinish_FallsBackToTextWhenSendFails(t *testing.T) {
+	s := &fakeSender{cardErr: errors.New("cannot create")}
+	h := newTestHandler(s, nil)
+
+	if err := h.finish(context.Background(), feishu.Inbound{ChatID: "oc"}, "", "plain"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if len(s.cards) != 0 {
+		t.Errorf("cards = %d, want 0 when sending cards fails", len(s.cards))
+	}
+	if len(s.texts) != 1 || s.texts[0].text != "plain" {
+		t.Errorf("texts = %+v, want the plain-text fallback to deliver the answer", s.texts)
+	}
+}
+
+func TestFinish_NoPlaceholderSendsCard(t *testing.T) {
 	s := &fakeSender{}
 	h := newTestHandler(s, nil)
 
 	if err := h.finish(context.Background(), feishu.Inbound{ChatID: "oc"}, "", "plain"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
-	if len(s.texts) != 1 || s.texts[0].text != "plain" {
-		t.Errorf("texts = %+v, want a single plain reply", s.texts)
+	if len(s.cards) != 1 {
+		t.Fatalf("cards = %+v, want one card", s.cards)
+	}
+	if !strings.Contains(s.cards[0].body, "plain") {
+		t.Errorf("card body = %q, want it to contain the answer", s.cards[0].body)
 	}
 	if len(s.updates) != 0 {
 		t.Error("no placeholder was sent, so nothing should be updated")
@@ -274,5 +362,143 @@ func TestHandle_HelpCommand(t *testing.T) {
 func TestThinkingPlaceholderConst(t *testing.T) {
 	if !strings.Contains(thinkingPlaceholder, "思考") {
 		t.Errorf("placeholder = %q, want a Chinese thinking hint", thinkingPlaceholder)
+	}
+}
+
+// firstErr returns the first non-nil error.
+func firstErr(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+func TestFinish_SplitsLargeTableAcrossMessages(t *testing.T) {
+	s := &fakeSender{}
+	h := newTestHandler(s, nil)
+
+	// A table long enough to exceed the default per-message row limit.
+	var b strings.Builder
+	b.WriteString("数据如下：\n\n| n | v |\n| --- | --- |")
+	for i := 0; i < 45; i++ {
+		b.WriteString("\n| ")
+		b.WriteString(itoa(i))
+		b.WriteString(" | x |")
+	}
+
+	if err := h.finish(context.Background(), feishu.Inbound{ChatID: "oc"}, "om_ph", b.String()); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	// The placeholder carries the first chunk...
+	if len(s.updates) != 1 {
+		t.Fatalf("updates = %d, want 1 (the placeholder)", len(s.updates))
+	}
+	// ...and the remaining chunks travel as additional messages.
+	if len(s.cards) == 0 {
+		t.Fatal("a large table should be split into additional messages")
+	}
+
+	// No row may be lost across the placeholder and the extra messages.
+	seen := map[string]int{}
+	collect := func(els []feishu.CardElement) {
+		for _, el := range els {
+			for _, row := range el.Rows {
+				seen[row["col_0"]]++
+			}
+		}
+	}
+	collect(s.updates[0].elements)
+	for _, c := range s.cards {
+		collect(c.elements)
+	}
+	for i := 0; i < 45; i++ {
+		if seen[itoa(i)] != 1 {
+			t.Errorf("row %d delivered %d times, want exactly 1", i, seen[itoa(i)])
+		}
+	}
+	// The prose must accompany the first chunk.
+	if !strings.Contains(s.updates[0].body, "数据如下") {
+		t.Errorf("the first message lost the surrounding prose: %q", s.updates[0].body)
+	}
+}
+
+func TestFinish_SmallTableStaysOneMessage(t *testing.T) {
+	s := &fakeSender{}
+	h := newTestHandler(s, nil)
+
+	md := "| a | b |\n| --- | --- |\n| 1 | 2 |"
+	if err := h.finish(context.Background(), feishu.Inbound{ChatID: "oc"}, "om_ph", md); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if len(s.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(s.updates))
+	}
+	if len(s.cards) != 0 {
+		t.Errorf("cards = %d, want 0 (a small table fits one message)", len(s.cards))
+	}
+	// It must be delivered as a native table element.
+	found := false
+	for _, el := range s.updates[0].elements {
+		if el.Tag == "table" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the table was not rendered natively: %+v", s.updates[0].elements)
+	}
+}
+
+func TestFinish_RetriesWithoutNativeTablesWhenRejected(t *testing.T) {
+	// The platform rejects the first card (the one carrying a native table);
+	// the compat rendering must then be attempted.
+	s := &fakeSender{cardFailN: 1}
+	h := newTestHandler(s, nil)
+
+	md := "| a | b |\n| --- | --- |\n| 1 | 2 |"
+	if err := h.finish(context.Background(), feishu.Inbound{ChatID: "oc"}, "", md); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if len(s.cards) != 1 {
+		t.Fatalf("cards = %d, want 1 successful card after the retry", len(s.cards))
+	}
+	// The delivered card must not contain a native table element.
+	for _, el := range s.cards[0].elements {
+		if el.Tag == "table" {
+			t.Error("the compat fallback must not emit a native table")
+		}
+	}
+	if !strings.Contains(s.cards[0].body, "| a |") {
+		t.Errorf("the table was lost in the compat rendering: %q", s.cards[0].body)
+	}
+}
+
+func TestFinish_PlainTextWhenEveryCardIsRejected(t *testing.T) {
+	s := &fakeSender{cardErr: errors.New("cards unsupported")}
+	h := newTestHandler(s, nil)
+
+	if err := h.finish(context.Background(), feishu.Inbound{ChatID: "oc"}, "", "hello"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if len(s.texts) != 1 || s.texts[0].text != "hello" {
+		t.Errorf("texts = %+v, want the plain-text last resort", s.texts)
+	}
+}
+
+func TestMarkdownToCardMessagesCompat_NoNativeTables(t *testing.T) {
+	md := "说明\n\n| 产品 | 数量 |\n| --- | --- |\n| 甲 | 1 |"
+	msgs := feishu.MarkdownToCardMessagesCompat(md, "T")
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want 1 (compat never splits)", len(msgs))
+	}
+	for _, el := range msgs[0].Elements {
+		if el.Tag == "table" {
+			t.Error("compat mode must not emit native table elements")
+		}
+	}
+	if !strings.Contains(renderElements(msgs[0].Elements), "产品") {
+		t.Error("the table content was lost")
 	}
 }

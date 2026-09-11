@@ -40,6 +40,14 @@ type CardElement struct {
 	Tag      string     `json:"tag"`
 	Text     *CardText  `json:"text,omitempty"`
 	Elements []CardText `json:"elements,omitempty"`
+
+	// Table fields, set when Tag == "table". Feishu's table component takes
+	// its rows as objects keyed by column name rather than as arrays.
+	PageSize    int                 `json:"page_size,omitempty"`
+	RowHeight   string              `json:"row_height,omitempty"`
+	HeaderStyle *TableTextStyle     `json:"header_style,omitempty"`
+	Columns     []TableColumn       `json:"columns,omitempty"`
+	Rows        []map[string]string `json:"rows,omitempty"`
 }
 
 // CardText is a text/media payload inside a card element. Tag is "lark_md" for
@@ -47,6 +55,19 @@ type CardElement struct {
 type CardText struct {
 	Tag     string `json:"tag"`
 	Content string `json:"content"`
+}
+
+// CardMessage is one outbound card. A single markdown answer usually maps to
+// one message; a table too large for one native table maps to several, each
+// carrying its own slice of the table.
+type CardMessage struct {
+	// Title is the card header.
+	Title string
+	// Elements are the card body elements.
+	Elements []CardElement
+	// Continued marks a message that continues a table from the previous
+	// message, so the caller can annotate it.
+	Continued bool
 }
 
 // MarkdownBlock is a chunk of markdown with its kind.
@@ -59,12 +80,117 @@ type MarkdownBlock struct {
 	Language string
 }
 
+// segment is a piece of a text block: either prose or a GFM table.
+type segment struct {
+	// Kind is "text" or "table".
+	Kind string
+	// Content is the raw markdown (prose only).
+	Content string
+	// Table holds the parsed table when Kind == "table".
+	Table *TableData
+}
+
+// segmentBlock splits a text block into prose and table segments, preserving
+// order. Code blocks are never segmented (a pipe inside a fence is not a
+// table).
+func segmentBlock(b MarkdownBlock) []segment {
+	if b.Kind == "code" {
+		return []segment{{Kind: "text", Content: b.Content}}
+	}
+	lines := strings.Split(normalizeNewlines(b.Content), "\n")
+	segs := make([]segment, 0, 2)
+	var prose []string
+
+	flushProse := func() {
+		if len(prose) == 0 {
+			return
+		}
+		text := strings.Trim(strings.Join(prose, "\n"), "\n")
+		if strings.TrimSpace(text) != "" {
+			segs = append(segs, segment{Kind: "text", Content: text})
+		}
+		prose = nil
+	}
+
+	for i := 0; i < len(lines); {
+		if IsTableStart(lines, i) {
+			// Collect the table's lines: the delimiter row plus every
+			// following row, which must all look like table rows.
+			end := i + 2
+			for end < len(lines) {
+				if _, ok := splitTableRow(lines[end]); !ok {
+					break
+				}
+				if strings.TrimSpace(lines[end]) == "" {
+					break
+				}
+				end++
+			}
+			tbl := ParseTable(lines[i:end])
+			if tbl != nil && tbl.ColumnCount() > 0 {
+				flushProse()
+				segs = append(segs, segment{Kind: "table", Table: tbl})
+				i = end
+				continue
+			}
+		}
+		prose = append(prose, lines[i])
+		i++
+	}
+	flushProse()
+
+	if len(segs) == 0 {
+		return []segment{{Kind: "text", Content: b.Content}}
+	}
+	return segs
+}
+
+// tableElementFor renders a table as a native element when it fits, otherwise
+// falls back to a markdown table inside a div so no data is lost.
+func tableElementFor(t *TableData, limits TableLimits) CardElement {
+	if el, err := NativeTableElement(t, limits); err == nil {
+		return el
+	}
+	return CardElement{
+		Tag:  "div",
+		Text: &CardText{Tag: "lark_md", Content: RenderTableAsText(t)},
+	}
+}
+
+// blockElements renders one markdown block into card elements, using native
+// tables where they fit and a markdown-table fallback otherwise.
+func blockElements(b MarkdownBlock, limits TableLimits) []CardElement {
+	if b.Kind == "code" {
+		out := make([]CardElement, 0, 1)
+		for _, part := range cardContentParts(b) {
+			out = append(out, CardElement{Tag: "div", Text: &CardText{Tag: "lark_md", Content: part}})
+		}
+		return out
+	}
+
+	out := make([]CardElement, 0, 2)
+	for _, seg := range segmentBlock(b) {
+		if seg.Kind == "table" {
+			out = append(out, tableElementFor(seg.Table, limits))
+			continue
+		}
+		for _, part := range cardContentParts(MarkdownBlock{Kind: "text", Content: seg.Content}) {
+			out = append(out, CardElement{Tag: "div", Text: &CardText{Tag: "lark_md", Content: part}})
+		}
+	}
+	return out
+}
+
 // MarkdownToCardElements converts a markdown string into Feishu card elements.
 //
 // Every text or code block becomes a div element whose lark_md content is the
 // block's markdown verbatim (code fences are kept intact so Feishu renders
 // them as code), and an hr divider is inserted between consecutive blocks —
 // never before the first or after the last one.
+//
+// GFM tables become native Feishu `table` elements. A table that is too large
+// for a single card falls back to a rendered markdown table here; use
+// MarkdownToCardMessages when the table may be split across messages instead.
 //
 // Elements whose content would exceed MaxCardContentBytes are split into
 // several div elements on line boundaries; oversized code blocks are re-opened
@@ -74,6 +200,12 @@ type MarkdownBlock struct {
 // yields a single div element with empty content, so callers always have
 // something valid to render.
 func MarkdownToCardElements(md string) []CardElement {
+	return MarkdownToCardElementsWithLimits(md, DefaultTableLimits())
+}
+
+// MarkdownToCardElementsWithLimits is MarkdownToCardElements with explicit
+// table limits.
+func MarkdownToCardElementsWithLimits(md string, limits TableLimits) []CardElement {
 	blocks := SplitMarkdownBlocks(md)
 	elements := make([]CardElement, 0, 2*len(blocks))
 	for _, b := range blocks {
@@ -83,17 +215,113 @@ func MarkdownToCardElements(md string) []CardElement {
 		if len(elements) > 0 {
 			elements = append(elements, CardElement{Tag: "hr"})
 		}
-		for _, part := range cardContentParts(b) {
-			elements = append(elements, CardElement{
-				Tag:  "div",
-				Text: &CardText{Tag: "lark_md", Content: part},
-			})
-		}
+		elements = append(elements, blockElements(b, limits)...)
 	}
 	if len(elements) == 0 {
 		return []CardElement{{Tag: "div", Text: &CardText{Tag: "lark_md", Content: ""}}}
 	}
 	return elements
+}
+
+// MarkdownToCardMessages converts markdown into one or more cards.
+//
+// A table wider or longer than the limits is split across several messages —
+// wide tables are chunked into column groups (each repeating the first column
+// as a key) and long tables into row chunks — so every message carries a native
+// table that the platform can actually render. The first message also carries
+// the surrounding prose; continuation messages carry a "（表格续）" marker.
+//
+// When a table cannot be rendered natively at all (a single cell is too long),
+// it degrades to a rendered markdown table inside a div rather than being lost.
+func MarkdownToCardMessages(md string, title string, limits TableLimits) []CardMessage {
+	return markdownToCardMessages(md, title, limits.normalized(), true)
+}
+
+// MarkdownToCardMessagesCompat renders markdown into a single card message
+// using only long-established card features: tables become markdown text
+// instead of native table elements. It is the fallback when the platform
+// rejects a card containing a native table, so a table is never lost to an
+// unsupported component.
+func MarkdownToCardMessagesCompat(md string, title string) []CardMessage {
+	return markdownToCardMessages(md, title, DefaultTableLimits(), false)
+}
+
+// markdownToCardMessages is the shared implementation. When nativeTables is
+// false, tables render as markdown text and the result is always one message.
+func markdownToCardMessages(md string, title string, lim TableLimits, nativeTables bool) []CardMessage {
+	blocks := SplitMarkdownBlocks(md)
+
+	// rendered holds everything for the first message; cont collects the
+	// additional table chunks that must travel as separate messages.
+	var rendered []CardElement
+	var cont []CardElement
+
+	appendBlock := func(b MarkdownBlock) {
+		if strings.TrimSpace(b.Content) == "" {
+			return
+		}
+		if len(rendered) > 0 {
+			rendered = append(rendered, CardElement{Tag: "hr"})
+		}
+		for _, seg := range segmentBlock(b) {
+			if seg.Kind != "table" {
+				for _, part := range cardContentParts(MarkdownBlock{Kind: "text", Content: seg.Content}) {
+					rendered = append(rendered, CardElement{
+						Tag: "div", Text: &CardText{Tag: "lark_md", Content: part},
+					})
+				}
+				continue
+			}
+			if !nativeTables {
+				rendered = append(rendered, CardElement{
+					Tag: "div", Text: &CardText{Tag: "lark_md", Content: RenderTableAsText(seg.Table)},
+				})
+				continue
+			}
+			chunks, err := SplitTableForMessages(seg.Table, lim)
+			if err != nil {
+				// Unrenderable natively: keep it as markdown text.
+				rendered = append(rendered, CardElement{
+					Tag: "div", Text: &CardText{Tag: "lark_md", Content: RenderTableAsText(seg.Table)},
+				})
+				continue
+			}
+			for i, chunk := range chunks {
+				el, err := NativeTableElement(chunk, lim)
+				if err != nil {
+					el = CardElement{
+						Tag: "div", Text: &CardText{Tag: "lark_md", Content: RenderTableAsText(chunk)},
+					}
+				}
+				if i == 0 {
+					rendered = append(rendered, el)
+				} else {
+					if len(cont) > 0 {
+						cont = append(cont, CardElement{Tag: "hr"})
+					}
+					cont = append(cont, el)
+				}
+			}
+		}
+	}
+
+	for _, b := range blocks {
+		appendBlock(b)
+	}
+
+	if len(rendered) == 0 && len(cont) == 0 {
+		rendered = []CardElement{{Tag: "div", Text: &CardText{Tag: "lark_md", Content: ""}}}
+	}
+
+	msgs := []CardMessage{{Title: title, Elements: rendered}}
+	if len(cont) > 0 {
+		msgs = append(msgs, CardMessage{
+			Title:     title,
+			Elements:  append([]CardElement{{Tag: "div", Text: &CardText{Tag: "lark_md", Content: "（表格续）"}}}, cont...),
+			Continued: true,
+		})
+	}
+	return msgs
 }
 
 // cardContentParts returns the lark_md contents to render for a single block,

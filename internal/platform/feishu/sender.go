@@ -119,9 +119,15 @@ type Sender interface {
 	// SendCard sends an interactive card built from markdown to a chat and
 	// returns its message id.
 	SendCard(ctx context.Context, chatID, title, markdown string) (string, error)
+	// SendCardElements sends a card built from pre-rendered elements and returns
+	// its message id. It is what lets a caller deliver a pre-split answer (e.g.
+	// a table chunked across several messages) without re-parsing it.
+	SendCardElements(ctx context.Context, chatID, title string, elements []CardElement) (string, error)
 	// UpdateCard replaces the content of a previously sent card message. It is
 	// how a placeholder ("thinking…") is turned into the final answer.
 	UpdateCard(ctx context.Context, messageID, title, markdown string) error
+	// UpdateCardElements replaces a card's content with pre-rendered elements.
+	UpdateCardElements(ctx context.Context, messageID, title string, elements []CardElement) error
 	// Recall deletes a previously sent message (best effort).
 	Recall(ctx context.Context, messageID string) error
 }
@@ -202,10 +208,22 @@ func buildCard(title, markdown string) (string, error) {
 	if title == "" {
 		title = CardTitleFromMarkdown(markdown, 40)
 	}
+	return buildCardElements(title, MarkdownToCardElements(markdown))
+}
+
+// buildCardElements encodes a card from pre-rendered elements. An empty element
+// list becomes a single empty div so the payload is always renderable, and an
+// empty title omits the header bar rather than rendering a blank one.
+func buildCardElements(title string, elements []CardElement) (string, error) {
+	if len(elements) == 0 {
+		elements = []CardElement{{Tag: "div", Text: &CardText{Tag: "lark_md", Content: ""}}}
+	}
 	card := cardBody{
 		Config:   cardConfig{WideScreenMode: true},
-		Header:   &cardHeader{Title: CardText{Tag: "plain_text", Content: title}},
-		Elements: MarkdownToCardElements(markdown),
+		Elements: elements,
+	}
+	if title != "" {
+		card.Header = &cardHeader{Title: CardText{Tag: "plain_text", Content: title}}
 	}
 	b, err := json.Marshal(card)
 	if err != nil {
@@ -246,19 +264,39 @@ func (s *larkSender) SendCard(ctx context.Context, chatID, title, markdown strin
 	return s.create(ctx, chatID, "chat_id", "interactive", body)
 }
 
-// UpdateCard replaces the content of a previously sent card message.
-func (s *larkSender) UpdateCard(ctx context.Context, messageID, title, markdown string) error {
+// SendCardElements sends a card built from pre-rendered elements.
+func (s *larkSender) SendCardElements(ctx context.Context, chatID, title string, elements []CardElement) (string, error) {
+	if err := s.requireCreate(); err != nil {
+		return "", err
+	}
+	body, err := buildCardElements(title, elements)
+	if err != nil {
+		return "", err
+	}
+	return s.create(ctx, chatID, "chat_id", "interactive", body)
+}
+
+// UpdateCardElements replaces a card's content with pre-rendered elements.
+func (s *larkSender) UpdateCardElements(ctx context.Context, messageID, title string, elements []CardElement) error {
 	if messageID == "" {
 		return fmt.Errorf("feishu: message_id is required to update a card")
 	}
 	if s.patch == nil {
 		return fmt.Errorf("feishu: sender does not support updating cards")
 	}
-	body, err := buildCard(title, markdown)
+	body, err := buildCardElements(title, elements)
 	if err != nil {
 		return err
 	}
 	return s.patch(ctx, messageID, body)
+}
+
+// UpdateCard replaces the content of a previously sent card message.
+func (s *larkSender) UpdateCard(ctx context.Context, messageID, title, markdown string) error {
+	if title == "" {
+		title = CardTitleFromMarkdown(markdown, 40)
+	}
+	return s.UpdateCardElements(ctx, messageID, title, MarkdownToCardElements(markdown))
 }
 
 // Recall deletes a previously sent message.

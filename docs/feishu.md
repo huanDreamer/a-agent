@@ -155,6 +155,29 @@ Replies with markdown (code blocks, lists) are sent as interactive cards so they
 render properly. While the model is generating you will see a
 `🤔 正在思考…` card, which is replaced in place by the answer.
 
+### Tables
+
+A markdown table in an answer is rendered as a **native Feishu table** (aligned
+columns, header row, horizontal alignment taken from the `:--`/`--:` markers).
+
+When a table does not fit one card, it is split across several messages instead
+of being truncated:
+
+- **Too many rows** → chunked, with the header repeated in every chunk.
+- **Too many columns** → chunked into column groups; the first column is
+  repeated in each group so rows stay identifiable.
+- **A single cell that is too long** to render at all → the table degrades to a
+  markdown table inside a text block rather than being lost.
+
+Defaults are 6 columns, 20 rows and 120 characters per cell (see
+`feishu.DefaultTableLimits`). Continuation messages start with `（表格续）`.
+
+If the platform rejects the card (for example when the native table component is
+unavailable for your tenant), delivery automatically retries with a
+maximum-compatibility rendering that turns tables into markdown text, and only
+falls back to a plain-text message if that also fails — so an answer is never
+lost to an unsupported card component.
+
 ## Troubleshooting
 
 - **No messages arrive even though connected** — the WebSocket reports
@@ -185,6 +208,13 @@ render properly. While the model is generating you will see a
   returned by the create call; a `patch message: code=...` warning means Feishu
   refused the update (card too large, or the message was already replaced). The
   bot then sends the answer as a fresh message.
+- **A table arrived as plain markdown text instead of a table** — the native
+  table component was rejected or the table was outside the limits, so the
+  compatibility rendering was used. Look for
+  `delivering the answer card failed; retrying without native tables` in the log
+  and check the table's shape against the limits above.
+- **A long answer arrived as several messages** — expected: that is a table
+  split across messages. The extra messages start with `（表格续）`.
 - **Callback mode returns 403** — the request's `verification_token` does not
   match `feishu.apps.<name>.verification_token`. Copy the token from
   **事件与回调 → 加密策略** in the console.

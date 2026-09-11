@@ -31,6 +31,9 @@ text.
   and path-traversal-safe naming.
 - `internal/platform/feishu/markdown.go`: markdown → Feishu card element
   conversion (code blocks, dividers, chunking, title extraction).
+- `internal/platform/feishu/table.go`: GFM table parsing, native Feishu `table`
+  elements, and splitting a table across messages (row chunks with a repeated
+  header, column groups with a repeated key column).
 - `internal/platform/feishu/resilience.go`: exponential-backoff retry, a
   stdlib token-bucket rate limiter, per-attempt timeout, and permanent-error
   classification.
@@ -41,9 +44,13 @@ text.
 
 ### CHANGED
 
-- `Sender` grows `SendText`, `SendCard`, `UpdateCard`, `Recall`; `ReplyCard`
-  now takes a title so a call site can send a card without one and have it
-  derived from the content.
+- `Sender` grows `SendText`, `SendCard`, `SendCardElements`, `UpdateCard`,
+  `UpdateCardElements`, `Recall`; `ReplyCard` now takes a title so a call site
+  can send a card without one and have it derived from the content.
+- A markdown table renders as a native Feishu table; when it is too large for
+  one card it is delivered as several messages instead of being truncated. If
+  the platform rejects the card, delivery retries with a compatibility
+  rendering (tables as markdown) before falling back to plain text.
 - The create primitive returns the new message id, which is what makes
   placeholder replacement possible.
 - `Transport` is selectable per app (`websocket` | `callback`).

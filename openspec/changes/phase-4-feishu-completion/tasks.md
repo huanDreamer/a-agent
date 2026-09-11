@@ -20,6 +20,11 @@
 ## 3. 出站富文本
 
 - [x] `MarkdownToCardElements`（代码块 / 分隔线 / 分块）
+- [x] **原生表格**：GFM 表格解析（`ParseTable`）→ 飞书原生 `table` 元素（列/行/对齐/表头样式）
+- [x] 表格超限拆分：行超出按行分块（重复表头）；列超出按列分组（重复首列作为键）
+- [x] 单元格过长无法原生渲染时降级为 markdown 表格文本（不丢数据）
+- [x] `MarkdownToCardMessages` 产出多条消息，续条带「（表格续）」标记
+- [x] 平台拒绝原生表格时自动重试兼容渲染（表格转 markdown），最终回退纯文本
 - [x] `SplitMarkdownBlocks`（围栏内不切分、支持 ~~~、未闭合围栏）
 - [x] `CardTitleFromMarkdown`（首个标题 → 首行 → 默认值，UTF-8 安全截断）
 - [x] 单元素内容预算（`MaxCardContentBytes`），超长按行/码点切分

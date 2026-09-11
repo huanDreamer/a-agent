@@ -296,16 +296,67 @@ const thinkingPlaceholder = "🤔 正在思考…"
 // fresh reply is sent. A failed update also falls back to a new message so the
 // user always receives the answer.
 func (h *botHandler) finish(ctx context.Context, in feishu.Inbound, placeholderID, text string) error {
+	// Render first: an answer containing a table too large for one card becomes
+	// several messages, each carrying a native table that the platform can
+	// actually render.
+	msgs := feishu.MarkdownToCardMessages(text, "", feishu.DefaultTableLimits())
+	if err := h.deliver(ctx, in, placeholderID, msgs); err == nil {
+		return nil
+	} else {
+		h.logger.Warn("feishu: delivering the answer card failed; retrying without native tables",
+			zap.Error(err))
+	}
+
+	// The platform may reject a native table component. Retry with the
+	// maximum-compatibility rendering: tables become markdown text inside a
+	// single card built only from long-established card features.
+	compat := feishu.MarkdownToCardMessagesCompat(text, "")
+	if err := h.deliver(ctx, in, placeholderID, compat); err == nil {
+		return nil
+	}
+
+	// Last resort: a plain text reply still delivers the answer.
+	h.logger.Warn("feishu: compatibility card also failed; falling back to plain text")
+	return h.reply(ctx, in, text)
+}
+
+// deliver sends the rendered messages: the first replaces the placeholder (or
+// is sent fresh) and any continuations follow as new messages. It returns an
+// error only when the first message could not be delivered at all.
+func (h *botHandler) deliver(ctx context.Context, in feishu.Inbound, placeholderID string, msgs []feishu.CardMessage) error {
+	if len(msgs) == 0 {
+		return errors.New("feishu: no card to deliver")
+	}
+	first := msgs[0]
+
 	if placeholderID != "" {
-		if err := h.sender.UpdateCard(ctx, placeholderID, "", text); err == nil {
+		if err := h.sender.UpdateCardElements(ctx, placeholderID, first.Title, first.Elements); err == nil {
+			h.sendContinuations(ctx, in, msgs[1:])
 			return nil
 		} else {
-			h.logger.Warn("feishu: update placeholder card failed, replying instead",
+			h.logger.Warn("feishu: update placeholder card failed, sending a new message",
 				zap.Error(err))
 		}
-		return h.replyCard(ctx, in, text)
 	}
-	return h.reply(ctx, in, text)
+	if _, err := h.sender.SendCardElements(ctx, in.ChatID, first.Title, first.Elements); err != nil {
+		return err
+	}
+	h.sendContinuations(ctx, in, msgs[1:])
+	return nil
+}
+
+// sendContinuations delivers the extra messages produced when a table had to be
+// split. A failure stops the sequence: if one chunk cannot be sent, the
+// remaining chunks would be out of context.
+func (h *botHandler) sendContinuations(ctx context.Context, in feishu.Inbound, rest []feishu.CardMessage) error {
+	for i, m := range rest {
+		if _, err := h.sender.SendCardElements(ctx, in.ChatID, m.Title, m.Elements); err != nil {
+			h.logger.Warn("feishu: sending a table continuation failed",
+				zap.Int("index", i+1), zap.Error(err))
+			return nil // the answer is already partly delivered; do not error
+		}
+	}
+	return nil
 }
 
 // systemPrompt returns the default system prompt.

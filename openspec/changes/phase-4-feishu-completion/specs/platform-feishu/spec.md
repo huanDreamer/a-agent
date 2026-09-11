@@ -39,6 +39,17 @@ below are added to, not replaced by, the original ones.
 8. **Rich rendering** — markdown answers MUST be rendered as interactive cards
    with proper code blocks, dividers and chunking; single elements MUST stay
    within the platform's content budget.
+9. **Native tables** — a markdown (GFM) table MUST be rendered as a native
+   Feishu `table` element carrying per-column alignment and a header style.
+10. **Table overflow** — a table exceeding the per-message limits MUST be split
+    across several messages rather than truncated: rows are chunked with the
+    header repeated, and columns are grouped with the first column repeated as
+    a key. Continuation messages MUST be marked as such.
+11. **Table fallback** — a table that cannot be rendered natively at all (a cell
+    exceeding the cell limit) MUST degrade to a markdown table in a text block
+    so no data is lost. When the platform rejects a card containing a native
+    table, delivery MUST retry with a maximum-compatibility rendering (tables as
+    markdown, no native table element) before falling back to plain text.
 9. **Transport selection** — the transport MUST be selectable per app
    (`websocket` default, `callback` optional), with aliases accepted, and an
    invalid value MUST fail at startup.
@@ -49,7 +60,7 @@ below are added to, not replaced by, the original ones.
 11. **Safe file names** — downloaded attachments MUST be written to bare file
     names inside the download directory (no path separators, no leading dots)
     and MUST be capped by a configurable size limit.
-12. **Build/test** — `go build ./...`, `go vet ./...` and `go test ./...` MUST
+13. **Build/test** — `go build ./...`, `go vet ./...` and `go test ./...` MUST
     pass without network access or real credentials.
 
 ## Non-goals
