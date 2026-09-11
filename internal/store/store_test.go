@@ -22,8 +22,19 @@ func TestOpenAndMigrate(t *testing.T) {
 		t.Fatal("DB() returned nil after Open")
 	}
 
-	// schema_migrations row should exist for v1
-	rows, err := s.DB().Query("SELECT version, name FROM schema_migrations")
+	// Open() must have applied every migration in the ordered list, without
+	// hardcoding the current schema version.
+	assertAppliedMigrations(t, s)
+}
+
+// assertAppliedMigrations checks that exactly the migrations declared in the
+// `migrations` slice are recorded, in ascending version order, with the
+// recorded names matching. It derives the expectation from the slice itself so
+// that adding a migration does not require touching the test.
+func assertAppliedMigrations(t *testing.T, s Store) {
+	t.Helper()
+
+	rows, err := s.DB().Query("SELECT version, name FROM schema_migrations ORDER BY version")
 	if err != nil {
 		t.Fatalf("query migrations: %v", err)
 	}
@@ -44,8 +55,20 @@ func TestOpenAndMigrate(t *testing.T) {
 			name    string
 		}{v, n})
 	}
-	if len(got) != 2 || got[0].version != 1 || got[1].version != 2 {
-		t.Errorf("migrations = %+v, want v1 and v2", got)
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migrations: %v", err)
+	}
+
+	if len(got) != len(migrations) {
+		t.Fatalf("applied %d migrations, want %d (one per entry in `migrations`)", len(got), len(migrations))
+	}
+	for i, want := range migrations {
+		if got[i].version != want.version {
+			t.Errorf("migrations[%d].version = %d, want %d (ascending order)", i, got[i].version, want.version)
+		}
+		if got[i].name != want.name {
+			t.Errorf("migrations[%d].name = %q, want %q", i, got[i].name, want.name)
+		}
 	}
 }
 
@@ -126,36 +149,40 @@ func TestOpen_InvalidPath(t *testing.T) {
 }
 
 func TestMigrateIdempotent(t *testing.T) {
-	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+
+	s, err := Open(ctx, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer s.Close()
+	assertAppliedMigrations(t, s)
 
-	// Re-run migrate by reopening.
+	// Re-running Migrate on an already-migrated database must be a no-op: the
+	// v3 ALTER TABLE ... ADD COLUMN would fail if it were applied twice.
+	// Migrate is not part of Store (it runs inside Open), so type-assert.
+	ss, ok := s.(*sqliteStore)
+	if !ok {
+		t.Fatalf("Open returned %T, want *sqliteStore", s)
+	}
+	if err := ss.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate (2nd run): %v", err)
+	}
+	if err := ss.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate (3rd run): %v", err)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	s2, err := Open(context.Background(), filepath.Join(t.TempDir(), "test2.db"))
+
+	// Reopening the same file runs Migrate again; the applied set must be
+	// unchanged (same versions, no duplicates).
+	s2, err := Open(ctx, path)
 	if err != nil {
 		t.Fatalf("Open 2: %v", err)
 	}
-	defer s2.Close()
+	defer func() { _ = s2.Close() }()
 
-	// Run migrate again on a fresh store.
-	rows, err := s2.DB().Query("SELECT COUNT(*) FROM schema_migrations")
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		t.Fatal("no rows")
-	}
-	var n int
-	if err := rows.Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 2 {
-		t.Errorf("count = %d, want 2 (v1 + v2)", n)
-	}
+	// Open() ran Migrate a fourth time on the existing file.
+	assertAppliedMigrations(t, s2)
 }

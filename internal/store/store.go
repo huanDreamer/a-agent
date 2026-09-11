@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ErrNotFound is returned by queries that yield zero rows.
@@ -26,6 +27,15 @@ type Store interface {
 	RecordInvocation(ctx context.Context, e InvocationEvent) error
 	QueryInvocations(ctx context.Context, f InvocationFilter) ([]InvocationRecord, error)
 
+	// Usage aggregation (Phase 5).
+	QueryUsageTotals(ctx context.Context, w UsageWindow) (UsageTotals, error)
+	QueryUsageByUser(ctx context.Context, w UsageWindow, limit int) ([]UsageGroupRow, error)
+	QueryUsageByModel(ctx context.Context, w UsageWindow, limit int) ([]UsageGroupRow, error)
+	QueryUsageByProvider(ctx context.Context, w UsageWindow, limit int) ([]UsageGroupRow, error)
+	QueryUsageByProviderModel(ctx context.Context, w UsageWindow, limit int) ([]ProviderModelGroup, error)
+	QueryUsageByDay(ctx context.Context, w UsageWindow, days int) ([]UsageDayRow, error)
+	QueryUsageRecent(ctx context.Context, w UsageWindow, limit int) ([]UsageRecord, error)
+
 	// Underlying handle, used sparingly (e.g. health checks).
 	DB() *sql.DB
 }
@@ -33,6 +43,7 @@ type Store interface {
 // UsageEvent is the input shape for recording an LLM call.
 type UsageEvent struct {
 	SessionID        string
+	UserID           string // attributing end user; empty = unattributed
 	Provider         string
 	Model            string
 	PromptTokens     int
@@ -41,29 +52,35 @@ type UsageEvent struct {
 	DurationMs       int64
 }
 
-// UsageRecord is the persisted view of a usage event.
+// UsageRecord is the persisted view of a usage event. The JSON tags define the
+// wire shape served by the admin usage API.
 type UsageRecord struct {
-	ID               int64
-	SessionID        string
-	Provider         string
-	Model            string
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	DurationMs       int64
-	CreatedAt        string // RFC3339 string from SQLite
+	ID               int64  `json:"id"`
+	SessionID        string `json:"session_id"`
+	UserID           string `json:"user_id"` // empty = unattributed
+	Provider         string `json:"provider"`
+	Model            string `json:"model"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	TotalTokens      int    `json:"total_tokens"`
+	DurationMs       int64  `json:"duration_ms"`
+	CreatedAt        string `json:"created_at"` // RFC3339 string from SQLite
 }
 
 // UsageFilter narrows QueryUsage results. Zero-value fields are ignored.
 type UsageFilter struct {
 	SessionID string
+	UserID    string // empty = all users
 	Provider  string
-	Limit     int // default 100, max 1000
+	Since     time.Time // zero value = no lower bound (inclusive)
+	Until     time.Time // zero value = no upper bound (exclusive)
+	Limit     int       // default 100, max 1000
 }
 
 // InvocationEvent is the input shape for recording a tool call.
 type InvocationEvent struct {
 	SessionID  string
+	UserID     string // attributing end user; empty = unattributed
 	ToolName   string
 	Arguments  string
 	Result     string
@@ -71,23 +88,28 @@ type InvocationEvent struct {
 	DurationMs int64
 }
 
-// InvocationRecord is the persisted view of a tool call.
+// InvocationRecord is the persisted view of a tool call. The JSON tags define
+// the wire shape served by the admin audit API.
 type InvocationRecord struct {
-	ID         int64
-	SessionID  string
-	ToolName   string
-	Arguments  string
-	Result     string
-	Err        string
-	DurationMs int64
-	CreatedAt  string
+	ID         int64  `json:"id"`
+	SessionID  string `json:"session_id"`
+	UserID     string `json:"user_id"` // empty = unattributed
+	ToolName   string `json:"tool_name"`
+	Arguments  string `json:"arguments"`
+	Result     string `json:"result"`
+	Err        string `json:"err"`
+	DurationMs int64  `json:"duration_ms"`
+	CreatedAt  string `json:"created_at"`
 }
 
 // InvocationFilter narrows QueryInvocations results. Zero-value fields are ignored.
 type InvocationFilter struct {
 	SessionID string
+	UserID    string // empty = all users
 	ToolName  string
-	Limit     int // default 100, max 1000
+	Since     time.Time // zero value = no lower bound (inclusive)
+	Until     time.Time // zero value = no upper bound (exclusive)
+	Limit     int       // default 100, max 1000
 }
 
 // Open returns a SQLite-backed Store. The caller MUST call Close().

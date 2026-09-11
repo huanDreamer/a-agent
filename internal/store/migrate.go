@@ -50,6 +50,19 @@ var migrations = []migration{
 		CREATE INDEX IF NOT EXISTS idx_inv_tool    ON tool_invocations(tool_name);
 		CREATE INDEX IF NOT EXISTS idx_inv_created ON tool_invocations(created_at);`,
 	},
+	{
+		version: 3,
+		name:    "add_user_attribution",
+		// NOTE: ALTER TABLE ... ADD COLUMN is not idempotent in SQLite, but
+		// Migrate guards on schema_migrations and applies each version at most
+		// once, inside a single transaction (SQLite DDL is transactional, so a
+		// failure rolls the whole migration back). Pre-existing rows get the
+		// empty-string default, i.e. "unattributed".
+		up: `ALTER TABLE usage_logs ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
+		ALTER TABLE tool_invocations ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
+		CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_logs(user_id);
+		CREATE INDEX IF NOT EXISTS idx_inv_user   ON tool_invocations(user_id);`,
+	},
 }
 
 // Migrate applies any pending migrations idempotently.
