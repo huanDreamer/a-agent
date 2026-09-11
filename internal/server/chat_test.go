@@ -711,3 +711,56 @@ func (m *recordingModel) Stream(_ context.Context, msgs []*schema.Message, _ ...
 		{Role: schema.Assistant, Content: "echo:" + strconv.Itoa(n)},
 	}), nil
 }
+
+func TestChatSession_UserTitleIsNeverOverwritten(t *testing.T) {
+	// A user may deliberately name a session "新对话". That is the same text the
+	// UI uses as a placeholder, so the server must not treat it as a sentinel and
+	// clobber the user's choice on the next turn.
+	h := newChatHarness(t, [][]*schema.Message{{{Role: schema.Assistant, Content: "hi"}}}, nil)
+	h.login(t)
+	id := createSession(t, h)
+
+	const chosen = "新对话"
+	resp := h.patchJSON(t, "/api/chat/sessions/"+id, map[string]string{"title": chosen})
+	requireStatus(t, resp, http.StatusOK)
+
+	// A full turn runs; the title must survive it.
+	readSSE(t, h.client, h.base+"/api/chat/sessions/"+id+"/messages",
+		map[string]string{"content": "这是一条很长的新消息应该被忽略掉"})
+
+	var got struct {
+		Session struct {
+			Title string `json:"title"`
+		} `json:"session"`
+	}
+	h.getJSON(t, "/api/chat/sessions/"+id, http.StatusOK, &got)
+	if got.Session.Title != chosen {
+		t.Errorf("title = %q, want the user's %q preserved", got.Session.Title, chosen)
+	}
+}
+
+func TestChatSession_UntitledIsEmptyAndAutoNamed(t *testing.T) {
+	h := newChatHarness(t, [][]*schema.Message{{{Role: schema.Assistant, Content: "hi"}}}, nil)
+	h.login(t)
+
+	// A brand-new session has an empty title (the UI supplies the placeholder).
+	id := createSession(t, h)
+	var created struct {
+		Session struct {
+			Title string `json:"title"`
+		} `json:"session"`
+	}
+	h.getJSON(t, "/api/chat/sessions/"+id, http.StatusOK, &created)
+	if created.Session.Title != "" {
+		t.Errorf("new session title = %q, want empty (the UI renders the placeholder)", created.Session.Title)
+	}
+
+	// The first turn names it from the message.
+	readSSE(t, h.client, h.base+"/api/chat/sessions/"+id+"/messages",
+		map[string]string{"content": "帮我排查一个 bug"})
+
+	h.getJSON(t, "/api/chat/sessions/"+id, http.StatusOK, &created)
+	if !strings.Contains(created.Session.Title, "帮我排查") {
+		t.Errorf("title = %q, want it derived from the first message", created.Session.Title)
+	}
+}

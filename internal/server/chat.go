@@ -185,9 +185,10 @@ func (s *Server) handleCreateSession(ctx context.Context, c *app.RequestContext)
 		Provider: provider,
 		Model:    model,
 	}
-	if sess.Title == "" {
-		sess.Title = "新对话"
-	}
+	// An untitled session keeps an EMPTY title: the UI renders its own
+	// "新对话" placeholder. Storing the placeholder instead would make it
+	// indistinguishable from a user who deliberately renamed a session to that
+	// text, and the auto-titler would then overwrite their choice.
 	if err := s.store.CreateChatSession(ctx, sess); err != nil {
 		s.fail(c, "create chat session", err)
 		return
@@ -636,8 +637,11 @@ func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, answer
 }
 
 // maybeTitle names an untitled session from its first exchange.
+//
+// It only fires while the title is empty, so a title the user chose is never
+// overwritten — including one that happens to read "新对话".
 func (s *Server) maybeTitle(ctx context.Context, sess store.ChatSession) {
-	if strings.TrimSpace(sess.Title) != "" && sess.Title != "新对话" {
+	if strings.TrimSpace(sess.Title) != "" {
 		return
 	}
 	msgs, err := s.store.ListChatMessages(ctx, sess.ID, 1)

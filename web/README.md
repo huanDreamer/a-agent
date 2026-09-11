@@ -1,6 +1,6 @@
 # huan-agent admin（Web UI）
 
-huan-agent 的 Web 控制台：用量统计、调用记录、审计日志与技能开关。
+huan-agent 的 Web 控制台：对话、用量统计、调用记录、审计日志、技能开关与链路追踪。
 Vue 3 + Vite 单页应用，构建产物由 Go 服务端通过 `//go:embed` 嵌入到二进制里。
 
 ## 快速开始
@@ -65,12 +65,39 @@ internal/server/webui/dist/assets/index-<hash>.css
 | GET    | `/api/skills`                   | 技能列表                               |
 | POST   | `/api/skills/{name}`            | `{enabled:bool}` 开关技能             |
 | GET    | `/api/meta`                     | provider / model / 版本 / 开关状态     |
+| GET    | `/api/chat/models`              | 可选模型目录、工具名、system prompt    |
+| GET    | `/api/chat/sessions`            | 会话列表，`limit`                      |
+| POST   | `/api/chat/sessions`            | 新建会话 `{title,provider,model}`      |
+| GET    | `/api/chat/sessions/{id}`       | 会话 + 全部消息                        |
+| PATCH  | `/api/chat/sessions/{id}`       | 改名 / 换模型                          |
+| DELETE | `/api/chat/sessions/{id}`       | 删除会话                               |
+| POST   | `/api/chat/sessions/{id}/clear` | 清空消息（保留会话）                   |
+| POST   | `/api/chat/sessions/{id}/messages` | **SSE** 流式对话（见下）            |
+| GET    | `/api/traces/status`            | 追踪开关 + 上报计数器                  |
+| GET    | `/api/traces`                   | trace 列表，`limit` / `page` / `session` / `user` / `name` |
+| GET    | `/api/traces/{id}`              | trace 详情 + observation 树            |
 
 用量类接口都支持 `since` / `until`（RFC3339）、`user`、`provider`、`model` 查询参数；
 页面顶部的时间范围选择器（24小时 / 7天 / 30天 / 全部）会把这些查询统一换算成 `since`。
 
 如果 API 不在站点根路径下，可以在 `index.html` 里于打包脚本之前设置
 `window.__ADMIN_API_BASE__ = '/some/prefix'`。
+
+### 流式对话（SSE）
+
+`POST /api/chat/sessions/{id}/messages` 返回 `text/event-stream`。`EventSource` 只能发 GET，
+所以这里用 `fetch` + `response.body.getReader()` 自己解析 SSE 分帧（`src/sse.js`）：
+按空行切帧、忽略 `: ping` 心跳、跨 chunk 缓冲半个帧、`stream_end` 结束读取。
+`done` 事件的 `text` 是最终答案（权威值，会覆盖已流式输出的内容）；
+停止按钮用 `AbortController` 中断请求，服务端仍会保存已经产出的内容，
+因此中断后重新加载依然能看到这一轮。
+
+### 链路追踪
+
+trace 由服务端代理读取，浏览器不会拿到 Langfuse 的 secret key。
+`enabled:false`（未配置）与 HTTP 502（Langfuse 不可达）是两种不同的状态，会分别提示：
+前者给出需要配置的 `langfuse.enable` / `host` / `public_key` / `secret_key` 与重启说明，
+后者提示后端不可达并提供重试。
 
 ## 设计约束
 
@@ -79,7 +106,11 @@ internal/server/webui/dist/assets/index-<hash>.css
   （`src/state.js`），请求用 `fetch`（`src/api.js`）。
 - **暗色主题**：与 `docs/status.html` 保持一致的色板（背景 `#0b0f17`、卡片 `#131a26`、
   边框 `#243044`、蓝色 `#58a6ff`、绿色 `#3fb950` 等），卡片圆角 14px。
-- **中文界面**，响应式支持到约 380px 宽度。
+- **中文界面**，响应式支持到约 380px 宽度；对话框在 900px 以下把会话列表收成抽屉。
+- **手写渲染**：助手回答的 markdown 子集（``` 代码块、行内 `code`、**加粗**、换行）由
+  `src/markdown.js` 解析成 token，再用文本节点渲染（不使用 `v-html`，模型输出无法注入标记）；
+  trace 瀑布流由 `src/components/TraceWaterfall.vue` 用普通 DOM + 百分比定位手写，
+  缺失时间戳 / 时长为 0 / 父节点成环都退化为满宽或根节点，不会出现 NaN 宽度。
 - **不留白面板**：每个数据视图都有骨架屏、错误重试条和「暂无数据」空状态
   （`src/components/AsyncBlock.vue`）。
 - 费用为 `cost.priced === false` 时显示 `—`（表示没有匹配到价格表，费用未知而非 0）。
@@ -97,8 +128,11 @@ web/
     ├── api.js                     # fetch 封装 + ApiError + 401 回调
     ├── state.js                   # reactive store（登录、时间范围、刷新令牌）
     ├── useResource.js             # 数据加载原语（loading/error/empty/ready）
-    ├── format.js                  # 数字 / 费用 / 时长 / 时间格式化
+    ├── format.js                  # 数字 / 费用 / 时长 / 时间 / JSON 格式化
     ├── metrics.js                 # 指标定义（调用数 / token / 费用）
+    ├── sse.js                     # SSE 分帧解析（纯函数，可单独测试）
+    ├── markdown.js                # markdown 子集解析（代码块 / 行内 code / 加粗）
+    ├── chatStore.js               # 对话状态：会话列表、消息、流式一轮的生命周期
     ├── styles.css                 # 全站样式（暗色主题）
     └── components/
         ├── AppHeader.vue          # 顶栏：品牌、meta、时间范围、刷新、退出、标签页
@@ -113,5 +147,14 @@ web/
         ├── ByUserView.vue         # 按用户
         ├── RecentView.vue         # 调用记录
         ├── AuditView.vue          # 审计日志
-        └── SkillsView.vue         # 技能开关
+        ├── SkillsView.vue         # 技能开关
+        ├── ChatView.vue           # 对话（会话侧栏 + 流式消息区）
+        ├── ChatSidebar.vue        # 会话列表 + 改名 / 清空 / 删除（二次确认）
+        ├── ChatMessage.vue        # 消息气泡：思考过程 / 工具卡片 / 用量 / 复制
+        ├── ChatComposer.vue       # 输入框（Enter 发送、Shift+Enter 换行、停止）
+        ├── MarkdownText.vue       # markdown 块级渲染（纯文本节点）
+        ├── MarkdownInline.vue     # markdown 行内渲染
+        ├── JsonBlock.vue          # 可折叠 JSON（null 安全 + 截断）
+        ├── TraceWaterfall.vue     # 手写 observation 瀑布流
+        └── TraceView.vue          # 链路追踪（状态条 + 列表 + 详情）
 ```
