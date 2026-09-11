@@ -20,6 +20,7 @@ import (
 
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/llm"
+	"github.com/huan/huan-agent/internal/metrics"
 	"github.com/huan/huan-agent/internal/obs"
 	"github.com/huan/huan-agent/internal/platform/feishu"
 	"github.com/huan/huan-agent/internal/store"
@@ -56,6 +57,8 @@ type botHandler struct {
 	recorder   *usage.Recorder
 	sender     feishu.Sender
 	downloader feishu.ResourceDownloader
+	// metrics may be nil when observability is disabled.
+	metrics *metrics.Metrics
 
 	mu       sync.Mutex
 	sessions map[string]*botSession
@@ -268,7 +271,9 @@ func (h *botHandler) answer(ctx context.Context, in feishu.Inbound, text string)
 	}
 
 	var out *schema.Message
+	started := time.Now()
 	out, err = h.cm.Generate(ctx, history)
+	h.observeLLM(started, out, err)
 	if err != nil {
 		h.logger.Error("generate", zap.Error(err))
 		sess.Lock()
@@ -286,6 +291,20 @@ func (h *botHandler) answer(ctx context.Context, in feishu.Inbound, text string)
 	sess.mem.addAssistantMessage(out)
 	sess.Unlock()
 	return h.finish(ctx, in, placeholderID, out.Content)
+}
+
+// observeLLM records one model call in the metrics registry. Token counts come
+// from the response when the provider reports them.
+func (h *botHandler) observeLLM(started time.Time, out *schema.Message, err error) {
+	if h.metrics == nil {
+		return
+	}
+	var prompt, completion int
+	if out != nil && out.ResponseMeta != nil && out.ResponseMeta.Usage != nil {
+		prompt = out.ResponseMeta.Usage.PromptTokens
+		completion = out.ResponseMeta.Usage.CompletionTokens
+	}
+	h.metrics.ObserveLLMCall(h.provider, h.model, time.Since(started), err, prompt, completion)
 }
 
 // thinkingPlaceholder is shown while the model is generating.
@@ -486,6 +505,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	handler := newBotHandler(cfg, logger, cm, cfg.LLM.DefaultProvider, cfg.LLM.DefaultProvider, st, rec)
 	handler.sender = sender
 	handler.downloader = downloader
+
+	// Observability is best-effort: a metrics failure must not stop the bot.
+	// The registry is shared with the admin server when both run together.
+	m, merr := metrics.New()
+	if merr != nil {
+		logger.Warn("init metrics failed; continuing without them", zap.Error(merr))
+	}
+	handler.metrics = m
 
 	mode, err := feishu.ParseMode(fsApp.Transport)
 	if err != nil {

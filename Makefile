@@ -9,9 +9,14 @@ LDFLAGS    := -s -w \
               -X github.com/huan/huan-agent/internal/version.Commit=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown) \
               -X github.com/huan/huan-agent/internal/version.BuildTime=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-.PHONY: all build test test-race lint fmt tidy run clean version help
+.PHONY: all build web test test-race lint fmt tidy run run-admin clean version help
 
 all: build
+
+## web: Build the admin web UI into internal/server/webui/dist (embedded by the binary)
+web:
+	cd web && npm install --no-audit --no-fund && npm run build
+	@echo "Built admin UI into internal/server/webui/dist"
 
 ## build: Compile the binary to $(BIN_DIR)/$(BIN_NAME)
 build:
@@ -43,6 +48,10 @@ tidy:
 run: build
 	./$(BIN_DIR)/$(BIN_NAME) serve --config ./configs/config.example.yaml
 
+## run-admin: Build and run the admin server (usage API, metrics, web UI)
+run-admin: build
+	./$(BIN_DIR)/$(BIN_NAME) admin serve --config ./configs/config.yaml
+
 ## version: Print the version
 version: build
 	./$(BIN_DIR)/$(BIN_NAME) version
@@ -50,6 +59,7 @@ version: build
 ## clean: Remove build artifacts
 clean:
 	rm -rf $(BIN_DIR)
+	rm -rf web/node_modules
 
 ## help: Show this help
 help:

@@ -12,9 +12,17 @@
 #   HUAN_AGENT_MAX_STEPS=8
 #   HUAN_SKILLS_DIR=./configs/skills
 
+# Admin HTTP server (Phase 5): usage API, audit log, Prometheus metrics and the
+# web UI. Run it with `huan-agent admin serve`.
 server:
   host: "127.0.0.1"
   port: 8080
+  enable: false            # opt in: the admin API exposes usage data
+  session_ttl_minutes: 720 # how long a login lasts
+  metrics_enable: true     # serve Prometheus metrics
+  metrics_path: "/metrics"
+  # Set the admin password hash with `huan-agent admin set-password`.
+  # NEVER commit a real hash: use HUAN_ADMIN_PASSWORD_HASH instead.
 
 logging:
   level: "info"      # debug | info | warn | error
@@ -150,3 +158,35 @@ feishu:
   # app_secret: ""
   # domain: ""
 
+# Cost estimation (Phase 5). Prices are USD per 1000 tokens.
+# Keys may be "provider/model" (most specific), "model", or "provider";
+# the most specific match wins, otherwise `fallback` applies.
+pricing:
+  fallback:
+    prompt_per_1k: 0.0
+    completion_per_1k: 0.0
+  models:
+    deepseek/deepseek-chat:
+      prompt_per_1k: 0.00014     # cache miss
+      completion_per_1k: 0.00028
+    qwen/qwen-plus:
+      prompt_per_1k: 0.0004
+      completion_per_1k: 0.0012
+    glm/glm-4-plus:
+      prompt_per_1k: 0.0007
+      completion_per_1k: 0.0007
+    openai/gpt-4o-mini:
+      prompt_per_1k: 0.00015
+      completion_per_1k: 0.0006
+    # ollama is local: no cost
+    ollama:
+      prompt_per_1k: 0.0
+      completion_per_1k: 0.0
+
+# Admin login (Phase 5). Single-user password auth.
+admin:
+  username: "admin"
+  # bcrypt hash; generate and set it with:
+  #   huan-agent admin set-password
+  # or via env: HUAN_ADMIN_PASSWORD_HASH
+  password_hash: ""

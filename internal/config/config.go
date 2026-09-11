@@ -28,6 +28,8 @@ type Config struct {
 	Memory   MemoryConfig   `mapstructure:"memory" json:"memory"`
 	Context  ContextConfig  `mapstructure:"context" json:"context"`
 	Feishu   FeishuConfig   `mapstructure:"feishu" json:"feishu"`
+	Pricing  PricingConfig  `mapstructure:"pricing" json:"pricing"`
+	Admin    AdminConfig    `mapstructure:"admin" json:"admin"`
 }
 
 // DatabaseConfig configures the SQLite database.
@@ -35,10 +37,57 @@ type DatabaseConfig struct {
 	Path string `mapstructure:"path" json:"path"`
 }
 
-// ServerConfig controls the admin HTTP server (placeholder for Phase 5).
+// ServerConfig configures the admin HTTP server (Phase 5).
 type ServerConfig struct {
+	// Host is the listen address.
 	Host string `mapstructure:"host" json:"host"`
-	Port int    `mapstructure:"port" json:"port"`
+	// Port is the listen port.
+	Port int `mapstructure:"port" json:"port"`
+	// Enable turns the admin server on. It is off by default because it
+	// exposes usage data and must be deliberately started.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// SessionTTLMinutes bounds how long a login lasts.
+	SessionTTLMinutes int `mapstructure:"session_ttl_minutes" json:"session_ttl_minutes"`
+	// MetricsPath is where the Prometheus exposition is served.
+	MetricsPath string `mapstructure:"metrics_path" json:"metrics_path"`
+	// MetricsEnable turns the /metrics endpoint on.
+	MetricsEnable bool `mapstructure:"metrics_enable" json:"metrics_enable"`
+}
+
+// SessionTTL returns how long an admin login stays valid.
+func (c ServerConfig) SessionTTL() time.Duration {
+	mins := c.SessionTTLMinutes
+	if mins <= 0 {
+		mins = DefaultSessionTTLMinutes
+	}
+	return time.Duration(mins) * time.Minute
+}
+
+// DefaultSessionTTLMinutes bounds an admin login when unset.
+const DefaultSessionTTLMinutes = 720
+
+// PricingConfig configures cost estimation for LLM usage.
+type PricingConfig struct {
+	// Fallback is used when no entry in Models matches a call.
+	Fallback PricingRate `mapstructure:"fallback" json:"fallback"`
+	// Models maps a key to a rate. Keys may be "provider/model", "model" or
+	// "provider"; the most specific match wins (Phase 5 price table).
+	Models map[string]PricingRate `mapstructure:"models" json:"models"`
+}
+
+// PricingRate is the price of 1000 tokens in USD.
+type PricingRate struct {
+	PromptPer1K     float64 `mapstructure:"prompt_per_1k" json:"prompt_per_1k"`
+	CompletionPer1K float64 `mapstructure:"completion_per_1k" json:"completion_per_1k"`
+}
+
+// AdminConfig configures admin authentication.
+type AdminConfig struct {
+	// Username is the single admin account (MVP: single-user password auth).
+	Username string `mapstructure:"username" json:"username"`
+	// PasswordHash is a bcrypt hash. Never commit a real hash; set it with
+	// `huan-agent admin set-password` or the HUAN_ADMIN_PASSWORD_HASH env var.
+	PasswordHash string `mapstructure:"password_hash" json:"password_hash"`
 }
 
 // LoggingConfig controls zap logger behavior.
@@ -378,6 +427,15 @@ func Load(explicitPath string) (*Config, error) {
 func SetDefaults(v *viper.Viper) {
 	v.SetDefault("server.host", "127.0.0.1")
 	v.SetDefault("server.port", 8080)
+	v.SetDefault("server.enable", false)
+	v.SetDefault("server.session_ttl_minutes", 720)
+	v.SetDefault("server.metrics_path", "/metrics")
+	v.SetDefault("server.metrics_enable", true)
+	v.SetDefault("admin.username", "admin")
+	v.SetDefault("admin.password_hash", "")
+	// Fallback price (USD per 1000 tokens) for providers without an entry.
+	v.SetDefault("pricing.fallback.prompt_per_1k", 0.0)
+	v.SetDefault("pricing.fallback.completion_per_1k", 0.0)
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "console")
 	v.SetDefault("database.path", "./data/huan-agent.db")
