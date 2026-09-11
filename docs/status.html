@@ -202,7 +202,7 @@
     <div class="overall">
       <div class="overall-head">
         <span class="lbl">MVP 阶段完成度</span>
-        <span class="val">5 / 8 阶段</span>
+        <span class="val">5.5 / 8 阶段</span>
       </div>
       <div class="track"><div class="fill green" data-w="62.5"></div></div>
       <div class="sub" style="margin-top:12px;font-size:13px">
@@ -217,11 +217,11 @@
     <h2><span class="ico">📊</span>关键指标</h2>
     <p class="sec-note">数据来自当前仓库实测（<code>go test -cover</code>）。</p>
     <div class="stats">
-      <div class="stat g"><div class="n">5</div><div class="k">已完成阶段</div></div>
-      <div class="stat b"><div class="n">84.7%</div><div class="k">平均测试覆盖率</div></div>
+      <div class="stat g"><div class="n">5.5</div><div class="k">已完成阶段</div></div>
+      <div class="stat b"><div class="n">86.4%</div><div class="k">平均测试覆盖率</div></div>
       <div class="stat c"><div class="n">13</div><div class="k">internal 包</div></div>
-      <div class="stat p"><div class="n">4,645</div><div class="k">业务代码行数</div></div>
-      <div class="stat a"><div class="n">2,841</div><div class="k">测试代码行数</div></div>
+      <div class="stat p"><div class="n">6,662</div><div class="k">业务代码行数</div></div>
+      <div class="stat a"><div class="n">6,160</div><div class="k">测试代码行数</div></div>
       <div class="stat g"><div class="n">0</div><div class="k">失败测试</div></div>
     </div>
   </section>
@@ -293,9 +293,9 @@
         </div>
         <div class="phase-desc">WebSocket 长连接、文本入站、文本/卡片出站、多用户会话隔离。已端到端跑通，但仍有 6 项缺口。</div>
         <div class="phase-meta">
-          <span class="mini ok">feishu 80%</span>
+          <span class="mini ok">feishu 92.2%</span>
           <span class="mini ok">多应用 active 选择</span>
-          <span class="mini">缺 回调/图片/重试/占位</span>
+          <span class="mini ok">附件/富文本/占位/重试限流/回调</span>
           <span class="mini">已归档</span>
         </div>
       </div>
@@ -388,11 +388,15 @@
       <div class="cap">
         <h3><span class="dot g"></span>飞书 IM 集成</h3>
         <ul>
-          <li>WebSocket 长连接（无需公网回调）</li>
-          <li>文本消息入站 → Agent → 回复</li>
-          <li>文本 + interactive 卡片出站</li>
+          <li>WebSocket 长连接（无需公网回调）+ HTTP 回调双模式</li>
+          <li>文本 / 富文本 / 图片 / 文件 / 语音 / 视频入站</li>
+          <li>附件下载到本地并交给模型</li>
+          <li>markdown → 富文本卡片（代码块、分隔线）</li>
+          <li>「正在思考…」占位 → 就地更新为答案</li>
+          <li>出站重试 + 限流 + 超时</li>
           <li>按 open_id 多用户会话隔离</li>
           <li>多飞书应用 + <code>active</code> 选择</li>
+          <li>回调 token 鉴权 + <code>/healthz</code></li>
           <li>斜杠命令 /help /reset /remember …</li>
         </ul>
       </div>
@@ -418,12 +422,14 @@
     <div class="cov">
       <div class="cov-row"><span class="cov-name">internal/obs</span>
         <span class="cov-track"><span class="cov-fill lv-hi" data-w="100"></span></span><span class="cov-val">100%</span></div>
+      <div class="cov-row"><span class="cov-name">internal/platform/feishu</span>
+        <span class="cov-track"><span class="cov-fill lv-hi" data-w="92.2"></span></span><span class="cov-val">92.2%</span></div>
       <div class="cov-row"><span class="cov-name">internal/context</span>
         <span class="cov-track"><span class="cov-fill lv-hi" data-w="90.5"></span></span><span class="cov-val">90.5%</span></div>
       <div class="cov-row"><span class="cov-name">internal/usage</span>
         <span class="cov-track"><span class="cov-fill lv-hi" data-w="88.9"></span></span><span class="cov-val">88.9%</span></div>
       <div class="cov-row"><span class="cov-name">internal/config</span>
-        <span class="cov-track"><span class="cov-fill lv-hi" data-w="88.1"></span></span><span class="cov-val">88.1%</span></div>
+        <span class="cov-track"><span class="cov-fill lv-hi" data-w="91.2"></span></span><span class="cov-val">91.2%</span></div>
       <div class="cov-row"><span class="cov-name">internal/llm</span>
         <span class="cov-track"><span class="cov-fill lv-hi" data-w="88.1"></span></span><span class="cov-val">88.1%</span></div>
       <div class="cov-row"><span class="cov-name">internal/tool</span>
@@ -432,8 +438,6 @@
         <span class="cov-track"><span class="cov-fill lv-hi" data-w="87"></span></span><span class="cov-val">87.0%</span></div>
       <div class="cov-row"><span class="cov-name">internal/memory</span>
         <span class="cov-track"><span class="cov-fill lv-mid" data-w="83.2"></span></span><span class="cov-val">83.2%</span></div>
-      <div class="cov-row"><span class="cov-name">internal/platform/feishu</span>
-        <span class="cov-track"><span class="cov-fill lv-mid" data-w="80"></span></span><span class="cov-val">80.0%</span></div>
       <div class="cov-row"><span class="cov-name">internal/mcp</span>
         <span class="cov-track"><span class="cov-fill lv-mid" data-w="78.7"></span></span><span class="cov-val">78.7%</span></div>
       <div class="cov-row"><span class="cov-name">internal/tool/builtin</span>
@@ -443,7 +447,7 @@
       <div class="cov-row"><span class="cov-name">internal/agent</span>
         <span class="cov-track"><span class="cov-fill lv-mid" data-w="74.2"></span></span><span class="cov-val">74.2%</span></div>
       <div class="cov-row"><span class="cov-name">cmd/huan-agent</span>
-        <span class="cov-track"><span class="cov-fill lv-low" data-w="4.7"></span></span><span class="cov-val">4.7%</span></div>
+        <span class="cov-track"><span class="cov-fill lv-low" data-w="11.4"></span></span><span class="cov-val">11.4%</span></div>
       <div class="cov-legend">
         <span><i class="key lv-hi"></i>≥85% 优秀</span>
         <span><i class="key lv-mid"></i>70–85% 达标</span>
@@ -458,20 +462,20 @@
     <p class="sec-note">这些是 PLAN.md 里已规划但尚未实现的交付物。</p>
 
     <div class="todo-group">
-      <h3><span class="dot a"></span>Phase 4 遗留缺口<span class="pill hi">建议优先</span></h3>
-      <div class="gl">飞书集成已能用，但 PLAN 里列的这些还没做。</div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">入站图片 / 文件消息<span class="pill hi">体感明显</span></span>
-        <span class="why">现在只处理 <code>msg_type == "text"</code>，其它类型被日志忽略。</span></span></div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">「正在思考…」占位提示<span class="pill md">体感明显</span></span>
-        <span class="why">LLM 生成期间用户看不到任何反馈，长回复时体验差。</span></span></div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">发送失败重试 / 限流<span class="pill md">稳定性</span></span>
-        <span class="why">出站调用没有 retry，入站没有 rate limit。</span></span></div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">markdown → 富文本卡片</span>
-        <span class="why">目前卡片只是 title + 正文，PLAN 要求的表格/代码块高亮没做。</span></span></div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">HTTP 事件回调双模式</span>
-        <span class="why">只实现了 WebSocket 长连接；回调作为可选模式未做。</span></span></div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">user-routing capability spec</span>
-        <span class="why">多用户会话隔离代码有了，但 openspec 里没有独立的 user-routing spec。</span></span></div>
+      <h3><span class="dot a"></span>Phase 4 · 已全部补完<span class="pill" style="color:var(--green);border-color:var(--green-dim);background:#0e2417">完成</span></h3>
+      <div class="gl">原先列的 6 项缺口已全部实现（见「最近提交」的 feat(feishu)）。</div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">入站图片 / 文件消息</span>
+        <span class="why">已支持 image/file/audio/media/sticker + post 富文本，附件下载到本地并把路径交给模型。</span></span></div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">「正在思考…」占位提示</span>
+        <span class="why">已实现：先发占位卡片，生成后就地更新为答案（失败则回退为新消息）。</span></span></div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">发送失败重试 / 限流</span>
+        <span class="why">已实现：指数退避重试 + 令牌桶限流 + 单次超时，永久错误不重试。</span></span></div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">markdown → 富文本卡片</span>
+        <span class="why">已实现：代码块、分隔线、分块与标题提取，单元素受内容预算约束。</span></span></div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">HTTP 事件回调双模式</span>
+        <span class="why">已实现：按 app 选择 websocket / callback，回调带 token 鉴权与 /healthz。</span></span></div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">user-routing capability spec</span>
+        <span class="why">已补齐 <code>specs/user-routing/spec.md</code>，与 platform-feishu 补完 spec 同批。</span></span></div>
     </div>
 
     <div class="todo-group">
@@ -503,7 +507,7 @@
       <div class="todo-item"><span class="box"></span><span><span class="txt">归档 phase-0-bootstrap</span>
         <span class="why">Phase 0 已完成但仍在 <code>changes/</code> 下，未移入 archive。</span></span></div>
       <div class="todo-item"><span class="box"></span><span><span class="txt">cmd/ 层测试覆盖率</span>
-        <span class="why">cmd/huan-agent 目前仅 4.7%，serve 主流程缺少端到端测试。</span></span></div>
+        <span class="why">cmd/huan-agent 现在是 11.4%（从 4.7% 提升），serve 主流程已有部分单测。</span></span></div>
     </div>
   </section>
 
@@ -512,6 +516,10 @@
     <h2><span class="ico">📝</span>最近提交<span class="count">本次会话</span></h2>
     <p class="sec-note">都是 Conventional Commits，均已推送到 <code>origin/main</code>。</p>
     <div class="commits">
+      <div class="commit"><span class="sha">e341f18</span><span class="cmsg"><span class="scope">docs(feishu)</span>: document attachments, progress card, resilience and transports</span></div>
+      <div class="commit"><span class="sha">9661ee1</span><span class="cmsg"><span class="scope">docs(openspec)</span>: add phase-4 feishu completion change and user-routing spec</span></div>
+      <div class="commit"><span class="sha">221fa8d</span><span class="cmsg"><span class="scope">feat(feishu)</span>: complete IM integration (attachments, cards, resilience, callbacks)</span></div>
+      <div class="commit"><span class="sha">01e3a5a</span><span class="cmsg"><span class="scope">docs</span>: add visual project status dashboard</span></div>
       <div class="commit"><span class="sha">e7acaa1</span><span class="cmsg"><span class="scope">docs(feishu)</span>: document real integration pitfalls</span></div>
       <div class="commit"><span class="sha">59670cb</span><span class="cmsg"><span class="scope">chore(openspec)</span>: archive completed phase-3 and phase-4 changes</span></div>
       <div class="commit"><span class="sha">5fe899c</span><span class="cmsg"><span class="scope">test(feishu)</span>: add unit tests for sanitizeBotHistory</span></div>
@@ -522,8 +530,8 @@
   </section>
 
   <div class="note">
-    <b>一句话总结：</b>核心链路（飞书发消息 → 多 LLM 可选 → Agent/记忆 → 回复）已经端到端跑通并可用，
-    Phase 0–4 的骨架与功能基本齐备；<b>剩下主要是 Phase 4 的体验补强（图片/占位/重试）、Phase 5 的可视化后台、Phase 6 的部署加固</b>。
+    <b>一句话总结：</b>飞书集成已<b>全部补完</b>——附件、富文本卡片、思考占位、重试限流、回调双模式都已落地，
+    Phase 0–4 完整；<b>剩下是 Phase 5 的可视化后台与 Phase 6 的部署加固</b>。
     <br><span style="font-size:12px;color:var(--text-dimmer)">生成时间：2026-09-06 · 数据源：仓库实测</span>
   </div>
 
