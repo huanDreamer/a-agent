@@ -107,6 +107,16 @@ export function formatAverageDuration(totalMs, calls) {
   return formatDuration(total / count)
 }
 
+/**
+ * Latency expressed in **seconds** (Langfuse reports floats) -> the same
+ * "12ms / 1.2s" rendering as formatDuration.
+ */
+export function formatSeconds(value) {
+  const n = toNumber(value)
+  if (n === null || n < 0) return DASH
+  return formatDuration(n * 1000)
+}
+
 /** "3 分钟前" — relative timestamp for recent/audit rows. */
 export function formatRelative(iso, now = Date.now()) {
   if (!iso) return DASH
@@ -170,6 +180,47 @@ export function truncate(text, max = 60) {
   const value = String(text)
   if (value.length <= max) return value
   return `${value.slice(0, max)}…`
+}
+
+/**
+ * Pretty-print arbitrary JSON for a <pre> block.
+ *
+ * Trace input/output and tool arguments are arbitrary JSON, and tool arguments
+ * are usually a *string* that contains JSON, so a string is unwrapped once
+ * before printing. Anything unparsable is printed as-is, and very long payloads
+ * are truncated with an explicit note instead of freezing the browser.
+ */
+export function formatJson(value, maxLength = 4000) {
+  const text = renderJson(value)
+  if (text === '') return ''
+  const limit = toNumber(maxLength)
+  const cap = limit && limit > 0 ? limit : 4000
+  if (text.length <= cap) return text
+  return `${text.slice(0, cap)}\n…（已截断，共 ${text.length.toLocaleString('en-US')} 字符）`
+}
+
+function renderJson(value) {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed === '') return ''
+    const head = trimmed.charAt(0)
+    if (head === '{' || head === '[') {
+      try {
+        return JSON.stringify(JSON.parse(trimmed), null, 2)
+      } catch (err) {
+        return value
+      }
+    }
+    return value
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    const text = JSON.stringify(value, null, 2)
+    return text === undefined ? String(value) : text
+  } catch (err) {
+    return String(value)
+  }
 }
 
 /** Share of a total in percent, for bar widths. Never returns NaN. */

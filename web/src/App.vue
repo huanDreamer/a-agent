@@ -2,21 +2,25 @@
 import { onMounted } from 'vue'
 import AppHeader from './components/AppHeader.vue'
 import LoginView from './components/LoginView.vue'
+import ChatView from './components/ChatView.vue'
 import DashboardView from './components/DashboardView.vue'
 import ByModelView from './components/ByModelView.vue'
 import ByUserView from './components/ByUserView.vue'
 import RecentView from './components/RecentView.vue'
 import AuditView from './components/AuditView.vue'
 import SkillsView from './components/SkillsView.vue'
+import TraceView from './components/TraceView.vue'
 import { TABS, checkSession, state } from './state.js'
 
 const VIEWS = {
+  chat: ChatView,
   dashboard: DashboardView,
   model: ByModelView,
   user: ByUserView,
   recent: RecentView,
   audit: AuditView,
   skills: SkillsView,
+  traces: TraceView,
 }
 
 onMounted(checkSession)

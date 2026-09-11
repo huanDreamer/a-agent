@@ -1,15 +1,16 @@
 // One loading primitive for every data view.
 //
 // A resource re-fetches when the global refresh token changes (the header's
-// 刷新 button) or when the time range changes, keeps the previous data visible
-// while reloading, and exposes a tri-state `status` that maps straight onto
-// AsyncBlock's loading / error / ready handling.
+// 刷新 button), when the time range changes, or when one of the extra `watch`
+// sources changes (local filters, a selected row, …), keeps the previous data
+// visible while reloading, and exposes a tri-state `status` that maps straight
+// onto AsyncBlock's loading / error / ready handling.
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { state } from './state.js'
 
 export function useResource(loader, options = {}) {
-  const { watchRange = true } = options
+  const { watchRange = true, watch: extraSources = [] } = options
 
   const data = ref(null)
   const error = ref('')
@@ -49,7 +50,9 @@ export function useResource(loader, options = {}) {
     }, 60)
   }
 
-  const sources = watchRange ? [() => state.refreshToken, () => state.range] : [() => state.refreshToken]
+  const sources = watchRange
+    ? [() => state.refreshToken, () => state.range, ...extraSources]
+    : [() => state.refreshToken, ...extraSources]
 
   watch(sources, schedule)
 

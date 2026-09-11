@@ -9,6 +9,7 @@
 
 import { computed, reactive } from 'vue'
 import { api, setUnauthorizedHandler } from './api.js'
+import { resetChat } from './chatStore.js'
 
 /** Time ranges offered in the header. `hours: null` means "全部". */
 export const RANGES = [
@@ -19,12 +20,14 @@ export const RANGES = [
 ]
 
 export const TABS = [
+  { key: 'chat', label: '对话' },
   { key: 'dashboard', label: '总览' },
   { key: 'model', label: '按模型' },
   { key: 'user', label: '按用户' },
   { key: 'recent', label: '调用记录' },
   { key: 'audit', label: '审计日志' },
   { key: 'skills', label: '技能' },
+  { key: 'traces', label: '链路追踪' },
 ]
 
 export const state = reactive({
@@ -143,6 +146,9 @@ export async function logout() {
     // Logging out locally is best-effort: even if the request failed (offline,
     // expired cookie) we must not keep the user inside the admin UI.
   }
+  // Conversations belong to the previous session: drop them (and any stream
+  // still running) so the next login starts clean.
+  resetChat()
   state.phase = 'login'
   state.username = ''
   state.authNotice = ''
