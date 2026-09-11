@@ -293,7 +293,7 @@
         </div>
         <div class="phase-desc">WebSocket 长连接、文本入站、文本/卡片出站、多用户会话隔离。已端到端跑通，但仍有 6 项缺口。</div>
         <div class="phase-meta">
-          <span class="mini ok">feishu 92.2%</span>
+          <span class="mini ok">feishu 91.8%</span>
           <span class="mini ok">多应用 active 选择</span>
           <span class="mini ok">附件/富文本/占位/重试限流/回调</span>
           <span class="mini">已归档</span>
@@ -392,6 +392,7 @@
           <li>文本 / 富文本 / 图片 / 文件 / 语音 / 视频入站</li>
           <li>附件下载到本地并交给模型</li>
           <li>markdown → 富文本卡片（代码块、分隔线）</li>
+          <li>原生表格（超限自动拆分多条消息）</li>
           <li>「正在思考…」占位 → 就地更新为答案</li>
           <li>出站重试 + 限流 + 超时</li>
           <li>按 open_id 多用户会话隔离</li>
@@ -423,7 +424,7 @@
       <div class="cov-row"><span class="cov-name">internal/obs</span>
         <span class="cov-track"><span class="cov-fill lv-hi" data-w="100"></span></span><span class="cov-val">100%</span></div>
       <div class="cov-row"><span class="cov-name">internal/platform/feishu</span>
-        <span class="cov-track"><span class="cov-fill lv-hi" data-w="92.2"></span></span><span class="cov-val">92.2%</span></div>
+        <span class="cov-track"><span class="cov-fill lv-hi" data-w="91.8"></span></span><span class="cov-val">91.8%</span></div>
       <div class="cov-row"><span class="cov-name">internal/context</span>
         <span class="cov-track"><span class="cov-fill lv-hi" data-w="90.5"></span></span><span class="cov-val">90.5%</span></div>
       <div class="cov-row"><span class="cov-name">internal/usage</span>
@@ -447,7 +448,7 @@
       <div class="cov-row"><span class="cov-name">internal/agent</span>
         <span class="cov-track"><span class="cov-fill lv-mid" data-w="74.2"></span></span><span class="cov-val">74.2%</span></div>
       <div class="cov-row"><span class="cov-name">cmd/huan-agent</span>
-        <span class="cov-track"><span class="cov-fill lv-low" data-w="11.4"></span></span><span class="cov-val">11.4%</span></div>
+        <span class="cov-track"><span class="cov-fill lv-low" data-w="13.7"></span></span><span class="cov-val">13.7%</span></div>
       <div class="cov-legend">
         <span><i class="key lv-hi"></i>≥85% 优秀</span>
         <span><i class="key lv-mid"></i>70–85% 达标</span>
@@ -507,7 +508,7 @@
       <div class="todo-item"><span class="box"></span><span><span class="txt">归档 phase-0-bootstrap</span>
         <span class="why">Phase 0 已完成但仍在 <code>changes/</code> 下，未移入 archive。</span></span></div>
       <div class="todo-item"><span class="box"></span><span><span class="txt">cmd/ 层测试覆盖率</span>
-        <span class="why">cmd/huan-agent 现在是 11.4%（从 4.7% 提升），serve 主流程已有部分单测。</span></span></div>
+        <span class="why">cmd/huan-agent 现在是 13.7%（从 4.7% 提升），serve 主流程已有部分单测。</span></span></div>
     </div>
   </section>
 
