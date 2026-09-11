@@ -202,12 +202,13 @@
     <div class="overall">
       <div class="overall-head">
         <span class="lbl">MVP 阶段完成度</span>
-        <span class="val">5.5 / 8 阶段</span>
+        <span class="val">6.5 / 8 阶段</span>
       </div>
-      <div class="track"><div class="fill green" data-w="62.5"></div></div>
+      <div class="track"><div class="fill green" data-w="81.25"></div></div>
       <div class="sub" style="margin-top:12px;font-size:13px">
-        Phase 0–3 完成，Phase 4（飞书）基本可用但仍有若干缺口，Phase 5–7 未开始。
-        核心链路「飞书发消息 → Agent 回复」已端到端跑通。
+        Phase 0–4 完成（飞书已全部补完），Phase 5（用量统计与可观测性）已完成：
+        用量归属与聚合、费用计算、管理员后台、Prometheus 指标、Web 管理界面。
+        剩余 Phase 6（生产加固）与 Phase 7（未来扩展）。
       </div>
     </div>
   </div>
@@ -217,8 +218,8 @@
     <h2><span class="ico">📊</span>关键指标</h2>
     <p class="sec-note">数据来自当前仓库实测（<code>go test -cover</code>）。</p>
     <div class="stats">
-      <div class="stat g"><div class="n">5.5</div><div class="k">已完成阶段</div></div>
-      <div class="stat b"><div class="n">86.4%</div><div class="k">平均测试覆盖率</div></div>
+      <div class="stat g"><div class="n">6.5</div><div class="k">已完成阶段</div></div>
+      <div class="stat b"><div class="n">86.7%</div><div class="k">平均测试覆盖率</div></div>
       <div class="stat c"><div class="n">13</div><div class="k">internal 包</div></div>
       <div class="stat p"><div class="n">6,662</div><div class="k">业务代码行数</div></div>
       <div class="stat a"><div class="n">6,160</div><div class="k">测试代码行数</div></div>
@@ -300,16 +301,17 @@
         </div>
       </div>
 
-      <div class="phase todo">
+      <div class="phase done">
         <div class="phase-head">
           <span class="phase-title">Phase 5 · 用量统计与可观测性</span>
-          <span class="phase-tag tag-todo">未开始</span>
+          <span class="phase-tag tag-done">完成</span>
         </div>
-        <div class="phase-desc">Admin HTTP API、Vue 3 管理界面、Prometheus 指标、审计日志。</div>
+        <div class="phase-desc">用量归属与聚合、费用计算、管理员 HTTP API、Prometheus 指标、Vue 3 管理界面、审计日志。</div>
         <div class="phase-meta">
-          <span class="mini">仅有 usage 记录器 + CLI 查询</span>
-          <span class="mini">缺 internal/server</span>
-          <span class="mini">缺 web/</span>
+          <span class="mini ok">server 70.9%</span>
+          <span class="mini ok">pricing 100%</span>
+          <span class="mini ok">metrics 91.2%</span>
+          <span class="mini ok">store 86.9%</span>
         </div>
       </div>
 
@@ -480,16 +482,18 @@
     </div>
 
     <div class="todo-group">
-      <h3><span class="dot b"></span>Phase 5 · 用量统计与可观测性</h3>
-      <div class="gl">目前只有「记录 + CLI 查询」这一小部分，可视化和服务端都没有。</div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">Admin HTTP server（internal/server/）</span>
-        <span class="why">REST API：/api/usage/summary、by-user、by-model、by-day。</span></span></div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">Web Admin UI（Vue 3）</span>
-        <span class="why">登录 + 用量仪表盘 + 用户/会话列表；web/ 目录尚未创建。</span></span></div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">Prometheus /metrics 指标</span>
-        <span class="why">调用次数、延迟、错误率、token 用量。</span></span></div>
-      <div class="todo-item"><span class="box"></span><span><span class="txt">审计日志</span>
-        <span class="why">谁在何时调了哪个工具（部分已有，未成体系）。</span></span></div>
+      <h3><span class="dot b"></span>Phase 5 · 已全部完成<span class="pill" style="color:var(--green);border-color:var(--green-dim);background:#0e2417">完成</span></h3>
+      <div class="gl">原先列的 4 项已全部实现（见「最近提交」的 feat(store,metrics,pricing) / feat(server) / feat(web)）。</div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">Admin HTTP server（internal/server/）</span>
+        <span class="why">已实现（Hertz）：summary / by-model / by-provider / by-user / by-day / recent + audit + skills。</span></span></div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">Web Admin UI（Vue 3）</span>
+        <span class="why">已实现并嵌入二进制：仪表盘、按模型、按用户、调用记录、审计日志、技能开关。</span></span></div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">Prometheus /metrics 指标</span>
+        <span class="why">8 个采集器 + build_info：调用次数、延迟、错误、token、限流命中。</span></span></div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">审计日志</span>
+        <span class="why">工具调用按用户/会话/工具/耗时/错误记录，并可按工具、用户、时间窗查询。</span></span></div>
+      <div class="todo-item"><span class="box" style="border-color:var(--green);background:#0e2417"></span><span><span class="txt" style="text-decoration:line-through;color:var(--text-dim)">费用计算（额外完成）</span>
+        <span class="why">YAML 价格表按 (provider, model) 逐对计价；未匹配价格为「未知」而非 0。</span></span></div>
     </div>
 
     <div class="todo-group">
@@ -531,8 +535,8 @@
   </section>
 
   <div class="note">
-    <b>一句话总结：</b>飞书集成已<b>全部补完</b>——附件、富文本卡片、思考占位、重试限流、回调双模式都已落地，
-    Phase 0–4 完整；<b>剩下是 Phase 5 的可视化后台与 Phase 6 的部署加固</b>。
+    <b>一句话总结：</b>Phase 0–5 全部完成——飞书集成补完，用量统计与可观测性落地（管理员后台 + Web 界面 + Prometheus 指标 + 费用计算）。
+    <b>剩下是 Phase 6 的生产加固（Docker、限流熔断、健康检查、部署文档）与 Phase 7 的未来扩展</b>。
     <br><span style="font-size:12px;color:var(--text-dimmer)">生成时间：2026-09-06 · 数据源：仓库实测</span>
   </div>
 
