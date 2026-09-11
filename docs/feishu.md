@@ -96,16 +96,64 @@ The bot opens a WebSocket long-connection and stays up until you send SIGINT/SIG
 Each private user (`open_id`) gets an independent session with the same memory +
 context machinery as `huan-agent chat`.
 
+### Behavior options
+
+```yaml
+feishu:
+  thinking: true            # send 🤔 正在思考… then replace it with the answer
+  retry_attempts: 3         # outbound send attempts (1 = no retry)
+  retry_base_delay_ms: 300  # exponential backoff start
+  send_timeout_ms: 15000    # per-attempt timeout
+  rate_limit_per_sec: 5.0   # outbound token bucket (0 = unlimited)
+  rate_limit_burst: 10
+  download_dir: ""          # empty = $TMPDIR/huan-agent-downloads
+  max_download_mb: 32       # per-attachment cap
+```
+
+### Event transport: WebSocket vs callback
+
+By default events arrive over the **WebSocket long-connection**, which needs no
+public URL. To use an HTTP callback instead (e.g. behind a load balancer), set it
+per app:
+
+```yaml
+feishu:
+  apps:
+    primary:
+      transport: "callback"
+      callback_addr: "0.0.0.0:8081"
+      callback_path: "/feishu/event"
+      verification_token: "your-verification-token"
+```
+
+Accepted `transport` values: `websocket` (default, aliases `ws`), `callback`
+(aliases `http`, `webhook`). In callback mode:
+
+- Register the public URL (`https://host/feishu/event`) in the Feishu console
+  under **事件与回调 → 请求地址**.
+- Set `verification_token` — the endpoint rejects requests whose token does not
+  match. **Without it (and without an encrypt key) the endpoint accepts
+  unauthenticated events**, and the bot logs a warning at startup.
+- Set `encrypt_key` to additionally have Feishu's request signature verified.
+- `GET /healthz` returns `ok` for liveness probes.
+
 ## 5. Talk to it
 
-Open a **private chat** with the bot in Feishu and send a text message.
-Supported in-chat commands:
+Open a **private chat** with the bot in Feishu and send a message. Plain text,
+rich text (`post`), images, files, voice and video are all accepted; attachments
+are downloaded locally and their paths are handed to the model.
+
+Supported in-chat commands (plain text only):
 
 - `你好` → replies from the agent.
 - `/reset` → clear this user's conversation.
 - `/remember <key>: <value>` → persist a fact (memory).
 - `/recall <query>` → search stored facts.
 - `/provider` → show the active model.
+
+Replies with markdown (code blocks, lists) are sent as interactive cards so they
+render properly. While the model is generating you will see a
+`🤔 正在思考…` card, which is replaced in place by the answer.
 
 ## Troubleshooting
 
@@ -129,6 +177,17 @@ Supported in-chat commands:
   `feishu message received` + `bot handler received`; a line in the log for every
   inbound message tells you whether the event reached the handler.
 - **Send fails with scope error** — re-add `im:message:send_as_bot` and re-publish.
+- **Attachment not read by the model** — check the log for
+  `feishu: download attachment failed`. Inbound files need the
+  `im:resource` permission (alongside `im:message`) and the app must be
+  republished. Downloads are capped by `feishu.max_download_mb`.
+- **Replies never update the placeholder** — the update path needs the message id
+  returned by the create call; a `patch message: code=...` warning means Feishu
+  refused the update (card too large, or the message was already replaced). The
+  bot then sends the answer as a fresh message.
+- **Callback mode returns 403** — the request's `verification_token` does not
+  match `feishu.apps.<name>.verification_token`. Copy the token from
+  **事件与回调 → 加密策略** in the console.
 - **Domain/endpoint** — on Lark (international), set `feishu.domain =
   https://open.larksuite.com`.
 - **App ID/secret wrong** — double-check they belong to the same app and were
@@ -136,6 +195,9 @@ Supported in-chat commands:
 
 ## Notes
 
-- The SDK used is `github.com/larksuite/oapi-sdk-go/v3` (WebSocket long-connection,
-  `ws.NewClient`). Review `internal/platform/feishu` for the wiring.
-- Unit tests use a stub `SendMessage` and never touch real credentials.
+- The SDK used is `github.com/larksuite/oapi-sdk-go/v3` (`ws.NewClient` for the
+  long-connection, `core/httpserverext` for the callback transport). Review
+  `internal/platform/feishu` for the wiring.
+- Outbound sends are wrapped as rate limit → retry → per-attempt timeout
+  (`WrapCreate`); permanent errors (permission/invalid-request) are not retried.
+- Unit tests use stub send/primitives and never touch real credentials.
