@@ -54,6 +54,10 @@ llm:
       api_key: ""    # ollama ignores api_key but the field is required by config schema
       base_url: "http://localhost:11434/v1"
       model: "llama3.2"
+      # Streaming asks for token usage via stream_options.include_usage. That is
+      # an OpenAI extension; set this to true for a provider that rejects the
+      # request, at the cost of getting no token counts on streamed calls.
+      # disable_usage_request: false
 
 # Agent (ReAct loop) settings. Used by `huan-agent chat --tools` and by
 # any platform integrations that build an agent.Agent.
@@ -190,3 +194,21 @@ admin:
   #   huan-agent admin set-password
   # or via env: HUAN_ADMIN_PASSWORD_HASH
   password_hash: ""
+
+# Web chat in the admin UI (requires `huan-agent admin serve`).
+chat:
+  enable: true             # off = the chat tab is hidden
+  max_steps: 12            # tool-calling iterations per turn
+  history_limit: 40        # stored messages replayed to the model
+  system_prompt: ""        # empty = built-in default
+
+# Langfuse tracing. Traces every chat turn: model generations (with token
+# usage) and tool calls, viewable in the admin UI's 链路追踪 tab and in
+# Langfuse itself.
+langfuse:
+  enable: false            # requires host + keys below
+  host: "https://cloud.langfuse.com"   # or a self-hosted URL
+  public_key: ""           # NEVER commit; use HUAN_LANGFUSE_PUBLIC_KEY
+  secret_key: ""           # NEVER commit; use HUAN_LANGFUSE_SECRET_KEY
+  environment: "production"
+  release: ""              # e.g. a git sha; empty = omitted

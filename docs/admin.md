@@ -129,6 +129,92 @@ The registry is private (the process-global default is never touched), and every
 metric is emitted through a nil-safe API, so observability can be disabled
 without touching call sites.
 
+## Web chat (对话)
+
+The admin UI can run conversations against the agent, with the model's reasoning
+and tool calls visible as they happen.
+
+```yaml
+chat:
+  enable: true             # off hides the 对话 tab
+  max_steps: 12            # tool-calling iterations per turn
+  history_limit: 40        # stored messages replayed to the model
+  system_prompt: ""        # empty = built-in default
+```
+
+Endpoints (session cookie required):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/chat/models` | selectable providers/models + the tool list |
+| `GET/POST /api/chat/sessions` | list / create |
+| `GET/PATCH/DELETE /api/chat/sessions/{id}` | fetch / rename or change model / delete |
+| `POST /api/chat/sessions/{id}/clear` | empty the history, keep the session |
+| `POST /api/chat/sessions/{id}/messages` | **SSE** stream for one turn |
+
+`POST .../messages` returns `text/event-stream`. Each frame is
+`data: {json}\n\n`, with a `type` of `step_start`, `reasoning_delta`,
+`text_delta`, `tool_call`, `tool_result`, `usage`, `done`, `error`, or
+`stream_end` (always last). A `: ping` comment is sent periodically so an
+idle stream is not mistaken for a dead one.
+
+Because `EventSource` cannot POST, the UI reads the body with `fetch` +
+`ReadableStream` and parses the framing itself.
+
+Behaviour worth knowing:
+
+- **Reasoning is separate from the answer.** Reasoning models stream their
+  thinking in a distinct field; it is shown in a collapsible 思考过程 panel and
+  stored separately, never mixed into the answer.
+- **A failing tool does not fail the turn.** The error is shown, recorded in the
+  audit log, and handed back to the model so it can adapt.
+- **Stopping a turn keeps what was produced.** Cancelling the request persists
+  the partial answer, so it is still there after a reload.
+- **Disconnecting does not lose the answer.** Persistence runs on its own
+  context, not the request's.
+- **Reasoning and tool metadata are never replayed to the model** on later
+  turns — they are display-only. Replaying an assistant tool call without its
+  paired result is what makes providers reject a request.
+- The first message auto-titles an untitled session.
+
+## Trace visualization (链路追踪)
+
+Every chat turn can be traced to Langfuse: one trace per turn, a generation
+observation per model call (with token usage), and a span per tool call. The
+admin UI has a 链路追踪 tab that lists traces and renders a trace's
+observations as a waterfall.
+
+```yaml
+langfuse:
+  enable: true
+  host: "https://cloud.langfuse.com"     # or self-hosted
+  public_key: ""                          # use HUAN_LANGFUSE_PUBLIC_KEY
+  secret_key: ""                          # use HUAN_LANGFUSE_SECRET_KEY
+  environment: "production"
+  release: ""                             # e.g. a git sha
+```
+
+Endpoints (session cookie required; the secret key never reaches the browser):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/traces/status` | enabled?, host, delivery counters |
+| `GET /api/traces?limit&page&session&user&name` | recent traces |
+| `GET /api/traces/{id}` | one trace with its observations |
+
+Notes:
+
+- **Tracing is fail-soft.** With no configuration every trace call is a no-op,
+  the chat path never checks, and the UI is told tracing is off along with which
+  config keys to set. A Langfuse outage returns 502 so it is distinguishable from
+  "not enabled".
+- **Reporting never blocks a turn.** Events are buffered and flushed in the
+  background (2s or 20 events); a full buffer drops the oldest and counts it;
+  failures are counted and logged, never propagated.
+- **`Close` flushes**, so the last turn of a session is not lost.
+- The counters on the status strip are the quickest way to tell whether traces
+  are actually arriving.
+
 ## Web UI
 
 The UI is a Vue 3 SPA in `web/`, built into `internal/server/webui/dist/` and
@@ -139,7 +225,8 @@ make web          # install deps and build into the embedded directory
 cd web && npm run dev   # dev server with /api proxied to :8080
 ```
 
-Tabs: 仪表盘 (summary + trend), 按模型, 按用户, 调用记录, 审计日志, 技能.
+Tabs: 对话 (chat), 仪表盘 (summary + trend), 按模型, 按用户, 调用记录,
+审计日志, 链路追踪, 技能.
 
 ## Security notes
 
@@ -167,3 +254,16 @@ Tabs: 仪表盘 (summary + trend), 按模型, 按用户, 调用记录, 审计日
 - **Cost shows `—`** — no price matched; add an entry to `pricing.models`.
 - **"admin UI is not built" warning** — `internal/server/webui/dist` was not
   built into the binary; run `make web` and rebuild.
+- **对话 tab is missing** — `chat.enable` is false, or no `llm.default_provider`
+  is configured (the server logs which).
+- **Chat replies but shows no thinking** — the model is not a reasoning model, so
+  it sends no reasoning content. `deepseek-reasoner` does.
+- **Token counts show 0 in chat** — usage must be requested on the stream
+  (`stream_options.include_usage`); the shipped provider sets it, so a provider
+  that ignores it will report none.
+- **链路追踪 says disabled** — set `langfuse.enable` plus host/keys and restart;
+  the tab names the keys it wants.
+- **链路追踪 shows a 502** — Langfuse was unreachable (check the host and that
+  the container is up), which is different from "not configured".
+- **Traces never appear in Langfuse** — check the status strip counters: a rising
+  `failed` means the keys or host are wrong; `dropped` means the buffer overflowed.
