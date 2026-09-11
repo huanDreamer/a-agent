@@ -3,6 +3,7 @@ package feishu
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -46,7 +47,7 @@ func TestParseInboundMessage(t *testing.T) {
 	})
 
 	t.Run("non-text and nil event", func(t *testing.T) {
-		if in := parseInboundMessage(nil); (interface{})(in) != (interface{})(Inbound{}) {
+		if in := parseInboundMessage(nil); !reflect.DeepEqual(in, Inbound{}) {
 			t.Errorf("nil event should yield zero Inbound, got %+v", in)
 		}
 		ev := &im.P2MessageReceiveV1{Event: &im.P2MessageReceiveV1Data{
@@ -147,7 +148,7 @@ func TestReplyCard(t *testing.T) {
 
 func TestReplyErrors(t *testing.T) {
 	// nil sender callbacks are rejected.
-	bad := &larkSender{send: nil}
+	bad := &larkSender{create: nil}
 	if err := bad.ReplyText(context.Background(), Inbound{}, "x"); err == nil {
 		t.Error("expected error when send is nil")
 	}

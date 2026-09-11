@@ -115,12 +115,36 @@ feishu:
       domain: ""        # empty = Feishu default; use https://open.larksuite.com for Lark
       verification_token: ""
       encrypt_key: ""
+      # transport: how events reach the bot.
+      #   websocket (default) = long connection, needs no public URL
+      #   callback            = HTTP server, needs a public URL in the console
+      transport: "websocket"
+      callback_addr: "0.0.0.0:8081"     # callback mode only
+      callback_path: "/feishu/event"    # callback mode only
     secondary:
       app_id: "cli_yyy"
       app_secret: ""
       domain: "https://open.larksuite.com"   # Lark (international)
       verification_token: ""
       encrypt_key: ""
+      transport: "websocket"
+
+  # --- behavior (shared by all apps) ---
+  # Send a "thinking…" card immediately and replace it with the answer when the
+  # model finishes (Feishu has no streaming).
+  thinking: true
+  # Outbound resilience. attempts includes the first try; 0 disables retrying.
+  retry_attempts: 3
+  retry_base_delay_ms: 300     # exponential backoff start
+  send_timeout_ms: 15000       # per-attempt timeout (0 = none)
+  # Token-bucket rate limit for outbound sends (0 = unlimited).
+  rate_limit_per_sec: 5.0
+  rate_limit_burst: 10
+  # Where inbound images/files are saved for the agent to read.
+  # Empty = $TMPDIR/huan-agent-downloads
+  download_dir: ""
+  max_download_mb: 32          # per-attachment cap
+
   # Legacy single-app form (alternative to `apps` + `active`):
   # app_id: "cli_xxx"
   # app_secret: ""

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -130,6 +131,25 @@ type FeishuConfig struct {
 	// Apps maps a display name to a Feishu app.
 	Apps map[string]FeishuApp `mapstructure:"apps" json:"apps"`
 
+	// Thinking sends a "thinking…" card immediately and replaces it with the
+	// answer once the model finishes, so the user always gets feedback.
+	Thinking bool `mapstructure:"thinking" json:"thinking"`
+	// RetryAttempts is the total number of outbound send attempts (>=1).
+	RetryAttempts int `mapstructure:"retry_attempts" json:"retry_attempts"`
+	// RetryBaseDelayMS is the first backoff delay in milliseconds.
+	RetryBaseDelayMS int `mapstructure:"retry_base_delay_ms" json:"retry_base_delay_ms"`
+	// SendTimeoutMS bounds a single outbound send attempt.
+	SendTimeoutMS int `mapstructure:"send_timeout_ms" json:"send_timeout_ms"`
+	// RateLimitPerSec caps outbound sends per second (0 = unlimited).
+	RateLimitPerSec float64 `mapstructure:"rate_limit_per_sec" json:"rate_limit_per_sec"`
+	// RateLimitBurst is the token-bucket burst size.
+	RateLimitBurst int `mapstructure:"rate_limit_burst" json:"rate_limit_burst"`
+	// DownloadDir stores inbound attachments. Empty uses a directory under the
+	// system temp dir.
+	DownloadDir string `mapstructure:"download_dir" json:"download_dir"`
+	// MaxDownloadMB caps a single downloaded attachment.
+	MaxDownloadMB int `mapstructure:"max_download_mb" json:"max_download_mb"`
+
 	// Legacy single-app fields (still honoured when Active is empty).
 	AppID             string `mapstructure:"app_id" json:"app_id"`
 	AppSecret         string `mapstructure:"app_secret" json:"app_secret"`
@@ -150,6 +170,54 @@ type FeishuApp struct {
 	// callbacks; WebSocket long-connection does not require them.
 	VerificationToken string `mapstructure:"verification_token" json:"verification_token"`
 	EncryptKey        string `mapstructure:"encrypt_key" json:"encrypt_key"`
+	// Transport selects how events arrive: "websocket" (default) or
+	// "callback". Aliases: ws / http / webhook.
+	Transport string `mapstructure:"transport" json:"transport"`
+	// CallbackAddr is the listen address for the callback transport.
+	CallbackAddr string `mapstructure:"callback_addr" json:"callback_addr"`
+	// CallbackPath is the event path for the callback transport.
+	CallbackPath string `mapstructure:"callback_path" json:"callback_path"`
+}
+
+// DefaultFeishuDownloadSubdir is appended to the system temp dir when no
+// download directory is configured.
+const DefaultFeishuDownloadSubdir = "huan-agent-downloads"
+
+// DefaultFeishuMaxDownloadMB caps a single downloaded attachment when unset.
+const DefaultFeishuMaxDownloadMB = 32
+
+// RetryBaseDelay returns the configured first backoff delay.
+func (c FeishuConfig) RetryBaseDelay() time.Duration {
+	if c.RetryBaseDelayMS <= 0 {
+		return 300 * time.Millisecond
+	}
+	return time.Duration(c.RetryBaseDelayMS) * time.Millisecond
+}
+
+// SendTimeout returns the per-attempt send timeout (0 disables it).
+func (c FeishuConfig) SendTimeout() time.Duration {
+	if c.SendTimeoutMS <= 0 {
+		return 0
+	}
+	return time.Duration(c.SendTimeoutMS) * time.Millisecond
+}
+
+// MaxDownloadBytes returns the per-attachment download cap.
+func (c FeishuConfig) MaxDownloadBytes() int64 {
+	mb := c.MaxDownloadMB
+	if mb <= 0 {
+		mb = DefaultFeishuMaxDownloadMB
+	}
+	return int64(mb) << 20
+}
+
+// ResolveDownloadDir returns the directory inbound attachments are stored in,
+// falling back to a subdirectory of the system temp dir.
+func (c FeishuConfig) ResolveDownloadDir() string {
+	if strings.TrimSpace(c.DownloadDir) != "" {
+		return c.DownloadDir
+	}
+	return filepath.Join(os.TempDir(), DefaultFeishuDownloadSubdir)
 }
 
 // Resolve returns the active Feishu app. When Active names an entry in Apps it
@@ -319,4 +387,12 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("feishu.app_id", "")
 	v.SetDefault("feishu.app_secret", "")
 	v.SetDefault("feishu.domain", "")
+	v.SetDefault("feishu.thinking", true)
+	v.SetDefault("feishu.retry_attempts", 3)
+	v.SetDefault("feishu.retry_base_delay_ms", 300)
+	v.SetDefault("feishu.send_timeout_ms", 15000)
+	v.SetDefault("feishu.rate_limit_per_sec", 5.0)
+	v.SetDefault("feishu.rate_limit_burst", 10)
+	v.SetDefault("feishu.download_dir", "")
+	v.SetDefault("feishu.max_download_mb", DefaultFeishuMaxDownloadMB)
 }

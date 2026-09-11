@@ -47,14 +47,15 @@ func init() {
 // botHandler answers Feishu IM messages using the session memory + optional
 // ReAct agent, mirroring the chat REPL loop.
 type botHandler struct {
-	cfg      *config.Config
-	logger   *zap.Logger
-	cm       model.BaseChatModel
-	provider string
-	model    string
-	st       store.Store
-	recorder *usage.Recorder
-	sender   feishu.Sender
+	cfg        *config.Config
+	logger     *zap.Logger
+	cm         model.BaseChatModel
+	provider   string
+	model      string
+	st         store.Store
+	recorder   *usage.Recorder
+	sender     feishu.Sender
+	downloader feishu.ResourceDownloader
 
 	mu       sync.Mutex
 	sessions map[string]*botSession
@@ -83,37 +84,83 @@ func newBotHandler(cfg *config.Config, logger *zap.Logger, cm model.BaseChatMode
 }
 
 func (h *botHandler) Handle(ctx context.Context, in feishu.Inbound) error {
-	// Trim + bound the text for the log so secrets/长文本 don't flood.
-	text := strings.TrimSpace(in.Text)
+	if !in.Handled() {
+		return nil
+	}
 	h.logger.Info("bot handler received",
 		zap.String("open_id", in.OpenID),
 		zap.String("chat_id", in.ChatID),
 		zap.String("msg_type", in.MsgType),
-		zap.Int("text_len", len(text)),
+		zap.Int("text_len", len(in.Text)),
+		zap.Int("resources", len(in.Resources)),
 	)
-	if !in.IsText() {
+
+	// Slash commands are only meaningful for plain text messages.
+	if in.IsText() {
+		text := strings.TrimSpace(in.Text)
+		lower := strings.ToLower(text)
+		switch lower {
+		case "/help":
+			return h.reply(ctx, in, "Commands:\n/reset 清空会话\n/remember key: value 记住事实\n/recall query 检索记忆\n/provider 查看模型")
+		case "/provider":
+			return h.reply(ctx, in, fmt.Sprintf("provider=%s model=%s", h.provider, h.model))
+		case "/reset":
+			h.reset(in.OpenID)
+			return h.reply(ctx, in, "(会话已重置)")
+		}
+		if strings.HasPrefix(lower, "/remember ") {
+			return h.remember(ctx, in, text[len("/remember "):])
+		}
+		if strings.HasPrefix(lower, "/recall ") {
+			return h.recall(ctx, in, text[len("/recall "):])
+		}
+	}
+
+	prompt := h.buildPrompt(ctx, in)
+	if prompt == "" {
+		h.logger.Info("feishu: nothing to answer", zap.String("msg_type", in.MsgType))
 		return nil
 	}
-	if text == "" {
-		return nil
+	return h.answer(ctx, in, prompt)
+}
+
+// buildPrompt renders the inbound message as the model prompt, downloading any
+// attachments first and appending their local paths so the agent can reason
+// about them. Download failures degrade to a note rather than an error: the
+// user still gets an answer about the parts that worked.
+func (h *botHandler) buildPrompt(ctx context.Context, in feishu.Inbound) string {
+	base := strings.TrimSpace(in.PromptText())
+	if !in.HasResources() || h.downloader == nil {
+		if in.HasResources() && h.downloader == nil {
+			h.logger.Warn("feishu: attachments present but no downloader configured")
+		}
+		return base
 	}
-	lower := strings.ToLower(text)
-	switch lower {
-	case "/help":
-		return h.reply(ctx, in, "Commands:\n/reset 清空会话\n/remember key: value 记住事实\n/recall query 检索记忆\n/provider 查看模型")
-	case "/provider":
-		return h.reply(ctx, in, fmt.Sprintf("provider=%s model=%s", h.provider, h.model))
-	case "/reset":
-		h.reset(in.OpenID)
-		return h.reply(ctx, in, "(会话已重置)")
+
+	notes := make([]string, 0, len(in.Resources))
+	for _, r := range in.Resources {
+		path, err := h.downloader.Download(ctx, in.MessageID, r)
+		if err != nil {
+			h.logger.Warn("feishu: download attachment failed",
+				zap.String("kind", string(r.Kind)), zap.Error(err))
+			notes = append(notes, fmt.Sprintf("（%s 附件下载失败）", r.Kind))
+			continue
+		}
+		h.logger.Info("feishu: attachment saved",
+			zap.String("kind", string(r.Kind)), zap.String("path", path))
+		if r.Name != "" {
+			notes = append(notes, fmt.Sprintf("（附件 %s 已保存到 %s）", r.Name, path))
+		} else {
+			notes = append(notes, fmt.Sprintf("（附件已保存到 %s）", path))
+		}
 	}
-	if strings.HasPrefix(lower, "/remember ") {
-		return h.remember(ctx, in, text[len("/remember "):])
+	if len(notes) == 0 {
+		return base
 	}
-	if strings.HasPrefix(lower, "/recall ") {
-		return h.recall(ctx, in, text[len("/recall "):])
+	if base == "" {
+		return strings.Join(notes, "\n")
 	}
-	return h.answer(ctx, in, text)
+	return base + "\n" + strings.Join(notes, "\n")
 }
 
 func (h *botHandler) reset(uid string) {
@@ -207,6 +254,19 @@ func (h *botHandler) answer(ctx context.Context, in feishu.Inbound, text string)
 	// tool_call has a paired tool result in the same request. For a plain
 	// conversational IM bot we don't need tools, so bypass the agent to keep
 	// the OpenAI-compatible message stream clean.
+	// Announce progress first: the model call can take many seconds and Feishu
+	// has no streaming, so a placeholder card is replaced with the answer once
+	// it is ready. Failure to send it is not fatal — we fall back to replying.
+	placeholderID := ""
+	if h.cfg.Feishu.Thinking && h.sender != nil {
+		id, perr := h.sender.SendCard(ctx, in.ChatID, "huan-agent", thinkingPlaceholder)
+		if perr != nil {
+			h.logger.Warn("feishu: send thinking placeholder failed", zap.Error(perr))
+		} else {
+			placeholderID = id
+		}
+	}
+
 	var out *schema.Message
 	out, err = h.cm.Generate(ctx, history)
 	if err != nil {
@@ -217,15 +277,35 @@ func (h *botHandler) answer(ctx context.Context, in feishu.Inbound, text string)
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
-		return h.reply(ctx, in, "抱歉，出错了: "+err.Error())
+		return h.finish(ctx, in, placeholderID, "抱歉，出错了: "+err.Error())
 	}
 	if out == nil || strings.TrimSpace(out.Content) == "" {
-		return h.reply(ctx, in, "(empty response)")
+		return h.finish(ctx, in, placeholderID, "(empty response)")
 	}
 	sess.Lock()
 	sess.mem.addAssistantMessage(out)
 	sess.Unlock()
-	return h.reply(ctx, in, out.Content)
+	return h.finish(ctx, in, placeholderID, out.Content)
+}
+
+// thinkingPlaceholder is shown while the model is generating.
+const thinkingPlaceholder = "🤔 正在思考…"
+
+// finish delivers the final answer. When a placeholder card was sent it is
+// updated in place (so the chat does not accumulate two messages); otherwise a
+// fresh reply is sent. A failed update also falls back to a new message so the
+// user always receives the answer.
+func (h *botHandler) finish(ctx context.Context, in feishu.Inbound, placeholderID, text string) error {
+	if placeholderID != "" {
+		if err := h.sender.UpdateCard(ctx, placeholderID, "", text); err == nil {
+			return nil
+		} else {
+			h.logger.Warn("feishu: update placeholder card failed, replying instead",
+				zap.Error(err))
+		}
+		return h.replyCard(ctx, in, text)
+	}
+	return h.reply(ctx, in, text)
 }
 
 // systemPrompt returns the default system prompt.
@@ -239,6 +319,15 @@ func (h *botHandler) reply(ctx context.Context, in feishu.Inbound, text string) 
 		return errors.New("feishu: sender not set")
 	}
 	return h.sender.ReplyText(ctx, in, text)
+}
+
+// replyCard sends the answer as an interactive card, so markdown (code blocks,
+// lists, tables) renders properly. The title is derived from the content.
+func (h *botHandler) replyCard(ctx context.Context, in feishu.Inbound, markdown string) error {
+	if h.sender == nil {
+		return errors.New("feishu: sender not set")
+	}
+	return h.sender.ReplyCard(ctx, in, "", markdown)
 }
 
 // sanitizeBotHistory removes tool-only message fragments and clears stale
@@ -318,18 +407,50 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	sender, err := feishu.RealSender(fsApp.AppID, fsApp.AppSecret, fsApp.Domain)
+	// Build the outbound primitives, then wrap the create step with the
+	// configured resilience layers (rate limit -> retry -> per-attempt
+	// timeout) so a transient Feishu hiccup does not silently drop a reply.
+	create, patch, recall, err := feishu.RealSenderFuncs(fsApp.AppID, fsApp.AppSecret, fsApp.Domain)
 	if err != nil {
 		return err
 	}
+	limiter := feishu.NewLimiter(cfg.Feishu.RateLimitPerSec, cfg.Feishu.RateLimitBurst)
+	retryPolicy := feishu.RetryPolicy{
+		MaxAttempts: cfg.Feishu.RetryAttempts,
+		BaseDelay:   cfg.Feishu.RetryBaseDelay(),
+		Jitter:      true,
+	}
+	create = feishu.WrapCreate(create, retryPolicy, limiter, cfg.Feishu.SendTimeout(), logger)
+	sender := feishu.NewLarkSenderWithCreate(create,
+		feishu.WithPatcher(patch), feishu.WithRecaller(recall))
+
+	// Inbound attachments are downloaded to a local directory so the agent can
+	// read them.
+	downloadDir := cfg.Feishu.ResolveDownloadDir()
+	downloader, err := feishu.RealDownloader(fsApp.AppID, fsApp.AppSecret, fsApp.Domain, downloadDir)
+	if err != nil {
+		return fmt.Errorf("init feishu downloader: %w", err)
+	}
+
 	handler := newBotHandler(cfg, logger, cm, cfg.LLM.DefaultProvider, cfg.LLM.DefaultProvider, st, rec)
 	handler.sender = sender
+	handler.downloader = downloader
 
+	mode, err := feishu.ParseMode(fsApp.Transport)
+	if err != nil {
+		return err
+	}
 	app, err := feishu.NewApp(feishu.Config{
-		AppID:     fsApp.AppID,
-		AppSecret: fsApp.AppSecret,
-		Domain:    fsApp.Domain,
-		Sender:    sender,
+		AppID:             fsApp.AppID,
+		AppSecret:         fsApp.AppSecret,
+		Domain:            fsApp.Domain,
+		VerificationToken: fsApp.VerificationToken,
+		EncryptKey:        fsApp.EncryptKey,
+		Mode:              mode,
+		CallbackAddr:      fsApp.CallbackAddr,
+		CallbackPath:      fsApp.CallbackPath,
+		Sender:            sender,
+		Logger:            logger,
 	}, handler)
 	if err != nil {
 		return fmt.Errorf("init feishu app: %w", err)
@@ -339,7 +460,12 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	defer stop()
 	logger.Info("feishu bot starting",
 		zap.String("provider", cfg.LLM.DefaultProvider),
+		zap.String("transport", string(mode)),
 		zap.Bool("memory", cfg.Memory.Enable),
+		zap.Bool("thinking", cfg.Feishu.Thinking),
+		zap.String("download_dir", downloadDir),
+		zap.Int("retry_attempts", cfg.Feishu.RetryAttempts),
+		zap.Float64("rate_limit_per_sec", cfg.Feishu.RateLimitPerSec),
 	)
 	if err := app.Run(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {

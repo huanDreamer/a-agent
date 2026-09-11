@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestDefault(t *testing.T) {
@@ -295,5 +297,167 @@ llm:
 	p := c.LLM.Providers["deepseek"]
 	if p.APIKey != "sk-env-secret" {
 		t.Errorf("deepseek api_key = %q, want env value sk-env-secret (nested map env override failed)", p.APIKey)
+	}
+}
+
+func TestFeishuConfig_RetryBaseDelay(t *testing.T) {
+	tests := []struct {
+		name string
+		ms   int
+		want time.Duration
+	}{
+		{"default when unset", 0, 300 * time.Millisecond},
+		{"default when negative", -5, 300 * time.Millisecond},
+		{"configured", 50, 50 * time.Millisecond},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := FeishuConfig{RetryBaseDelayMS: tc.ms}
+			if got := c.RetryBaseDelay(); got != tc.want {
+				t.Errorf("RetryBaseDelay() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFeishuConfig_SendTimeout(t *testing.T) {
+	if got := (FeishuConfig{}).SendTimeout(); got != 0 {
+		t.Errorf("unset SendTimeout() = %v, want 0 (disabled)", got)
+	}
+	c := FeishuConfig{SendTimeoutMS: 250}
+	if got := c.SendTimeout(); got != 250*time.Millisecond {
+		t.Errorf("SendTimeout() = %v, want 250ms", got)
+	}
+}
+
+func TestFeishuConfig_MaxDownloadBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		mb   int
+		want int64
+	}{
+		{"default when unset", 0, int64(DefaultFeishuMaxDownloadMB) << 20},
+		{"default when negative", -1, int64(DefaultFeishuMaxDownloadMB) << 20},
+		{"configured", 5, 5 << 20},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := FeishuConfig{MaxDownloadMB: tc.mb}
+			if got := c.MaxDownloadBytes(); got != tc.want {
+				t.Errorf("MaxDownloadBytes() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFeishuConfig_ResolveDownloadDir(t *testing.T) {
+	t.Run("explicit dir wins", func(t *testing.T) {
+		c := FeishuConfig{DownloadDir: "/tmp/custom-dl"}
+		if got := c.ResolveDownloadDir(); got != "/tmp/custom-dl" {
+			t.Errorf("ResolveDownloadDir() = %q, want the configured dir", got)
+		}
+	})
+	t.Run("whitespace is treated as unset", func(t *testing.T) {
+		c := FeishuConfig{DownloadDir: "   "}
+		got := c.ResolveDownloadDir()
+		if got == "" || got == "   " {
+			t.Errorf("ResolveDownloadDir() = %q, want a temp-dir fallback", got)
+		}
+		if !strings.HasSuffix(got, DefaultFeishuDownloadSubdir) {
+			t.Errorf("ResolveDownloadDir() = %q, want it to end with %q", got, DefaultFeishuDownloadSubdir)
+		}
+	})
+	t.Run("empty falls back under the temp dir", func(t *testing.T) {
+		got := (FeishuConfig{}).ResolveDownloadDir()
+		want := filepath.Join(os.TempDir(), DefaultFeishuDownloadSubdir)
+		if got != want {
+			t.Errorf("ResolveDownloadDir() = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestLoad_FeishuBehaviorDefaults(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+
+	c, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.Feishu.Thinking {
+		t.Error("feishu.thinking should default to true")
+	}
+	if c.Feishu.RetryAttempts != 3 {
+		t.Errorf("retry_attempts = %d, want 3", c.Feishu.RetryAttempts)
+	}
+	if c.Feishu.RetryBaseDelayMS != 300 {
+		t.Errorf("retry_base_delay_ms = %d, want 300", c.Feishu.RetryBaseDelayMS)
+	}
+	if c.Feishu.SendTimeoutMS != 15000 {
+		t.Errorf("send_timeout_ms = %d, want 15000", c.Feishu.SendTimeoutMS)
+	}
+	if c.Feishu.RateLimitPerSec != 5.0 {
+		t.Errorf("rate_limit_per_sec = %v, want 5.0", c.Feishu.RateLimitPerSec)
+	}
+	if c.Feishu.RateLimitBurst != 10 {
+		t.Errorf("rate_limit_burst = %d, want 10", c.Feishu.RateLimitBurst)
+	}
+	if c.Feishu.MaxDownloadMB != DefaultFeishuMaxDownloadMB {
+		t.Errorf("max_download_mb = %d, want %d", c.Feishu.MaxDownloadMB, DefaultFeishuMaxDownloadMB)
+	}
+}
+
+func TestLoad_FeishuBehaviorFromYAML(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	yaml := `
+feishu:
+  thinking: false
+  retry_attempts: 1
+  retry_base_delay_ms: 10
+  send_timeout_ms: 500
+  rate_limit_per_sec: 0
+  rate_limit_burst: 2
+  download_dir: "/data/dl"
+  max_download_mb: 4
+  apps:
+    prod:
+      app_id: "cli_p"
+      app_secret: "s"
+      transport: "callback"
+      callback_addr: "127.0.0.1:9999"
+      callback_path: "/hook"
+  active: "prod"
+`
+	if err := os.WriteFile(cfgFile, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	c, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Feishu.Thinking {
+		t.Error("thinking should be false")
+	}
+	if c.Feishu.RetryAttempts != 1 {
+		t.Errorf("retry_attempts = %d, want 1", c.Feishu.RetryAttempts)
+	}
+	if got := c.Feishu.SendTimeout(); got != 500*time.Millisecond {
+		t.Errorf("SendTimeout() = %v, want 500ms", got)
+	}
+	if got := c.Feishu.MaxDownloadBytes(); got != 4<<20 {
+		t.Errorf("MaxDownloadBytes() = %d, want 4MiB", got)
+	}
+	if got := c.Feishu.ResolveDownloadDir(); got != "/data/dl" {
+		t.Errorf("ResolveDownloadDir() = %q, want /data/dl", got)
+	}
+
+	app := c.Feishu.Resolve()
+	if app.AppID != "cli_p" {
+		t.Errorf("active app = %+v, want the prod entry", app)
+	}
+	if app.Transport != "callback" || app.CallbackAddr != "127.0.0.1:9999" || app.CallbackPath != "/hook" {
+		t.Errorf("transport fields not loaded: %+v", app)
 	}
 }
