@@ -18,6 +18,8 @@ export const chat = reactive({
   catalogError: '',
 
   // --- session list: GET /api/chat/sessions -----------------------------
+  /** True once the initial catalog + session load ran (see ensureLoaded). */
+  booted: false,
   sessions: [],
   sessionsStatus: 'loading',
   sessionsError: '',
@@ -324,9 +326,13 @@ export async function loadSessions({ quiet = false, select = true } = {}) {
   }
 }
 
-/** Boot the tab: catalog + sessions, then the newest conversation. */
+/** Boot the view: catalog + sessions, then the newest conversation. */
 export async function ensureLoaded() {
   if (!chat.catalog) await loadCatalog()
+  // The sidebar shows the session list on every view, so the first caller wins
+  // and later calls must not re-select a conversation over the user's choice.
+  if (chat.booted) return
+  chat.booted = true
   await loadSessions()
 }
 
@@ -702,6 +708,7 @@ export function resetChat() {
   chat.catalog = null
   chat.catalogStatus = 'loading'
   chat.catalogError = ''
+  chat.booted = false
   chat.sessions = []
   chat.sessionsStatus = 'loading'
   chat.sessionsError = ''

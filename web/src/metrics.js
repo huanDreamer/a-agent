@@ -17,7 +17,7 @@ export const BAR_METRICS = [
   {
     key: 'calls',
     label: '调用次数',
-    color: '#58a6ff',
+    color: 'var(--chart-1)',
     tone: '',
     barValue: (row) => num(row.calls),
     text: (row) => formatCount(row.calls),
@@ -25,7 +25,7 @@ export const BAR_METRICS = [
   {
     key: 'total_tokens',
     label: '总 token',
-    color: '#bc8cff',
+    color: 'var(--chart-2)',
     tone: 'p',
     barValue: (row) => num(row.total_tokens),
     text: (row) => formatCompact(row.total_tokens),
@@ -33,7 +33,7 @@ export const BAR_METRICS = [
   {
     key: 'cost',
     label: '费用',
-    color: '#3fb950',
+    color: 'var(--chart-3)',
     tone: 'g',
     barValue: (row) => (row.cost && row.cost.priced !== false ? num(row.cost.total) : 0),
     text: (row) => formatCost(row.cost),

@@ -7,6 +7,7 @@
 // missing timestamp, a zero-duration span or a parent cycle degrades to a
 // full-width bar or a root row instead of a NaN width.
 import { computed, reactive } from 'vue'
+import Icon from './Icon.vue'
 import JsonBlock from './JsonBlock.vue'
 import {
   formatCompact,
@@ -257,7 +258,9 @@ function usageTitle(usage) {
           :aria-expanded="Boolean(openRows[node.id])"
           @click="toggle(node.id)"
         >
-          <span class="json-caret" aria-hidden="true">{{ openRows[node.id] ? '▾' : '▸' }}</span>
+          <span class="json-caret" aria-hidden="true">
+            <Icon :name="openRows[node.id] ? 'chevron-down' : 'chevron-right'" :size="14" />
+          </span>
           <span class="wf-name mono" :title="node.obs.name || node.id">
             {{ node.obs.name || '（未命名）' }}
           </span>

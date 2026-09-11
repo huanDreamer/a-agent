@@ -6,6 +6,7 @@
 // than rendered as-is. `toggle: false` makes the block follow the `open` prop
 // only, which lets a parent row own the expand/collapse (the trace waterfall).
 import { computed, ref, watch } from 'vue'
+import Icon from './Icon.vue'
 import { formatJson } from '../format.js'
 
 const props = defineProps({
@@ -40,7 +41,9 @@ const size = computed(() => text.value.length)
       :aria-expanded="expanded"
       @click="internal = !internal"
     >
-      <span class="json-caret" aria-hidden="true">{{ expanded ? '▾' : '▸' }}</span>
+      <span class="json-caret" aria-hidden="true">
+        <Icon :name="expanded ? 'chevron-down' : 'chevron-right'" :size="14" />
+      </span>
       <span>{{ label }}</span>
       <span v-if="!expanded" class="dimmer">{{ size.toLocaleString('en-US') }} 字符</span>
     </button>

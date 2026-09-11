@@ -6,6 +6,8 @@ import AsyncBlock from './AsyncBlock.vue'
 import StatCard from './StatCard.vue'
 import DailyTrendChart from './DailyTrendChart.vue'
 import BarList from './BarList.vue'
+import ViewHead from './ViewHead.vue'
+import ViewToolbar from './ViewToolbar.vue'
 import { api } from '../api.js'
 import {
   formatAverageDuration,
@@ -16,7 +18,7 @@ import {
   isCostUnknown,
 } from '../format.js'
 import { BAR_METRICS } from '../metrics.js'
-import { currentFilters, setTab, state, trendDays } from '../state.js'
+import { currentFilters, rangeNote, setTab, trendDays } from '../state.js'
 import { useResource } from '../useResource.js'
 
 const { data: summary, status: summaryStatus, error: summaryError, reload: reloadSummary } =
@@ -53,109 +55,109 @@ const latencySub = computed(() => {
   if (s.duration_ms === undefined) return ''
   return `总耗时 ${formatDuration(s.duration_ms)}`
 })
-
-function retryAll() {
-  reloadSummary()
-  reloadTrend()
-  reloadModel()
-}
 </script>
 
 <template>
-  <div class="stack">
-    <div class="page-head">
-      <div>
-        <div class="page-title">总览</div>
-        <div class="page-note">
-          统计范围：<b>{{ state.range === 'all' ? '全部时间' : state.range === '24h' ? '最近 24 小时' : state.range === '7d' ? '最近 7 天' : '最近 30 天' }}</b>
-        </div>
-      </div>
-      <button type="button" class="btn sm" @click="retryAll">重新加载</button>
-    </div>
+  <div class="page">
+    <ViewHead title="总览" :note="`用量统计 · ${rangeNote} · 数据直接来自本机 API`">
+      <template #tools>
+        <ViewToolbar />
+      </template>
+    </ViewHead>
 
-    <AsyncBlock
-      :state="summaryStatus"
-      :error="summaryError"
-      :skeleton-rows="3"
-      @retry="reloadSummary"
-    >
-      <div v-if="!summary" class="empty">
-        <div class="empty-ico" aria-hidden="true">◍</div>
-        <div class="empty-text">暂无数据</div>
-      </div>
-      <div v-else class="stat-grid">
-        <StatCard
-          label="调用次数"
-          tone="b"
-          :value="formatCount(totals.calls)"
-          :title="`该区间内共 ${formatCount(totals.calls)} 次 LLM 调用`"
-        />
-        <StatCard
-          label="总 token"
-          tone="p"
-          :value="formatCompact(totals.total_tokens)"
-          :sub="tokenSub"
-          :title="`prompt + completion 合计 ${formatCount(totals.total_tokens)} tokens`"
-        />
-        <StatCard
-          label="费用"
-          tone="g"
-          :value="costValue"
-          :sub="costSub"
-          :title="costUnknown ? '没有匹配到价格表条目，费用未知' : '按价格表估算（USD）'"
-        />
-        <StatCard
-          label="用户数"
-          tone="c"
-          :value="formatCount(totals.users)"
-          title="该区间内产生调用的去重用户数"
-        />
-        <StatCard
-          label="会话数"
-          tone="c"
-          :value="formatCount(totals.sessions)"
-          title="该区间内产生调用的去重会话数"
-        />
-        <StatCard
-          label="平均延迟"
-          tone="a"
-          :value="formatAverageDuration(totals.duration_ms, totals.calls)"
-          :sub="latencySub"
-          title="总耗时 / 调用次数"
-        />
-      </div>
-    </AsyncBlock>
-
-    <AsyncBlock :state="trendStatus" :error="trendError" :skeleton-rows="6" @retry="reloadTrend">
-      <DailyTrendChart :rows="trendRows" />
-    </AsyncBlock>
-
-    <div class="card">
-      <div class="card-head">
-        <div class="card-title">
-          <span class="dot" />
-          按模型分布
-          <span class="card-sub">Top {{ modelRows.length }}</span>
-        </div>
-        <div class="row">
-          <div class="seg" role="group" aria-label="排序指标">
-            <button
-              v-for="m in BAR_METRICS"
-              :key="m.key"
-              type="button"
-              :class="{ active: barMetricKey === m.key }"
-              @click="barMetricKey = m.key"
-            >
-              {{ m.label }}
-            </button>
+    <div class="page-scroll">
+      <div class="stack">
+        <AsyncBlock
+          :state="summaryStatus"
+          :error="summaryError"
+          :skeleton-rows="3"
+          @retry="reloadSummary"
+        >
+          <div v-if="!summary" class="empty">
+            <div class="empty-ico" aria-hidden="true">◍</div>
+            <div class="empty-text">暂无数据</div>
+            <div class="empty-hint">{{ rangeNote }}内没有任何 LLM 调用</div>
           </div>
-          <button type="button" class="btn sm" @click="setTab('model')">查看全部</button>
-        </div>
-      </div>
+          <div v-else class="stat-grid">
+            <StatCard
+              label="调用次数"
+              tone="b"
+              :value="formatCount(totals.calls)"
+              :title="`该区间内共 ${formatCount(totals.calls)} 次 LLM 调用`"
+            />
+            <StatCard
+              label="总 token"
+              tone="p"
+              :value="formatCompact(totals.total_tokens)"
+              :sub="tokenSub"
+              :title="`prompt + completion 合计 ${formatCount(totals.total_tokens)} tokens`"
+            />
+            <StatCard
+              label="费用"
+              tone="g"
+              :value="costValue"
+              :sub="costSub"
+              :title="costUnknown ? '没有匹配到价格表条目，费用未知' : '按价格表估算（USD）'"
+            />
+            <StatCard
+              label="用户数"
+              tone="c"
+              :value="formatCount(totals.users)"
+              title="该区间内产生调用的去重用户数"
+            />
+            <StatCard
+              label="会话数"
+              tone="c"
+              :value="formatCount(totals.sessions)"
+              title="该区间内产生调用的去重会话数"
+            />
+            <StatCard
+              label="平均延迟"
+              tone="a"
+              :value="formatAverageDuration(totals.duration_ms, totals.calls)"
+              :sub="latencySub"
+              title="总耗时 / 调用次数"
+            />
+          </div>
+        </AsyncBlock>
 
-      <AsyncBlock :state="modelStatus" :error="modelError" :skeleton-rows="4" @retry="reloadModel">
-        <BarList :rows="modelRows" :metric="barMetricKey" empty-text="该区间内没有按模型聚合的数据" />
-      </AsyncBlock>
+        <AsyncBlock :state="trendStatus" :error="trendError" :skeleton-rows="6" @retry="reloadTrend">
+          <DailyTrendChart :rows="trendRows" />
+        </AsyncBlock>
+
+        <div class="card">
+          <div class="card-head">
+            <div class="card-title">
+              <span class="dot" />
+              按模型分布
+              <span class="card-sub">Top {{ modelRows.length }}</span>
+            </div>
+            <div class="row">
+              <div class="seg" role="group" aria-label="排序指标">
+                <button
+                  v-for="m in BAR_METRICS"
+                  :key="m.key"
+                  type="button"
+                  :class="{ active: barMetricKey === m.key }"
+                  @click="barMetricKey = m.key"
+                >
+                  {{ m.label }}
+                </button>
+              </div>
+              <button type="button" class="btn sm" @click="setTab('model')">查看全部</button>
+            </div>
+          </div>
+
+          <AsyncBlock :state="modelStatus" :error="modelError" :skeleton-rows="4" @retry="reloadModel">
+            <BarList :rows="modelRows" :metric="barMetricKey" empty-text="该区间内没有按模型聚合的数据" />
+          </AsyncBlock>
+        </div>
+
+        <p class="muted-note page-foot">
+          统计范围：{{ rangeNote }} · 数据来自
+          <code class="md-code">/api/usage/*</code>，未做任何缓存
+        </p>
+      </div>
     </div>
   </div>
 </template>

@@ -5,6 +5,7 @@
 // Enter is ignored while an IME composition is active, otherwise confirming a
 // Chinese candidate would send the message.
 import { computed, nextTick, ref, watch } from 'vue'
+import Icon from './Icon.vue'
 
 const props = defineProps({
   /** No conversation selected: the composer is inert and explains why. */
@@ -91,8 +92,14 @@ defineExpose({ focus })
     />
     <div class="composer-actions">
       <span class="composer-hint">{{ hint }}</span>
-      <button v-if="streaming" type="button" class="btn danger" @click="emit('stop')">停止</button>
-      <button v-else type="submit" class="btn primary" :disabled="!canSend">发送</button>
+      <button v-if="streaming" type="button" class="btn danger" @click="emit('stop')">
+        <Icon name="square" :size="14" />
+        停止
+      </button>
+      <button v-else type="submit" class="btn primary" :disabled="!canSend">
+        <Icon name="send" :size="16" />
+        发送
+      </button>
     </div>
   </form>
 </template>

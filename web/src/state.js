@@ -2,39 +2,45 @@
 //
 // It owns three things:
 //   1. authentication state (whether the login screen is shown);
-//   2. the global time-range selector, which every usage query derives `since`
-//      from;
+//   2. the time-range selector, which every usage query derives `since` from.
+//      The control that changes it lives in each usage view's own toolbar (see
+//      ViewToolbar.vue) — there is no global header any more;
 //   3. the manual-refresh counter: bumping it re-runs the active view's queries
 //      without each view having to know about the toolbar.
 
 import { computed, reactive } from 'vue'
 import { api, setUnauthorizedHandler } from './api.js'
 import { resetChat } from './chatStore.js'
+import { closeDrawer } from './ui.js'
 
-/** Time ranges offered in the header. `hours: null` means "全部". */
+/** Time ranges offered by the usage views. `hours: null` means "全部". */
 export const RANGES = [
-  { key: '24h', label: '24小时', hours: 24 },
-  { key: '7d', label: '7天', hours: 24 * 7 },
-  { key: '30d', label: '30天', hours: 24 * 30 },
-  { key: 'all', label: '全部', hours: null },
+  { key: '24h', label: '24小时', hours: 24, note: '最近 24 小时' },
+  { key: '7d', label: '7天', hours: 24 * 7, note: '最近 7 天' },
+  { key: '30d', label: '30天', hours: 24 * 30, note: '最近 30 天' },
+  { key: 'all', label: '全部', hours: null, note: '全部时间' },
 ]
 
+/**
+ * Navigation. 对话 is the primary surface and therefore the entry view; the
+ * `icon` names come from components/Icon.vue.
+ */
 export const TABS = [
-  { key: 'chat', label: '对话' },
-  { key: 'dashboard', label: '总览' },
-  { key: 'model', label: '按模型' },
-  { key: 'user', label: '按用户' },
-  { key: 'recent', label: '调用记录' },
-  { key: 'audit', label: '审计日志' },
-  { key: 'skills', label: '技能' },
-  { key: 'traces', label: '链路追踪' },
+  { key: 'chat', label: '对话', icon: 'message', section: 'sessions' },
+  { key: 'dashboard', label: '总览', icon: 'activity', section: 'management' },
+  { key: 'model', label: '按模型', icon: 'cpu', section: 'management' },
+  { key: 'user', label: '按用户', icon: 'users', section: 'management' },
+  { key: 'recent', label: '调用记录', icon: 'list', section: 'management' },
+  { key: 'audit', label: '审计日志', icon: 'scroll-text', section: 'management' },
+  { key: 'skills', label: '技能', icon: 'sparkles', section: 'management' },
+  { key: 'traces', label: '链路追踪', icon: 'route', section: 'management' },
 ]
 
 export const state = reactive({
   /** 'checking' | 'login' | 'ready' */
   phase: 'checking',
   username: '',
-  tab: 'dashboard',
+  tab: 'chat',
   range: '7d',
   refreshToken: 0,
   meta: null,
@@ -69,6 +75,12 @@ export const trendDays = computed(() => {
   }
 })
 
+/** Human wording of the active range ("最近 7 天"), for view subtitles. */
+export const rangeNote = computed(() => {
+  const found = RANGES.find((r) => r.key === state.range)
+  return found ? found.note : ''
+})
+
 /** Filters object handed to every usage endpoint. */
 export function currentFilters() {
   return { since: sinceFor(state.range) }
@@ -81,6 +93,9 @@ export function requestRefresh() {
 
 export function setTab(tab) {
   state.tab = tab
+  // Navigating away from the drawer means the user is done with it (it only
+  // exists below 900px, where it covers the content it just opened).
+  closeDrawer()
 }
 
 export function setRange(range) {

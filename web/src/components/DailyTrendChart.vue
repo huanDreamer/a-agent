@@ -16,7 +16,7 @@ const METRICS = [
   {
     key: 'calls',
     label: '调用次数',
-    color: '#58a6ff',
+    color: 'var(--chart-1)',
     pick: (row) => Number(row.calls) || 0,
     value: (v) => formatCount(v),
     axis: (v) => formatCompact(v),
@@ -24,7 +24,7 @@ const METRICS = [
   {
     key: 'tokens',
     label: '总 token',
-    color: '#bc8cff',
+    color: 'var(--chart-2)',
     pick: (row) => Number(row.total_tokens) || 0,
     value: (v) => formatCompact(v),
     axis: (v) => formatCompact(v),
@@ -32,7 +32,7 @@ const METRICS = [
   {
     key: 'cost',
     label: '费用',
-    color: '#3fb950',
+    color: 'var(--chart-3)',
     pick: (row) => (row.cost && row.cost.priced !== false ? Number(row.cost.total) || 0 : 0),
     value: (v) => formatMoney(v),
     axis: (v) => (v === 0 ? '0' : `$${v < 0.1 ? v.toFixed(3) : v.toFixed(2)}`),
@@ -244,7 +244,7 @@ const summary = computed(() => {
               :x2="pad.left + plotW"
               :y1="yAt(tick)"
               :y2="yAt(tick)"
-              :stroke="tick === 0 ? '#243044' : '#1d2838'"
+              :stroke="tick === 0 ? 'var(--border-strong)' : 'var(--border)'"
               stroke-width="1"
               :stroke-dasharray="tick === 0 ? '0' : '3 4'"
             />
@@ -252,7 +252,7 @@ const summary = computed(() => {
               :x="pad.left - 8"
               :y="yAt(tick) + 3.5"
               text-anchor="end"
-              fill="#5d6b82"
+              fill="var(--muted-foreground)"
               font-size="10.5"
               font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
             >
@@ -269,7 +269,7 @@ const summary = computed(() => {
             :x="label.x"
             :y="height - 10"
             text-anchor="middle"
-            fill="#5d6b82"
+            fill="var(--muted-foreground)"
             font-size="10.5"
           >
             {{ label.text }}
@@ -292,7 +292,7 @@ const summary = computed(() => {
             :cx="xAt(p.index)"
             :cy="yAt(p.value)"
             r="3"
-            fill="#0b0f17"
+            fill="var(--card)"
             :stroke="metric.color"
             stroke-width="2"
           >

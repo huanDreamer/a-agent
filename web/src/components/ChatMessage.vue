@@ -5,6 +5,7 @@
 // 思考过程 panel, one card per tool call, the answer itself (rendered by the
 // hand-written markdown subset) and the turn footer with token usage.
 import { computed, ref } from 'vue'
+import Icon from './Icon.vue'
 import JsonBlock from './JsonBlock.vue'
 import MarkdownText from './MarkdownText.vue'
 import {
@@ -93,6 +94,7 @@ async function copy() {
           :title="'把回答复制到剪贴板'"
           @click="copy"
         >
+          <Icon :name="copyState === 'ok' ? 'check' : 'copy'" :size="14" />
           {{ copyState === 'ok' ? '已复制' : copyState === 'fail' ? '复制失败' : '复制' }}
         </button>
       </div>
@@ -105,7 +107,7 @@ async function copy() {
           :aria-expanded="Boolean(item.reasoningOpen)"
           @click="toggleReasoning"
         >
-          <span class="json-caret" aria-hidden="true">{{ item.reasoningOpen ? '▾' : '▸' }}</span>
+          <Icon :name="item.reasoningOpen ? 'chevron-down' : 'chevron-right'" :size="14" />
           <span>思考过程</span>
           <span class="dimmer">
             {{ item.streaming && item.reasoningOpen ? '推理中…' : `${reasoningSize} 字符` }}
