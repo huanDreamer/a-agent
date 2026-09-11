@@ -63,6 +63,36 @@ var migrations = []migration{
 		CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_logs(user_id);
 		CREATE INDEX IF NOT EXISTS idx_inv_user   ON tool_invocations(user_id);`,
 	},
+	{
+		version: 4,
+		name:    "create_chat_sessions",
+		up: `CREATE TABLE IF NOT EXISTS chat_sessions (
+			id          TEXT PRIMARY KEY,
+			title       TEXT NOT NULL DEFAULT '',
+			user_id     TEXT NOT NULL DEFAULT '',
+			provider    TEXT NOT NULL DEFAULT '',
+			model       TEXT NOT NULL DEFAULT '',
+			created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at);
+		CREATE INDEX IF NOT EXISTS idx_chat_sessions_user    ON chat_sessions(user_id);
+
+		CREATE TABLE IF NOT EXISTS chat_messages (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id  TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+			role        TEXT NOT NULL,
+			content     TEXT NOT NULL DEFAULT '',
+			reasoning   TEXT NOT NULL DEFAULT '',
+			tool_calls  TEXT NOT NULL DEFAULT '',
+			tool_call_id TEXT NOT NULL DEFAULT '',
+			tool_name   TEXT NOT NULL DEFAULT '',
+			usage_json  TEXT NOT NULL DEFAULT '',
+			error       TEXT NOT NULL DEFAULT '',
+			created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, id);`,
+	},
 }
 
 // Migrate applies any pending migrations idempotently.

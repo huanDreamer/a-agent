@@ -30,6 +30,32 @@ type Config struct {
 	Feishu   FeishuConfig   `mapstructure:"feishu" json:"feishu"`
 	Pricing  PricingConfig  `mapstructure:"pricing" json:"pricing"`
 	Admin    AdminConfig    `mapstructure:"admin" json:"admin"`
+	Langfuse LangfuseConfig `mapstructure:"langfuse" json:"langfuse"`
+	Chat     ChatConfig     `mapstructure:"chat" json:"chat"`
+}
+
+// ChatConfig configures the web chat feature.
+type ChatConfig struct {
+	// Enable turns the web chat on. It is off by default because it lets the
+	// admin UI spend LLM tokens.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// MaxSteps caps tool-calling iterations per turn.
+	MaxSteps int `mapstructure:"max_steps" json:"max_steps"`
+	// HistoryLimit bounds how many stored messages are replayed to the model.
+	HistoryLimit int `mapstructure:"history_limit" json:"history_limit"`
+	// SystemPrompt overrides the default system prompt.
+	SystemPrompt string `mapstructure:"system_prompt" json:"system_prompt"`
+}
+
+// DefaultChatHistoryLimit bounds the replayed conversation when unset.
+const DefaultChatHistoryLimit = 40
+
+// HistoryLimitOr returns the configured history limit or the default.
+func (c ChatConfig) HistoryLimitOr() int {
+	if c.HistoryLimit <= 0 {
+		return DefaultChatHistoryLimit
+	}
+	return c.HistoryLimit
 }
 
 // DatabaseConfig configures the SQLite database.
@@ -81,6 +107,20 @@ type PricingRate struct {
 	CompletionPer1K float64 `mapstructure:"completion_per_1k" json:"completion_per_1k"`
 }
 
+// LangfuseConfig configures Langfuse tracing.
+type LangfuseConfig struct {
+	// Enable turns tracing on. Tracing also requires Host and the API keys.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// Host is the Langfuse base URL, e.g. https://cloud.langfuse.com.
+	Host string `mapstructure:"host" json:"host"`
+	// PublicKey and SecretKey are the project API keys. Never commit these.
+	PublicKey string `mapstructure:"public_key" json:"public_key"`
+	SecretKey string `mapstructure:"secret_key" json:"secret_key"`
+	// Environment and Release label every trace.
+	Environment string `mapstructure:"environment" json:"environment"`
+	Release     string `mapstructure:"release" json:"release"`
+}
+
 // AdminConfig configures admin authentication.
 type AdminConfig struct {
 	// Username is the single admin account (MVP: single-user password auth).
@@ -107,6 +147,11 @@ type LLMProvider struct {
 	APIKey  string `mapstructure:"api_key" json:"api_key"`
 	BaseURL string `mapstructure:"base_url" json:"base_url"`
 	Model   string `mapstructure:"model" json:"model"`
+	// DisableUsageRequest suppresses stream_options.include_usage, which
+	// streaming needs in order to report token usage. Set it for a provider that
+	// rejects that OpenAI extension; the cost is that streamed calls then report
+	// no token counts.
+	DisableUsageRequest bool `mapstructure:"disable_usage_request" json:"disable_usage_request"`
 }
 
 // AgentConfig configures the ReAct agent loop. Empty values fall back
@@ -436,6 +481,16 @@ func SetDefaults(v *viper.Viper) {
 	// Fallback price (USD per 1000 tokens) for providers without an entry.
 	v.SetDefault("pricing.fallback.prompt_per_1k", 0.0)
 	v.SetDefault("pricing.fallback.completion_per_1k", 0.0)
+	v.SetDefault("chat.enable", true)
+	v.SetDefault("chat.max_steps", 12)
+	v.SetDefault("chat.history_limit", DefaultChatHistoryLimit)
+	v.SetDefault("chat.system_prompt", "")
+	v.SetDefault("langfuse.enable", false)
+	v.SetDefault("langfuse.host", "")
+	v.SetDefault("langfuse.public_key", "")
+	v.SetDefault("langfuse.secret_key", "")
+	v.SetDefault("langfuse.environment", "production")
+	v.SetDefault("langfuse.release", "")
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "console")
 	v.SetDefault("database.path", "./data/huan-agent.db")

@@ -21,6 +21,11 @@ type Provider struct {
 	BaseURL string // OpenAI-compatible API root
 	APIKey  string // empty for local providers (e.g. ollama)
 	Model   string // default model name
+	// DisableUsageRequest suppresses stream_options.include_usage. Streaming
+	// needs it to report token usage, but it is an OpenAI extension: a provider
+	// that rejects unknown request fields would fail every streamed call, so it
+	// can be turned off per provider.
+	DisableUsageRequest bool
 }
 
 // LLMError wraps an upstream LLM call failure with provider context.
@@ -66,6 +71,14 @@ type openAIModel struct {
 	client   *openai.Client
 	tools    []*schema.ToolInfo // bound tools (immutable; use WithTools to derive)
 }
+
+// Name returns the provider's configured model name. It is how tracing and
+// logging attribute a call to a specific model without the caller having to
+// thread the name through; without it a trace records no model at all.
+func (m *openAIModel) Name() string { return m.provider.Model }
+
+// Provider returns the provider name (deepseek, qwen, ...).
+func (m *openAIModel) Provider() string { return m.provider.Name }
 
 // WithTools returns a copy of m with the given tools bound. It
 // implements model.ToolCallingChatModel so the same model can be
@@ -183,6 +196,13 @@ func (m *openAIModel) Stream(ctx context.Context, msgs []*schema.Message, opts .
 		Messages: m.toOpenAIMessages(msgs),
 		Stream:   true,
 	}
+	// Ask for token usage on the final chunk. Without this the stream never
+	// reports usage, so a streamed conversation would show zero tokens and cost
+	// nothing. It is opt-out because it is an OpenAI extension that a strict
+	// provider may reject.
+	if !m.provider.DisableUsageRequest {
+		req.StreamOptions = &openai.StreamOptions{IncludeUsage: true}
+	}
 	if len(m.tools) > 0 {
 		req.Tools = toOpenAITools(m.tools)
 	}
@@ -210,6 +230,17 @@ func (m *openAIModel) Stream(ctx context.Context, msgs []*schema.Message, opts .
 				_ = sw.Send(nil, m.wrapErr(recvErr, 0, ""))
 				return
 			}
+			// The usage-only chunk carries no choices, so it must be handled
+			// before the choice checks or the token counts are lost.
+			if chunk.Usage != nil && len(chunk.Choices) == 0 {
+				if closed := sw.Send(&schema.Message{
+					Role:         schema.Assistant,
+					ResponseMeta: &schema.ResponseMeta{Usage: toTokenUsage(*chunk.Usage)},
+				}, nil); closed {
+					return
+				}
+				continue
+			}
 			if len(chunk.Choices) == 0 {
 				continue
 			}
@@ -217,14 +248,22 @@ func (m *openAIModel) Stream(ctx context.Context, msgs []*schema.Message, opts .
 			msg := &schema.Message{
 				Role:    schema.Assistant,
 				Content: c.Delta.Content,
+				// Reasoning models stream their thinking in a separate field;
+				// dropping it would hide the model's reasoning entirely.
+				ReasoningContent: c.Delta.ReasoningContent,
 			}
 			if len(c.Delta.ToolCalls) > 0 {
 				msg.ToolCalls = toEinoToolCalls(c.Delta.ToolCalls)
 			}
+			meta := &schema.ResponseMeta{}
 			if c.FinishReason != "" {
-				msg.ResponseMeta = &schema.ResponseMeta{
-					FinishReason: string(c.FinishReason),
-				}
+				meta.FinishReason = string(c.FinishReason)
+			}
+			if u := toTokenUsagePtr(chunk.Usage); u != nil {
+				meta.Usage = u
+			}
+			if meta.FinishReason != "" || meta.Usage != nil {
+				msg.ResponseMeta = meta
 			}
 			if closed := sw.Send(msg, nil); closed {
 				return
@@ -232,6 +271,14 @@ func (m *openAIModel) Stream(ctx context.Context, msgs []*schema.Message, opts .
 		}
 	}()
 	return sr, nil
+}
+
+// toTokenUsagePtr converts an optional usage payload.
+func toTokenUsagePtr(u *openai.Usage) *schema.TokenUsage {
+	if u == nil {
+		return nil
+	}
+	return toTokenUsage(*u)
 }
 
 func toTokenUsage(u openai.Usage) *schema.TokenUsage {

@@ -36,6 +36,17 @@ type Store interface {
 	QueryUsageByDay(ctx context.Context, w UsageWindow, days int) ([]UsageDayRow, error)
 	QueryUsageRecent(ctx context.Context, w UsageWindow, limit int) ([]UsageRecord, error)
 
+	// Chat sessions for the web UI (Phase 5 chat).
+	CreateChatSession(ctx context.Context, sess ChatSession) error
+	GetChatSession(ctx context.Context, id string) (ChatSession, error)
+	ListChatSessions(ctx context.Context, f ChatSessionFilter) ([]ChatSession, error)
+	UpdateChatSession(ctx context.Context, id string, patch ChatSessionPatch) error
+	TouchChatSession(ctx context.Context, id string) error
+	DeleteChatSession(ctx context.Context, id string) error
+	AppendChatMessage(ctx context.Context, sessionID string, m ChatMessage) (int64, error)
+	ListChatMessages(ctx context.Context, sessionID string, limit int) ([]ChatMessage, error)
+	DeleteChatMessages(ctx context.Context, sessionID string) error
+
 	// Underlying handle, used sparingly (e.g. health checks).
 	DB() *sql.DB
 }

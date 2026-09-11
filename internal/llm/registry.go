@@ -2,6 +2,8 @@ package llm
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/cloudwego/eino/components/model"
@@ -85,6 +87,67 @@ func (r *Registry) Default() (model.BaseChatModel, error) {
 		return nil, fmt.Errorf("llm: no default provider configured")
 	}
 	return r.Get(r.defaultN)
+}
+
+// GetWithModel returns a chat model for a provider using a specific model name,
+// overriding the provider's configured default. It is what lets the web UI pick
+// a model per conversation while reusing the provider's credentials and base URL.
+// An empty modelName falls back to the provider default.
+func (r *Registry) GetWithModel(provider, modelName string) (model.BaseChatModel, error) {
+	r.mu.RLock()
+	p, ok := r.providers[provider]
+	r.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("llm: provider %q is not configured (known: %v)", provider, r.Names())
+	}
+	if strings.TrimSpace(modelName) == "" {
+		return New(p)
+	}
+	p.Model = modelName
+	return New(p)
+}
+
+// Catalog describes every configured provider and its default model, for a UI
+// that lets a user choose where a conversation runs.
+type Catalog struct {
+	// Name is the provider key.
+	Name string `json:"name"`
+	// Model is the provider's configured default model.
+	Model string `json:"model"`
+	// Default marks the registry's default provider.
+	Default bool `json:"default"`
+	// HasAPIKey reports whether credentials are present, so a UI can avoid
+	// offering a provider that cannot work.
+	HasAPIKey bool `json:"has_api_key"`
+}
+
+// Catalog returns the configured providers in a stable order.
+func (r *Registry) Catalog() []Catalog {
+	r.mu.RLock()
+	names := make([]string, 0, len(r.providers))
+	for n := range r.providers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]Catalog, 0, len(names))
+	for _, n := range names {
+		p := r.providers[n]
+		out = append(out, Catalog{
+			Name:      p.Name,
+			Model:     p.Model,
+			Default:   p.Name == r.defaultN,
+			HasAPIKey: p.APIKey != "",
+		})
+	}
+	r.mu.RUnlock()
+	return out
+}
+
+// DefaultName returns the configured default provider name.
+func (r *Registry) DefaultName() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.defaultN
 }
 
 // Provider returns the configuration for a name (without constructing the client).
