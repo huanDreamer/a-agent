@@ -913,3 +913,81 @@ func TestToolRun_JSONShapeIsSnakeCase(t *testing.T) {
 		t.Errorf("empty fields should be omitted, got %s", b2)
 	}
 }
+
+// TestToolInfos_AlwaysHaveAnObjectSchema guards the regression that broke real
+// providers: a parameter schema whose type was null is rejected outright with
+// "Invalid schema for function ... got 'type: null'".
+func TestToolInfos_AlwaysHaveAnObjectSchema(t *testing.T) {
+	tests := []struct {
+		name   string
+		params string
+	}{
+		{"declared schema", `{"type":"object","properties":{"expr":{"type":"string"}},"required":["expr"]}`},
+		{"empty object", `{}`},
+		{"empty string", ``},
+		{"explicit null", `null`},
+		{"object without a type", `{"properties":{"a":{"type":"string"}}}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tl := &fakeTool{name: "t", desc: "d", params: tc.params,
+				run: func(context.Context, string) (string, error) { return "", nil }}
+			r, err := New(Config{Model: &fakeModel{turns: []*schema.Message{{Role: schema.Assistant, Content: "x"}}},
+				Tools: newRegistry(t, tl), Logger: zap.NewNop()})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			infos, err := r.toolInfos(context.Background())
+			if err != nil {
+				t.Fatalf("toolInfos: %v", err)
+			}
+			if len(infos) != 1 {
+				t.Fatalf("infos = %d, want 1 (a tool must never be dropped for an odd schema)", len(infos))
+			}
+			if infos[0].ParamsOneOf == nil {
+				t.Fatal("ParamsOneOf is nil; the provider would receive no schema at all")
+			}
+			js, err := infos[0].ParamsOneOf.ToJSONSchema()
+			if err != nil {
+				t.Fatalf("ToJSONSchema: %v", err)
+			}
+			if js == nil {
+				t.Fatal("ToJSONSchema returned nil")
+			}
+			if js.Type != "object" {
+				t.Errorf("schema type = %q, want object (providers reject null)", js.Type)
+			}
+		})
+	}
+}
+
+// TestToolInfos_PreservesDeclaredProperties verifies the conversion does not
+// flatten a real schema into an empty object.
+func TestToolInfos_PreservesDeclaredProperties(t *testing.T) {
+	tl := &fakeTool{
+		name: "calc", desc: "calculates",
+		params: `{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}`,
+		run:    func(context.Context, string) (string, error) { return "1", nil },
+	}
+	r, _ := New(Config{Model: &fakeModel{}, Tools: newRegistry(t, tl), Logger: zap.NewNop()})
+
+	infos, err := r.toolInfos(context.Background())
+	if err != nil {
+		t.Fatalf("toolInfos: %v", err)
+	}
+	js, err := infos[0].ParamsOneOf.ToJSONSchema()
+	if err != nil {
+		t.Fatalf("ToJSONSchema: %v", err)
+	}
+	b, err := json.Marshal(js)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), "expression") {
+		t.Errorf("declared property was lost: %s", b)
+	}
+	if !strings.Contains(string(b), `"required"`) {
+		t.Errorf("required list was lost: %s", b)
+	}
+}

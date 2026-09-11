@@ -2,11 +2,14 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
-	"github.com/cloudwego/eino/components/tool"
+	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
+	"github.com/eino-contrib/jsonschema"
 )
 
 type stubTool struct {
@@ -18,7 +21,7 @@ func (s *stubTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 	return &schema.ToolInfo{Name: s.name, Desc: s.desc}, nil
 }
 
-func (s *stubTool) InvokableRun(_ context.Context, args string, _ ...tool.Option) (string, error) {
+func (s *stubTool) InvokableRun(_ context.Context, args string, _ ...einotool.Option) (string, error) {
 	if s.fn == nil {
 		return args, nil
 	}
@@ -185,7 +188,75 @@ func TestSpecOf(t *testing.T) {
 func TestAsEinoTool_Passthrough(t *testing.T) {
 	et := newStub("a", "", nil)
 	got := AsEinoTool(et)
-	if got != tool.InvokableTool(et) {
+	if got != einotool.InvokableTool(et) {
 		t.Error("AsEinoTool should pass through an eino tool")
 	}
+}
+
+// TestSpecOf_ParameterSchemaIsValid guards the regression that made every tool
+// call fail against real providers: ParamsOneOf keeps its schema in unexported
+// fields, so marshalling it produced "{}" and the model received a schema with
+// type null ("Invalid schema for function ... got 'type: null'").
+func TestSpecOf_ParameterSchemaIsValid(t *testing.T) {
+	tests := []struct {
+		name string
+		tool Tool
+	}{
+		{"declared params", &schemaTool{name: "with", params: `{"type":"object","properties":{"a":{"type":"string"}}}`}},
+		{"no params", &schemaTool{name: "without"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := SpecOf(context.Background(), tc.tool)
+			if err != nil {
+				t.Fatalf("SpecOf: %v", err)
+			}
+			var parsed map[string]any
+			if err := json.Unmarshal([]byte(spec.ParametersJSONSchema), &parsed); err != nil {
+				t.Fatalf("schema is not valid JSON (%q): %v", spec.ParametersJSONSchema, err)
+			}
+			if parsed["type"] != "object" {
+				t.Errorf("schema type = %v, want object; got %s",
+					parsed["type"], spec.ParametersJSONSchema)
+			}
+			if _, ok := parsed["properties"]; !ok {
+				t.Errorf("schema has no properties: %s", spec.ParametersJSONSchema)
+			}
+		})
+	}
+
+	// A tool that declares properties keeps them.
+	spec, err := SpecOf(context.Background(), &schemaTool{
+		name:   "keep",
+		params: `{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}`,
+	})
+	if err != nil {
+		t.Fatalf("SpecOf: %v", err)
+	}
+	if !strings.Contains(spec.ParametersJSONSchema, "expression") {
+		t.Errorf("declared property lost: %s", spec.ParametersJSONSchema)
+	}
+}
+
+// schemaTool is a Tool that declares an explicit parameter schema.
+type schemaTool struct {
+	name   string
+	params string
+}
+
+func (s *schemaTool) Info(context.Context) (*schema.ToolInfo, error) {
+	info := &schema.ToolInfo{Name: s.name, Desc: "test"}
+	if s.params == "" {
+		return info, nil
+	}
+	var js jsonschema.Schema
+	if err := json.Unmarshal([]byte(s.params), &js); err != nil {
+		return nil, err
+	}
+	info.ParamsOneOf = schema.NewParamsOneOfByJSONSchema(&js)
+	return info, nil
+}
+
+func (s *schemaTool) InvokableRun(context.Context, string, ...einotool.Option) (string, error) {
+	return "", nil
 }

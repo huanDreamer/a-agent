@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
@@ -82,9 +83,28 @@ func (NopTracer) EndGeneration(context.Context, string, any, Usage, string) {}
 // dropping the parameters would leave the model unable to call the tool with
 // arguments at all.
 func schemaToParams(raw string) (*schema.ParamsOneOf, error) {
+	trimmed := strings.TrimSpace(raw)
+	// A tool that declares nothing, or only an empty object, still needs a valid
+	// object schema: providers reject a function whose parameter type is null
+	// ("Invalid schema for function ... got 'type: null'").
+	if trimmed == "" || trimmed == "{}" || trimmed == "null" {
+		return schema.NewParamsOneOfByJSONSchema(&jsonschema.Schema{
+			Type:       "object",
+			Properties: jsonschema.NewProperties(),
+		}), nil
+	}
+
 	var s jsonschema.Schema
-	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+	if err := json.Unmarshal([]byte(trimmed), &s); err != nil {
 		return nil, err
+	}
+	// A schema without a type is rejected too, so default it to an object
+	// rather than forwarding a null.
+	if strings.TrimSpace(s.Type) == "" {
+		s.Type = "object"
+	}
+	if s.Properties == nil {
+		s.Properties = jsonschema.NewProperties()
 	}
 	return schema.NewParamsOneOfByJSONSchema(&s), nil
 }

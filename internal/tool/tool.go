@@ -10,6 +10,11 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
+// emptyObjectSchema is the minimal valid parameter schema, used for tools that
+// take no arguments. Providers require type "object", so an absent schema cannot
+// simply be omitted.
+const emptyObjectSchema = `{"type":"object","properties":{}}`
+
 // Spec is the static, LLM-facing view of a tool: name, description, and
 // parameter JSON schema. Registry exposes Spec slices to the chat model
 // so it can decide which tool to call.
@@ -51,13 +56,30 @@ func SpecOf(ctx context.Context, t Tool) (Spec, error) {
 	}
 	params := ""
 	if info.ParamsOneOf != nil {
-		// Prefer the explicit JSON schema when the tool declared it.
-		b, _ := jsonMarshal(info.ParamsOneOf)
-		params = string(b)
+		// ParamsOneOf keeps its schema in unexported fields, so marshalling it
+		// directly yields "{}" — an empty schema with no type, which providers
+		// reject outright ("got 'type: null'"). ToJSONSchema is the accessor that
+		// actually produces the schema the model needs.
+		js, err := info.ParamsOneOf.ToJSONSchema()
+		if err != nil {
+			return Spec{}, fmt.Errorf("tool %q: parameter schema: %w", info.Name, err)
+		}
+		if js != nil {
+			b, merr := jsonMarshal(js)
+			if merr != nil {
+				return Spec{}, fmt.Errorf("tool %q: encode parameter schema: %w", info.Name, merr)
+			}
+			params = string(b)
+		}
+	}
+	// A tool that declares no parameters still has to send a valid object
+	// schema: providers reject a missing or null "type".
+	if params == "" || params == "{}" || params == "null" {
+		params = emptyObjectSchema
 	}
 	return Spec{
-		Name:                info.Name,
-		Description:         info.Desc,
+		Name:                 info.Name,
+		Description:          info.Desc,
 		ParametersJSONSchema: params,
 	}, nil
 }
