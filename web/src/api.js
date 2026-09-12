@@ -1,11 +1,12 @@
 // Minimal fetch wrapper for the huan-agent admin API.
 //
-// - always sends cookies (`credentials: 'same-origin'`), because the session
-//   cookie set by POST /api/login is the only authentication mechanism;
+// - sends cookies (`credentials: 'same-origin'`) so a deployment with
+//   `admin.require_login: true` would still be able to carry a session cookie;
+//   the login-free default (require_login: false) needs none;
 // - decodes/encodes JSON and raises ApiError (carrying the HTTP status) on
 //   every failure, so views never have to inspect Response objects;
-// - a 401 means the session expired: the registered handler flips the app back
-//   to the login screen before the error propagates to the caller.
+// - a 401 means the server wants a session this console cannot provide: the
+//   registered handler surfaces a shell notice before the error propagates.
 
 import { createSseParser, parseSsePayload } from './sse.js'
 
@@ -78,7 +79,7 @@ async function request(path, options = {}) {
     } catch (cause) {
       if (response.status === 401) {
         notifyUnauthorized()
-        throw new ApiError('登录状态已失效，请重新登录', 401, null)
+        throw new ApiError('服务端要求登录（HTTP 401）', 401, null)
       }
       throw new ApiError(`服务器返回了非 JSON 响应（HTTP ${response.status}）`, response.status, text)
     }
@@ -86,7 +87,7 @@ async function request(path, options = {}) {
 
   if (response.status === 401) {
     notifyUnauthorized()
-    throw new ApiError(messageOf(data, '密码错误或登录状态已失效'), 401, data)
+    throw new ApiError(messageOf(data, '服务端要求登录（HTTP 401）'), 401, data)
   }
 
   if (!response.ok) {
@@ -140,7 +141,7 @@ export async function streamChatTurn(sessionId, content, { signal, onEvent } = {
 
   if (response.status === 401) {
     notifyUnauthorized()
-    throw new ApiError('登录状态已失效，请重新登录', 401, null)
+    throw new ApiError('服务端要求登录（HTTP 401）', 401, null)
   }
 
   if (!response.ok) {
@@ -234,11 +235,10 @@ function usageQuery(filters = {}) {
 }
 
 export const api = {
-  // --- auth -------------------------------------------------------------
-  login: (password) => request('/api/login', { method: 'POST', body: { password } }),
-  logout: () => request('/api/logout', { method: 'POST' }),
+  // --- bootstrap --------------------------------------------------------
+  // The console is login-free: /api/me is only the boot probe (it answers 200
+  // with {"authenticated":false} when require_login is off).
   me: () => request('/api/me'),
-  health: () => request('/api/health'),
 
   // --- usage ------------------------------------------------------------
   usageSummary: (filters) => request('/api/usage/summary', { query: usageQuery(filters) }),

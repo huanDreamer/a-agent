@@ -284,6 +284,88 @@ export const maxSteps = computed(() => {
 
 export const activeSession = computed(() => chat.session)
 
+// ------------------------------------------------------ model selector --
+
+/**
+ * Select options grouped by provider, for the composer's model picker.
+ *
+ * The value is the option's own key rather than a "provider/model" string,
+ * because neither part is guaranteed to be free of the separator.
+ */
+export const modelOptionGroups = computed(() => {
+  const groups = modelGroups.value.map((group) => ({ provider: group.provider, options: [] }))
+  const byProvider = new Map(groups.map((group) => [group.provider, group]))
+  const flat = []
+
+  for (const group of modelGroups.value) {
+    const bucket = byProvider.get(group.provider)
+    for (const entry of group.models) {
+      const option = {
+        key: `catalog-${flat.length}`,
+        provider: entry.provider,
+        model: entry.model,
+        label:
+          `${entry.provider || '—'} / ${entry.model || '—'}` +
+          (entry.isDefault ? '（默认）' : '') +
+          (entry.hasKey ? '' : '（未配置 API Key）'),
+        disabled: !entry.hasKey,
+      }
+      bucket.options.push(option)
+      flat.push(option)
+    }
+  }
+
+  const current = chat.session
+  if (current && !flat.some((o) => o.provider === current.provider && o.model === current.model)) {
+    // Never leave the picker blank: the session may point at a model that is no
+    // longer offered (or the catalog may be empty).
+    const option = {
+      key: 'current',
+      provider: current.provider || '',
+      model: current.model || '',
+      label: `${current.provider || '—'} / ${current.model || '—'}（不在目录中）`,
+      disabled: false,
+    }
+    groups.unshift({ provider: '当前会话', options: [option] })
+    flat.unshift(option)
+  }
+  return groups
+})
+
+export const modelOptions = computed(() =>
+  modelOptionGroups.value.flatMap((group) => group.options),
+)
+
+/** Key of the option matching the active session, or '' when there is none. */
+export const selectedModelKey = computed(() => {
+  const current = chat.session
+  if (!current) return ''
+  const found = modelOptions.value.find(
+    (o) => o.provider === current.provider && o.model === current.model,
+  )
+  return found ? found.key : ''
+})
+
+/** The catalog entry for the active session's model, when it is known. */
+export const currentCatalogEntry = computed(() => {
+  const current = chat.session
+  if (!current) return null
+  return (
+    modelGroups.value
+      .flatMap((group) => group.models)
+      .find((entry) => entry.provider === current.provider && entry.model === current.model) || null
+  )
+})
+
+/** Select handler for the composer's picker. */
+export function changeModel(key) {
+  const option = modelOptions.value.find((o) => o.key === key)
+  if (!option) return
+  const current = chat.session
+  if (current && option.provider === current.provider && option.model === current.model) return
+  setModel(option.provider, option.model)
+}
+
 // ------------------------------------------------------------------ loading --
 
 export async function loadCatalog({ quiet = false } = {}) {
@@ -691,38 +773,6 @@ function handleEvent(turn, event) {
     default:
       return true
   }
-}
-
-/** Drop every trace of the previous login (called on logout). */
-export function resetChat() {
-  streamSeq += 1
-  if (controller) {
-    const pending = controller
-    controller = null
-    pending.abort()
-  }
-  if (noticeTimer) {
-    window.clearTimeout(noticeTimer)
-    noticeTimer = null
-  }
-  chat.catalog = null
-  chat.catalogStatus = 'loading'
-  chat.catalogError = ''
-  chat.booted = false
-  chat.sessions = []
-  chat.sessionsStatus = 'loading'
-  chat.sessionsError = ''
-  chat.activeId = ''
-  chat.session = null
-  chat.items = []
-  chat.messagesStatus = 'ready'
-  chat.messagesError = ''
-  chat.streaming = false
-  chat.creating = false
-  chat.streamTick = 0
-  chat.actionError = ''
-  chat.pendingContent = ''
-  chat.notice = ''
 }
 
 /** Dismiss the action-error banner (and forget the pending retry). */

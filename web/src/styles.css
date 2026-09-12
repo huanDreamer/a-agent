@@ -272,6 +272,10 @@ samp {
 
 /* ------------------------------------------------------------- sidebar --- */
 
+/* Exactly three regions, in this order: 新建对话, the session list (which takes
+   every remaining pixel and scrolls), and the two pinned menu items. Nothing
+   sits above the button — no brand, no provider/model line, no theme control —
+   and nothing follows the menu — no account row, no 退出, no version string. */
 .side-panel {
   display: flex;
   flex-direction: column;
@@ -279,103 +283,9 @@ samp {
   min-height: 0;
 }
 
-.side-top {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 14px 12px 10px;
-}
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.brand-text {
-  min-width: 0;
-}
-
-.brand-mark {
-  width: 30px;
-  height: 30px;
-  border-radius: var(--radius-sm);
-  background: var(--primary);
-  color: var(--primary-foreground);
-  display: grid;
-  place-items: center;
-  font-weight: 700;
-  font-size: 14px;
+.side-new {
   flex: 0 0 auto;
-}
-
-.brand-name {
-  font-size: 14.5px;
-  font-weight: 600;
-  letter-spacing: -0.2px;
-  white-space: nowrap;
-}
-
-.brand-sub {
-  font-size: 11.5px;
-  color: var(--muted-foreground);
-  white-space: nowrap;
-}
-
-.theme-toggle {
-  display: inline-flex;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-xs);
-  background: var(--muted);
-  flex: 0 0 auto;
-}
-
-.theme-btn {
-  appearance: none;
-  border: none;
-  background: none;
-  color: var(--muted-foreground);
-  width: 24px;
-  height: 22px;
-  display: grid;
-  place-items: center;
-  border-radius: calc(var(--radius-xs) - 0.125rem);
-  transition: background 0.15s ease, color 0.15s ease;
-}
-
-.theme-btn:hover {
-  color: var(--foreground);
-  background: var(--background);
-}
-
-.theme-btn.active {
-  background: var(--background);
-  color: var(--foreground);
-  box-shadow: inset 0 0 0 1px var(--border-strong);
-}
-
-.side-meta {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  padding: 0 12px 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.side-sessions {
-  display: flex;
-  flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 0;
-  padding: 10px 8px 6px;
-}
-
-.side-head {
-  padding: 0 2px 8px;
+  padding: 12px 10px 8px;
 }
 
 .side-scroll {
@@ -383,13 +293,7 @@ samp {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-}
-
-.side-section {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding-bottom: 4px;
+  padding: 0 8px 8px;
 }
 
 .side-label {
@@ -398,7 +302,7 @@ samp {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--muted-foreground);
-  padding: 8px 10px 4px;
+  padding: 4px 10px 6px;
 }
 
 .nav-item {
@@ -437,47 +341,13 @@ samp {
   white-space: nowrap;
 }
 
+/* The two pinned entries: 设置 and 统计监控. */
 .side-nav {
   display: flex;
   flex-direction: column;
   gap: 2px;
   padding: 8px;
   border-top: 1px solid var(--border);
-  flex: 0 0 auto;
-  max-height: 44vh;
-  overflow-y: auto;
-}
-
-.side-foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 10px 12px;
-  border-top: 1px solid var(--border);
-  flex: 0 0 auto;
-}
-
-.side-user {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1 1 auto;
-  min-width: 0;
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.avatar {
-  width: 24px;
-  height: 24px;
-  border-radius: 999px;
-  background: var(--muted);
-  border: 1px solid var(--border);
-  display: grid;
-  place-items: center;
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--muted-strong);
   flex: 0 0 auto;
 }
 
@@ -543,14 +413,49 @@ samp {
   color: var(--muted-foreground);
 }
 
+/* Row actions (重命名 / 清空 / 删除) are overlays, so revealing them never
+   reflows the list. They are hidden with `visibility: hidden` — not merely
+   transparent, so a click cannot land on an invisible button and
+   `document.elementFromPoint` skips them — and revealed on row hover or
+   keyboard focus. Tabbing into the row's pick button already counts as
+   `:focus-within`, so the very next Tab reaches the buttons; below 900px there
+   is no hover, so the media query keeps them visible (see the responsive
+   section). */
+.session-item {
+  position: relative;
+}
+
 .session-actions,
 .session-confirm {
+  position: absolute;
+  right: 4px;
+  bottom: 2px;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 4px;
-  flex-wrap: wrap;
-  padding: 0 6px 5px;
+  padding: 1px 2px;
+  border-radius: var(--radius-sm);
+  background: var(--muted);
   font-size: 12px;
+}
+
+.session-actions {
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.session-item:hover .session-actions,
+.session-item:focus-within .session-actions {
+  visibility: visible;
+  opacity: 1;
+}
+
+/* The two-step confirmation replaces them once an action was chosen, and stays
+   visible until it is answered. */
+.session-confirm {
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 
 .session-edit {
@@ -1440,23 +1345,6 @@ table.data tbody tr.selected {
   font-size: 14px;
 }
 
-.chat-model {
-  width: auto;
-  max-width: 260px;
-  padding: 5px 8px;
-  font-size: 12.5px;
-}
-
-.chat-chips {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  flex: 0 0 auto;
-  padding: 7px 14px;
-  border-bottom: 1px solid var(--border);
-}
-
 .chat-scroll {
   position: relative;
   display: flex;
@@ -1644,36 +1532,157 @@ table.data tbody tr.selected {
   font-weight: 600;
 }
 
-/* Composer: pinned at the bottom of the chat column, never scrolled away. */
+/* Composer: one integrated container — textarea on top, model picker at the
+   bottom-left, send button at the bottom-right — pinned at the bottom of the
+   chat column and never scrolled away. */
 .composer {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
   flex: 0 0 auto;
-  padding: 10px 14px 12px;
-  border-top: 1px solid var(--border);
+  padding: 10px 18px 14px;
   background: var(--background);
 }
 
-.composer-input {
-  resize: none;
-  min-height: 38px;
-  max-height: 190px;
-  overflow-y: auto;
-  line-height: 1.55;
+.composer-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 8px 8px 7px 12px;
+  background: var(--card);
+  border: 1px solid var(--input);
+  border-radius: var(--radius-xl);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.composer-actions {
+/* The whole container lights up while the textarea has focus. */
+.composer-box:focus-within {
+  border-color: var(--ring);
+  box-shadow: 0 0 0 3px var(--muted);
+}
+
+.composer-input {
+  appearance: none;
+  border: none;
+  background: none;
+  outline: none;
+  resize: none;
+  width: 100%;
+  /* ≈4 visible lines at rest; grows with the content, then scrolls. */
+  min-height: 96px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 4px 4px 0;
+  font-size: 14px;
+  line-height: 1.62;
+  color: var(--foreground);
+}
+
+.composer-input::placeholder {
+  color: var(--muted-foreground);
+}
+
+.composer-input:disabled {
+  cursor: not-allowed;
+  color: var(--muted-foreground);
+}
+
+.composer-bar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Model picker: a compact chip inside the container, showing provider / model. */
+.composer-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 999px;
+  color: var(--muted-strong);
+  background: var(--muted);
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.composer-model:hover {
+  color: var(--foreground);
+}
+
+.composer-select {
+  appearance: none;
+  border: none;
+  background: none;
+  outline: none;
+  max-width: 260px;
+  min-width: 0;
+  padding: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: inherit;
+  text-overflow: ellipsis;
+}
+
+.composer-select:disabled {
+  cursor: not-allowed;
+  color: var(--muted-foreground);
 }
 
 .composer-hint {
   flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 11.5px;
   color: var(--muted-foreground);
+}
+
+.composer-send {
+  appearance: none;
+  border: 1px solid var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.composer-send:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.composer-send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.composer-stop {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--destructive);
+  height: 34px;
+  flex: 0 0 auto;
+  padding: 0 13px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.composer-stop:hover {
+  background: var(--muted);
+  border-color: var(--destructive);
 }
 
 .chat-jump {
@@ -1929,61 +1938,7 @@ table.data tbody tr.row-click:focus-visible {
   min-width: 0;
 }
 
-/* ---------------------------------------------------------------- login -- */
-
-.login-screen {
-  min-height: 100vh;
-  min-height: 100svh;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: var(--background);
-}
-
-.login-card {
-  width: 100%;
-  max-width: 372px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 28px 26px 24px;
-  box-shadow: var(--shadow);
-}
-
-.login-brand {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  margin-bottom: 18px;
-}
-
-.login-title {
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: -0.3px;
-}
-
-.login-sub {
-  color: var(--muted-foreground);
-  font-size: 13px;
-  margin-bottom: 18px;
-  word-break: break-word;
-}
-
-.login-card .btn.primary {
-  width: 100%;
-  padding: 10px 14px;
-  font-size: 14px;
-  margin-top: 4px;
-}
-
-.login-foot {
-  margin-top: 16px;
-  font-size: 11.5px;
-  color: var(--muted-foreground);
-  text-align: center;
-  line-height: 1.6;
-}
+/* ---------------------------------------------------------------- misc --- */
 
 .spin {
   display: inline-block;
@@ -2003,7 +1958,13 @@ table.data tbody tr.row-click:focus-visible {
   }
 }
 
-/* ---------------------------------------------------------------- misc --- */
+/* Shell notice, above the active surface: only a server that turned the login
+   check back on can produce it. */
+.main-banner {
+  flex: 0 0 auto;
+  margin: 10px 18px 0;
+  border-radius: var(--radius-sm);
+}
 
 .filter-bar {
   display: flex;
@@ -2026,6 +1987,128 @@ table.data tbody tr.row-click:focus-visible {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 16px;
+}
+
+/* ------------------------------------------------- 统计监控 sub-tabs ----- */
+
+/* Six sub-tabs inside one page. They scroll horizontally rather than wrapping,
+   so the strip keeps its height at 380px. */
+.subtabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.subtabs::-webkit-scrollbar {
+  display: none;
+}
+
+.subtab {
+  appearance: none;
+  border: none;
+  background: none;
+  position: relative;
+  padding: 9px 10px 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+  transition: color 0.15s ease;
+}
+
+.subtab:hover {
+  color: var(--foreground);
+}
+
+.subtab.active {
+  color: var(--foreground);
+  font-weight: 600;
+}
+
+.subtab.active::after {
+  content: '';
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--primary);
+}
+
+/* The panel header owns 刷新 / host: the panel's own controls, not the page's. */
+.panel-tools {
+  justify-content: flex-end;
+}
+
+/* ------------------------------------------------------------- settings --- */
+
+.set-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.set-text {
+  min-width: 0;
+  flex: 1 1 220px;
+}
+
+.set-name {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.set-desc {
+  font-size: 12.5px;
+  color: var(--muted-foreground);
+}
+
+.kv {
+  display: flex;
+  flex-direction: column;
+}
+
+.kv-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.kv-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.kv-row dt {
+  font-size: 12.5px;
+  color: var(--muted-foreground);
+}
+
+.kv-row dd {
+  min-width: 0;
+  font-size: 13px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.card-foot {
+  margin-top: 12px;
+}
+
+.tools-chips {
+  margin-top: 10px;
 }
 
 /* ---------------------------------------------------------- responsive --- */
@@ -2063,6 +2146,12 @@ table.data tbody tr.row-click:focus-visible {
     display: inline-flex;
   }
 
+  /* No hover on touch: keep the row actions reachable instead of hiding them. */
+  .session-actions {
+    visibility: visible;
+    opacity: 1;
+  }
+
   .grid-2 {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -2097,7 +2186,6 @@ table.data tbody tr.row-click:focus-visible {
     padding: 9px 12px;
   }
 
-  .chat-chips,
   .chat-scroll,
   .composer {
     padding-left: 12px;
@@ -2108,10 +2196,24 @@ table.data tbody tr.row-click:focus-visible {
     max-width: 92%;
   }
 
-  .chat-title-input,
-  .chat-model {
+  .chat-title-input {
     width: 100%;
     max-width: 100%;
+  }
+
+  .composer-select {
+    max-width: 148px;
+  }
+
+  .composer-hint {
+    display: none;
+  }
+
+  .subtabs,
+  .view-head,
+  .page-scroll {
+    padding-left: 12px;
+    padding-right: 12px;
   }
 
   .wf-model {
@@ -2143,13 +2245,6 @@ table.data tbody tr.row-click:focus-visible {
     gap: 6px;
   }
 
-  .brand-sub {
-    display: none;
-  }
-
-  .login-card {
-    padding: 22px 18px 20px;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {

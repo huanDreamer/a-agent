@@ -1,16 +1,19 @@
 // Tiny reactive store — the app has no router and no state library on purpose.
 //
-// It owns three things:
-//   1. authentication state (whether the login screen is shown);
-//   2. the time-range selector, which every usage query derives `since` from.
-//      The control that changes it lives in each usage view's own toolbar (see
-//      ViewToolbar.vue) — there is no global header any more;
-//   3. the manual-refresh counter: bumping it re-runs the active view's queries
-//      without each view having to know about the toolbar.
+// It owns four things:
+//   1. navigation: which top-level surface is showing ('chat' | 'settings' |
+//      'monitor') and which sub-tab of 统计监控 is open;
+//   2. the time-range selector, from which every usage query derives its
+//      `since` (and the trend chart its `days`);
+//   3. the manual-refresh counter: bumping it re-runs the mounted view's
+//      queries without the view knowing about the toolbar;
+//   4. the cached GET /api/meta payload shown by 设置.
+//
+// There is no authentication state: the console is login-free
+// (admin.require_login defaults to false) and renders immediately on load.
 
 import { computed, reactive } from 'vue'
 import { api, setUnauthorizedHandler } from './api.js'
-import { resetChat } from './chatStore.js'
 import { closeDrawer } from './ui.js'
 
 /** Time ranges offered by the usage views. `hours: null` means "全部". */
@@ -22,33 +25,40 @@ export const RANGES = [
 ]
 
 /**
- * Navigation. 对话 is the primary surface and therefore the entry view; the
- * `icon` names come from components/Icon.vue.
+ * The two surfaces pinned at the bottom of the sidebar. `icon` names come from
+ * components/Icon.vue; 对话 is the default surface and has no nav entry of its
+ * own (the session list is the navigation).
  */
-export const TABS = [
-  { key: 'chat', label: '对话', icon: 'message', section: 'sessions' },
-  { key: 'dashboard', label: '总览', icon: 'activity', section: 'management' },
-  { key: 'model', label: '按模型', icon: 'cpu', section: 'management' },
-  { key: 'user', label: '按用户', icon: 'users', section: 'management' },
-  { key: 'recent', label: '调用记录', icon: 'list', section: 'management' },
-  { key: 'audit', label: '审计日志', icon: 'scroll-text', section: 'management' },
-  { key: 'skills', label: '技能', icon: 'sparkles', section: 'management' },
-  { key: 'traces', label: '链路追踪', icon: 'route', section: 'management' },
+export const NAV = [
+  { key: 'settings', label: '设置', icon: 'settings' },
+  { key: 'monitor', label: '统计监控', icon: 'bar-chart' },
+]
+
+/** The six sub-tabs of 统计监控, all inside one page. */
+export const MONITOR_TABS = [
+  { key: 'dashboard', label: '总览' },
+  { key: 'model', label: '按模型' },
+  { key: 'user', label: '按用户' },
+  { key: 'recent', label: '调用记录' },
+  { key: 'audit', label: '审计日志' },
+  { key: 'traces', label: '链路追踪' },
 ]
 
 export const state = reactive({
-  /** 'checking' | 'login' | 'ready' */
-  phase: 'checking',
-  username: '',
+  /** 'chat' | 'settings' | 'monitor' */
   tab: 'chat',
+  /** Active sub-tab of 统计监控. */
+  monitor: 'dashboard',
   range: '7d',
   refreshToken: 0,
   meta: null,
   metaError: '',
-  /** Set by the login form or by an expired session, shown on the login card. */
-  authNotice: '',
-  /** True once a session was established — a first visit is not an "expiry". */
-  hadSession: false,
+  /**
+   * Set when the server answers 401 — only possible on a deployment that turned
+   * 登录校验 back on (admin.require_login: true). This console has no login
+   * flow, so it explains the situation instead of redirecting anywhere.
+   */
+  denied: false,
 })
 
 /**
@@ -91,10 +101,15 @@ export function requestRefresh() {
   if (state.metaError) loadMeta()
 }
 
+/** Switch top-level surface. Navigating means the drawer is no longer needed. */
 export function setTab(tab) {
   state.tab = tab
-  // Navigating away from the drawer means the user is done with it (it only
-  // exists below 900px, where it covers the content it just opened).
+  closeDrawer()
+}
+
+/** Switch the 统计监控 sub-tab (also reached from 总览's 查看全部). */
+export function setMonitor(key) {
+  state.monitor = key
   closeDrawer()
 }
 
@@ -104,36 +119,30 @@ export function setRange(range) {
   state.refreshToken += 1
 }
 
-/** Called by api.js on any 401 — drops us back to the login screen. */
-export function onUnauthorized() {
-  if (state.phase === 'login') return
-  // Only an *expired* session deserves the notice; a first visit is not one.
-  state.authNotice = state.hadSession ? '登录状态已失效，请重新登录' : ''
-  state.phase = 'login'
-  state.username = ''
-  state.hadSession = false
+/** Called by api.js on any 401: the server wants a session this UI cannot give. */
+function onDenied() {
+  state.denied = true
 }
 
-setUnauthorizedHandler(onUnauthorized)
+setUnauthorizedHandler(onDenied)
 
-/** Runs on boot: is an admin session already active? */
-export async function checkSession() {
+/**
+ * Boot the shell. `GET /api/me` is the app's bootstrap probe: with login
+ * disabled it answers 200 ({"authenticated":false} without a cookie) and the
+ * console is usable right away — nothing is gated on it. A transport failure
+ * is not fatal either: each view reports its own loading error.
+ */
+export async function bootstrap() {
   try {
-    const res = await api.me()
-    if (res && res.authenticated) {
-      state.username = res.username || 'admin'
-      state.hadSession = true
-      state.phase = 'ready'
-      loadMeta()
-      return
-    }
-    state.phase = 'login'
+    await api.me()
+    state.denied = false
   } catch (err) {
-    // A 401 already flipped us to 'login' (and set the notice) in onUnauthorized.
-    state.phase = 'login'
+    if (err && err.status === 401) state.denied = true
   }
+  await loadMeta()
 }
 
+/** Provider / model / version / feature flags, rendered read-only by 设置. */
 export async function loadMeta() {
   try {
     state.meta = await api.meta()
@@ -142,32 +151,4 @@ export async function loadMeta() {
     if (err && err.status === 401) return
     state.metaError = err && err.message ? err.message : '无法读取服务信息'
   }
-}
-
-export async function login(password) {
-  const res = await api.login(password)
-  state.username = (res && res.username) || 'admin'
-  state.authNotice = ''
-  state.hadSession = true
-  state.phase = 'ready'
-  state.refreshToken += 1
-  loadMeta()
-}
-
-export async function logout() {
-  try {
-    await api.logout()
-  } catch (err) {
-    // Logging out locally is best-effort: even if the request failed (offline,
-    // expired cookie) we must not keep the user inside the admin UI.
-  }
-  // Conversations belong to the previous session: drop them (and any stream
-  // still running) so the next login starts clean.
-  resetChat()
-  state.phase = 'login'
-  state.username = ''
-  state.authNotice = ''
-  state.hadSession = false
-  state.meta = null
-  state.tab = 'dashboard'
 }

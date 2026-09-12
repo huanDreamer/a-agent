@@ -1,13 +1,18 @@
 <script setup>
-// Time-range selector + 刷新.
+// Time-range selector + 刷新 for the usage sub-tabs of 统计监控.
 //
-// These used to live in the global header; they belong to the usage views only
-// (总览 / 按模型 / 按用户 / 调用记录 / 审计日志), because `state.range` drives
-// their `since` filter. 对话 and 技能 never mount this, and 链路追踪 has its own
-// filters.
+// `state.range` is what every usage query turns into `since` (and the trend
+// chart into `days`), so this control — not a global header — is what makes the
+// range work. 审计日志 mounts it with :range="false": that view has no time
+// filter of its own, but 刷新 is still useful there. 链路追踪 never mounts it.
 import { computed, ref } from 'vue'
 import Icon from './Icon.vue'
 import { RANGES, requestRefresh, setRange, state } from '../state.js'
+
+const props = defineProps({
+  /** Render the 24小时 / 7天 / 30天 / 全部 segment. */
+  range: { type: Boolean, default: true },
+})
 
 /** Short visual acknowledgement — the queries themselves are fired by the view. */
 const busy = ref(false)
@@ -16,6 +21,12 @@ const rangeLabel = computed(() => {
   const found = RANGES.find((r) => r.key === state.range)
   return found ? found.label : ''
 })
+
+const refreshTitle = computed(() =>
+  props.range
+    ? `重新加载当前页面数据（当前范围：${rangeLabel.value}）`
+    : '重新加载当前页面数据',
+)
 
 function onRefresh() {
   busy.value = true
@@ -28,27 +39,21 @@ function onRefresh() {
 
 <template>
   <div class="row head-tools">
-    <div class="seg" role="group" aria-label="统计时间范围">
+    <div v-if="range" class="seg" role="group" aria-label="统计时间范围">
       <button
-        v-for="range in RANGES"
-        :key="range.key"
+        v-for="item in RANGES"
+        :key="item.key"
         type="button"
-        :class="{ active: state.range === range.key }"
-        :title="`统计范围：${range.label}`"
-        :aria-pressed="state.range === range.key"
-        @click="setRange(range.key)"
+        :class="{ active: state.range === item.key }"
+        :title="`统计范围：${item.label}`"
+        :aria-pressed="state.range === item.key"
+        @click="setRange(item.key)"
       >
-        {{ range.label }}
+        {{ item.label }}
       </button>
     </div>
 
-    <button
-      type="button"
-      class="btn ghost sm"
-      :disabled="busy"
-      :title="`重新加载当前页面数据（当前范围：${rangeLabel}）`"
-      @click="onRefresh"
-    >
+    <button type="button" class="btn ghost sm" :disabled="busy" :title="refreshTitle" @click="onRefresh">
       <Icon name="refresh" :size="15" />
       {{ busy ? '刷新中' : '刷新' }}
     </button>

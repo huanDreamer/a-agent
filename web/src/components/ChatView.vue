@@ -1,8 +1,10 @@
 <script setup>
 // 对话 — the primary surface: a streaming conversation that owns the full
-// height of the main area. The session list, the brand and the navigation all
-// live in the app sidebar (AppSidebar.vue), so the chat pane has nothing above
-// it but a thin context header.
+// height of the main area. The session list lives in the app sidebar
+// (AppSidebar.vue), so the chat pane has nothing above it but a thin context
+// header: the session title (click to rename), 清空, and the message count.
+// The model picker is inside the composer, and the available tools are not
+// listed anywhere in the chat.
 //
 // All state and the SSE turn machinery live in chatStore.js, so a running
 // stream survives leaving and re-entering this view.
@@ -14,17 +16,14 @@ import DrawerButton from './DrawerButton.vue'
 import Icon from './Icon.vue'
 import {
   chat,
-  chatTools,
   clearSession,
   createSession,
+  currentCatalogEntry,
   dismissActionError,
   ensureLoaded,
-  maxSteps,
-  modelGroups,
   renameSession,
   selectSession,
   sendMessage,
-  setModel,
   stopStreaming,
 } from '../chatStore.js'
 import { formatCount } from '../format.js'
@@ -43,82 +42,10 @@ const session = computed(() => chat.session)
 const items = computed(() => chat.items)
 const streaming = computed(() => chat.streaming)
 
-// ------------------------------------------------------------ model selector --
-
-/**
- * Grouped select options. The value is the option's own key rather than a
- * "provider/model" string, because neither part is guaranteed to be free of
- * the separator.
- */
-const optionGroups = computed(() => {
-  const groups = modelGroups.value.map((group) => ({ provider: group.provider, options: [] }))
-  const byProvider = new Map(groups.map((group) => [group.provider, group]))
-
-  const flat = []
-  for (const group of modelGroups.value) {
-    const bucket = byProvider.get(group.provider)
-    for (const entry of group.models) {
-      const label =
-        `${entry.provider || '—'} / ${entry.model || '—'}` +
-        (entry.isDefault ? '（默认）' : '') +
-        (entry.hasKey ? '' : '（未配置 API Key）')
-      const option = {
-        key: `catalog-${flat.length}`,
-        provider: entry.provider,
-        model: entry.model,
-        label,
-        disabled: !entry.hasKey,
-      }
-      bucket.options.push(option)
-      flat.push(option)
-    }
-  }
-
-  const current = session.value
-  if (current && !flat.some((o) => o.provider === current.provider && o.model === current.model)) {
-    // Never leave the select blank: the session may point at a model that is no
-    // longer offered (or the catalog may be empty).
-    const option = {
-      key: 'current',
-      provider: current.provider || '',
-      model: current.model || '',
-      label: `${current.provider || '—'} / ${current.model || '—'}（不在目录中）`,
-      disabled: false,
-    }
-    groups.unshift({ provider: '当前会话', options: [option] })
-    flat.unshift(option)
-  }
-  return groups
-})
-
-const modelOptions = computed(() => optionGroups.value.flatMap((group) => group.options))
-
-const selectedModelKey = computed(() => {
-  const current = session.value
-  if (!current) return ''
-  const found = modelOptions.value.find(
-    (o) => o.provider === current.provider && o.model === current.model,
-  )
-  return found ? found.key : ''
-})
-
-/** The catalog entry for the active session's model, when it is known. */
-const currentCatalogEntry = computed(() => {
-  const current = session.value
-  if (!current) return null
-  return (
-    modelGroups.value
-      .flatMap((group) => group.models)
-      .find((entry) => entry.provider === current.provider && entry.model === current.model) || null
-  )
-})
-
-function onModelChange(event) {
-  const option = modelOptions.value.find((o) => o.key === event.target.value)
-  if (!option) return
-  if (option.provider === session.value?.provider && option.model === session.value?.model) return
-  setModel(option.provider, option.model)
-}
+/** Only surfaced when the session's model cannot be called at all. */
+const missingKey = computed(
+  () => Boolean(currentCatalogEntry.value) && !currentCatalogEntry.value.hasKey,
+)
 
 // ------------------------------------------------------------- title editing --
 
@@ -149,9 +76,7 @@ function cancelTitle() {
 
 /**
  * 清空 is two-step, and the two steps are separate functions so neither can be
- * reached by accident: `armClear` asks, `runClear` performs. An earlier single
- * boolean parameter defaulted to "perform", which let the toolbar button clear
- * a conversation outright and made the confirmation unreachable.
+ * reached by accident: `armClear` asks, `runClear` performs.
  */
 function armClear() {
   if (!session.value) return
@@ -218,8 +143,6 @@ function previousUserText(index) {
   return ''
 }
 
-const toolNames = computed(() => chatTools.value.filter((name) => typeof name === 'string' && name))
-
 onMounted(() => {
   ensureLoaded()
 })
@@ -249,13 +172,13 @@ onMounted(() => {
     </div>
 
     <template v-if="session">
-      <!-- context header: what the conversation is, and the tools to steer it -->
+      <!-- thin context header: what the conversation is, and the tools to steer it -->
       <header class="chat-head">
         <button
           type="button"
           class="btn ghost sm icon-btn drawer-btn"
-          title="显示导航与会话列表"
-          aria-label="显示导航与会话列表"
+          title="显示会话列表"
+          aria-label="显示会话列表"
           @click="setDrawer(true)"
         >
           <Icon name="panel-left" :size="16" />
@@ -285,27 +208,12 @@ onMounted(() => {
           </button>
         </div>
 
-        <select
-          class="input chat-model"
-          :value="selectedModelKey"
-          aria-label="选择模型"
-          :disabled="streaming"
-          @change="onModelChange"
-        >
-          <optgroup v-for="group in optionGroups" :key="group.provider" :label="group.provider">
-            <option
-              v-for="option in group.options"
-              :key="option.key"
-              :value="option.key"
-              :disabled="option.disabled"
-            >
-              {{ option.label }}
-            </option>
-          </optgroup>
-        </select>
-
+        <span v-if="missingKey" class="chip warn" title="该 provider 没有配置 API Key，发送会失败">
+          当前模型未配置 API Key
+        </span>
         <span v-if="chat.notice" class="chip ok">{{ chat.notice }}</span>
         <span class="spacer" />
+        <span class="muted-note nowrap">共 {{ formatCount(session.message_count) }} 条消息</span>
 
         <template v-if="!confirmClear">
           <button type="button" class="btn ghost sm" title="清空该对话的消息" @click="armClear()">
@@ -319,24 +227,6 @@ onMounted(() => {
           <button type="button" class="btn sm ghost" @click="confirmClear = false">取消</button>
         </template>
       </header>
-
-      <div class="chat-chips">
-        <span class="muted-note">可用工具</span>
-        <template v-if="toolNames.length">
-          <span v-for="name in toolNames" :key="name" class="chip mono">{{ name }}</span>
-        </template>
-        <span v-else class="chip warn">当前没有注册任何工具</span>
-        <span v-if="maxSteps" class="chip" title="单轮最多工具调用步数">最多 {{ maxSteps }} 步</span>
-        <span
-          v-if="currentCatalogEntry && !currentCatalogEntry.hasKey"
-          class="chip warn"
-          title="该 provider 没有配置 API Key，发送会失败"
-        >
-          当前模型未配置 API Key
-        </span>
-        <span class="spacer" />
-        <span class="muted-note">共 {{ formatCount(session.message_count) }} 条消息</span>
-      </div>
 
       <!-- messages take every remaining pixel; the composer is pinned below -->
       <div ref="scroller" class="chat-scroll" @scroll="onScroll">
