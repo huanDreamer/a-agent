@@ -121,7 +121,19 @@ func New(cfg Config, st store.Store, table *pricing.Table, adminCfg config.Admin
 		cfg.Tracer = nopTracer{}
 	}
 
-	auth, err := newAuthenticator(adminCfg.Username, adminCfg.PasswordHash, cfg.SessionTTL, logger)
+	// A login-free admin is only defensible on loopback: the agent's tools read,
+	// write and execute, so exposing this port without a password would hand
+	// command execution to anyone who can reach it. Refuse that combination
+	// rather than starting something dangerous because of a config oversight.
+	if !adminCfg.RequireLogin && !adminCfg.AllowInsecureBind && !config.LoopbackHost(cfg.Host) {
+		return nil, fmt.Errorf(
+			"refusing to serve a login-free admin on %q: it would expose command execution "+
+				"to the network. Bind 127.0.0.1, set admin.require_login: true, or set "+
+				"admin.allow_insecure_bind: true if it sits behind another authenticating layer",
+			cfg.Host)
+	}
+
+	auth, err := newAuthenticator(adminCfg.Username, adminCfg.PasswordHash, cfg.SessionTTL, logger, adminCfg.RequireLogin)
 	if err != nil {
 		return nil, err
 	}

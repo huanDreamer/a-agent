@@ -648,3 +648,39 @@ func TestConfig_ToolsDefaultsAndParsing(t *testing.T) {
 		t.Errorf("deny = %v, want [boom]", got)
 	}
 }
+
+func TestLoopbackHost(t *testing.T) {
+	// Erring toward "not loopback" is the safe direction: a wrong "yes" would
+	// expose command execution to the network.
+	loopback := []string{"", "   ", "localhost", "LOCALHOST", "127.0.0.1", "127.0.0.53", "::1", "[::1]"}
+	for _, h := range loopback {
+		if !LoopbackHost(h) {
+			t.Errorf("LoopbackHost(%q) = false, want true", h)
+		}
+	}
+	exposed := []string{"0.0.0.0", "::", "[::]", "192.168.1.10", "10.0.0.5", "example.com", "huan.local", "8.8.8.8"}
+	for _, h := range exposed {
+		if LoopbackHost(h) {
+			t.Errorf("LoopbackHost(%q) = true, want false", h)
+		}
+	}
+}
+
+func TestAdminConfig_LoginDefaults(t *testing.T) {
+	// A fresh install is a single-user local console: no password prompt.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("llm:\n  default_provider: \"x\"\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Admin.RequireLogin {
+		t.Error("require_login should default to false")
+	}
+	if cfg.Admin.AllowInsecureBind {
+		t.Error("allow_insecure_bind should default to false")
+	}
+}

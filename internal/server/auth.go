@@ -46,6 +46,11 @@ type authenticator struct {
 	ttl      time.Duration
 	logger   *zap.Logger
 
+	// disabled makes every request pass. It is set when the operator runs a
+	// single-user local console and does not want to log in; the server refuses
+	// to combine it with a non-loopback bind.
+	disabled bool
+
 	mu       sync.Mutex
 	sessions map[string]time.Time // token -> expiry
 	failures []time.Time          // recent login failure timestamps
@@ -53,22 +58,37 @@ type authenticator struct {
 
 // newAuthenticator validates the configured credentials at construction time,
 // so a misconfigured admin account fails fast instead of at first login.
-func newAuthenticator(username, passwordHash string, ttl time.Duration, logger *zap.Logger) (*authenticator, error) {
+//
+// With requireLogin false there are no credentials to validate: a single-user
+// local console has no account, and demanding a password hash would make a
+// fresh install refuse to start for a password it will never ask for.
+func newAuthenticator(username, passwordHash string, ttl time.Duration, logger *zap.Logger, requireLogin bool) (*authenticator, error) {
 	if strings.TrimSpace(username) == "" {
 		username = "admin"
-	}
-	if strings.TrimSpace(passwordHash) == "" {
-		return nil, ErrNoPassword
-	}
-	// Fail fast on a malformed hash rather than at login time.
-	if _, err := bcrypt.Cost([]byte(passwordHash)); err != nil {
-		return nil, fmt.Errorf("server: admin password_hash is not a valid bcrypt hash: %w", err)
 	}
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+
+	if !requireLogin {
+		return &authenticator{
+			username: username,
+			ttl:      ttl,
+			logger:   logger,
+			sessions: make(map[string]time.Time),
+			disabled: true,
+		}, nil
+	}
+
+	if strings.TrimSpace(passwordHash) == "" {
+		return nil, ErrNoPassword
+	}
+	// Fail fast on a malformed hash rather than at login time.
+	if _, err := bcrypt.Cost([]byte(passwordHash)); err != nil {
+		return nil, fmt.Errorf("server: admin password_hash is not a valid bcrypt hash: %w", err)
 	}
 	return &authenticator{
 		username: username,
@@ -182,7 +202,14 @@ func (a *authenticator) sessionCount() int {
 }
 
 // requireSession is Hertz middleware rejecting unauthenticated requests.
+//
+// With login disabled it lets everything through: there is no session to check,
+// and the only thing protecting the console is that it listens on loopback.
 func (a *authenticator) requireSession(ctx context.Context, c *app.RequestContext) {
+	if a.disabled {
+		c.Next(ctx)
+		return
+	}
 	token := string(c.Cookie(SessionCookieName))
 	if !a.valid(token) {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{

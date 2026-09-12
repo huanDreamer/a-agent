@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,6 +130,41 @@ type AdminConfig struct {
 	// PasswordHash is a bcrypt hash. Never commit a real hash; set it with
 	// `huan-agent admin set-password` or the HUAN_ADMIN_PASSWORD_HASH env var.
 	PasswordHash string `mapstructure:"password_hash" json:"password_hash"`
+	// RequireLogin asks for the password before the admin API is usable.
+	//
+	// It defaults to FALSE because the admin UI is a single-user local console:
+	// requiring a password you have to type on every restart is friction with no
+	// benefit when the only way in is loopback.
+	//
+	// That reasoning holds only on loopback. The agent's tools can read, write
+	// and execute, so a login-free admin reachable from another host would hand
+	// shell access to anyone who can reach the port. Serve therefore REFUSES to
+	// start with login disabled on a non-loopback host unless AllowInsecureBind
+	// says otherwise.
+	RequireLogin bool `mapstructure:"require_login" json:"require_login"`
+	// AllowInsecureBind permits a login-free admin on a non-loopback address.
+	// Only set it behind another authenticating layer (a reverse proxy, a VPN,
+	// or an SSH tunnel): on its own it exposes command execution.
+	AllowInsecureBind bool `mapstructure:"allow_insecure_bind" json:"allow_insecure_bind"`
+}
+
+// LoopbackHost reports whether host binds only to this machine. A blank host,
+// "localhost", and any 127.x/::1 address count as loopback; "0.0.0.0" and "::"
+// do not, because they listen on every interface.
+func LoopbackHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if h == "" || strings.EqualFold(h, "localhost") {
+		return true
+	}
+	if h == "::1" || strings.EqualFold(h, "[::1]") {
+		return true
+	}
+	if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil {
+		return ip.IsLoopback()
+	}
+	// An unresolvable name is treated as non-loopback: assuming the safe answer
+	// is wrong here, since being wrong exposes command execution.
+	return false
 }
 
 // LoggingConfig controls zap logger behavior.
@@ -593,6 +629,8 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("tools.max_read_kb", 512)
 	v.SetDefault("tools.max_write_mb", 4)
 	v.SetDefault("tools.max_list_entries", 500)
+	v.SetDefault("admin.require_login", false)
+	v.SetDefault("admin.allow_insecure_bind", false)
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "console")
 	v.SetDefault("database.path", "./data/huan-agent.db")
