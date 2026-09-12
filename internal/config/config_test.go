@@ -525,3 +525,126 @@ func DeniedByDefault(cmd string) bool {
 	}
 	return false
 }
+
+func TestToolsConfig_WorkspaceOrDefault(t *testing.T) {
+	t.Run("explicit workspace wins", func(t *testing.T) {
+		c := ToolsConfig{Workspace: "/tmp/project"}
+		got, ok := c.WorkspaceOrDefault()
+		if !ok || got != "/tmp/project" {
+			t.Errorf("got (%q, %v), want (/tmp/project, true)", got, ok)
+		}
+	})
+	t.Run("blank falls back to the process working directory", func(t *testing.T) {
+		for _, blank := range []string{"", "   ", "\t"} {
+			got, ok := (ToolsConfig{Workspace: blank}).WorkspaceOrDefault()
+			if !ok {
+				t.Fatalf("blank %q should still resolve", blank)
+			}
+			wd, err := os.Getwd()
+			if err != nil {
+				t.Skipf("Getwd: %v", err)
+			}
+			if got != wd {
+				t.Errorf("got %q, want %q", got, wd)
+			}
+		}
+	})
+}
+
+func TestToolsConfig_BashTimeout(t *testing.T) {
+	if got := (ToolsConfig{}).BashTimeout(); got != 120*time.Second {
+		t.Errorf("default = %v, want 2m", got)
+	}
+	if got := (ToolsConfig{BashTimeoutSeconds: -5}).BashTimeout(); got != 120*time.Second {
+		t.Errorf("negative = %v, want the default", got)
+	}
+	if got := (ToolsConfig{BashTimeoutSeconds: 30}).BashTimeout(); got != 30*time.Second {
+		t.Errorf("configured = %v, want 30s", got)
+	}
+}
+
+func TestToolsConfig_Limits(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		r, w, l := (ToolsConfig{}).Limits()
+		if r != 512<<10 {
+			t.Errorf("maxRead = %d, want %d", r, 512<<10)
+		}
+		if w != 4<<20 {
+			t.Errorf("maxWrite = %d, want %d", w, 4<<20)
+		}
+		if l != 500 {
+			t.Errorf("maxList = %d, want 500", l)
+		}
+	})
+	t.Run("configured", func(t *testing.T) {
+		r, w, l := (ToolsConfig{MaxReadKB: 64, MaxWriteMB: 2, MaxListEntries: 10}).Limits()
+		if r != 64<<10 || w != 2<<20 || l != 10 {
+			t.Errorf("got (%d, %d, %d), want (65536, 2097152, 10)", r, w, l)
+		}
+	})
+	t.Run("non-positive falls back to defaults", func(t *testing.T) {
+		r, w, l := (ToolsConfig{MaxReadKB: -1, MaxWriteMB: 0, MaxListEntries: -3}).Limits()
+		if r != 512<<10 || w != 4<<20 || l != 500 {
+			t.Errorf("got (%d, %d, %d), want the defaults", r, w, l)
+		}
+	})
+}
+
+func TestToolsConfig_DenyOrDefault(t *testing.T) {
+	if got := (ToolsConfig{}).DenyOrDefault(); len(got) != len(DefaultDenyPatterns) {
+		t.Errorf("unconfigured = %d patterns, want the %d built-ins", len(got), len(DefaultDenyPatterns))
+	}
+	custom := []string{`rm\s+important`}
+	got := (ToolsConfig{DenyPatterns: custom}).DenyOrDefault()
+	if len(got) != 1 || got[0] != custom[0] {
+		t.Errorf("configured patterns should replace the defaults, got %v", got)
+	}
+}
+
+func TestConfig_ToolsDefaultsAndParsing(t *testing.T) {
+	// The documented defaults must survive a load that says nothing about tools,
+	// otherwise a fresh install behaves differently from the example config.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := "llm:\n  default_provider: \"ollama\"\n  providers:\n    ollama:\n      base_url: \"http://localhost:11434/v1\"\n      model: \"llama3.2\"\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Tools.EnableBash {
+		t.Error("enable_bash should default to true")
+	}
+	if cfg.Tools.ReadOnly {
+		t.Error("read_only should default to false")
+	}
+	if cfg.Tools.BashTimeout() != 120*time.Second {
+		t.Errorf("bash timeout = %v, want 2m", cfg.Tools.BashTimeout())
+	}
+
+	// And an explicit section must be honoured.
+	yaml2 := yaml + "tools:\n  workspace: \"/tmp/ws\"\n  read_only: true\n  enable_bash: false\n  bash_timeout_seconds: 5\n  max_read_kb: 8\n  max_write_mb: 1\n  max_list_entries: 3\n  deny_patterns: [\"boom\"]\n"
+	path2 := filepath.Join(dir, "config2.yaml")
+	if err := os.WriteFile(path2, []byte(yaml2), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg2, err := Load(path2)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg2.Tools.Workspace != "/tmp/ws" || !cfg2.Tools.ReadOnly || cfg2.Tools.EnableBash {
+		t.Errorf("tools section not parsed: %+v", cfg2.Tools)
+	}
+	if cfg2.Tools.BashTimeout() != 5*time.Second {
+		t.Errorf("timeout = %v, want 5s", cfg2.Tools.BashTimeout())
+	}
+	r, w, l := cfg2.Tools.Limits()
+	if r != 8<<10 || w != 1<<20 || l != 3 {
+		t.Errorf("limits = (%d,%d,%d), want (8192,1048576,3)", r, w, l)
+	}
+	if got := cfg2.Tools.DenyOrDefault(); len(got) != 1 || got[0] != "boom" {
+		t.Errorf("deny = %v, want [boom]", got)
+	}
+}
