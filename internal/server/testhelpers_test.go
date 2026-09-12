@@ -57,6 +57,9 @@ func buildServer(t *testing.T, skillsDir, statePath string, seed func(store.Stor
 	}, pricing.Rate{}), config.AdminConfig{
 		Username:     "admin",
 		PasswordHash: hash,
+		// The harness logs in, so it needs the protected mode; the production
+		// default is login-free and is covered by the auth tests.
+		RequireLogin: true,
 	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
@@ -183,6 +186,9 @@ func buildServerWith(t *testing.T, opts buildOpts) (*Server, store.Store) {
 	}, pricing.Rate{}), config.AdminConfig{
 		Username:     "admin",
 		PasswordHash: hash,
+		// The harness logs in, so it needs the protected mode; the production
+		// default is login-free and is covered by the auth tests.
+		RequireLogin: true,
 	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)

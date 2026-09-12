@@ -652,7 +652,9 @@ func TestBatchSizeTriggersOneFlush(t *testing.T) {
 			t.Fatalf("Trace: %v", err)
 		}
 	}
-	waitFor(t, 2*time.Second, "one flush", func() bool { return c.Stats().Flushes == 1 })
+	// Wait on Sent, which is what is asserted below; Flushes is incremented
+	// before the request completes and would let this read a half-done flush.
+	waitFor(t, 2*time.Second, "one flush", func() bool { return c.Stats().Sent == int64(cfg.BatchSize) })
 
 	// Give a would-be second flush a chance to appear, then assert there was none.
 	time.Sleep(50 * time.Millisecond)
@@ -829,7 +831,9 @@ func TestUnencodableEventCountsFailed(t *testing.T) {
 	if err := c.Trace(context.Background(), TraceEvent{Name: "bad", Input: make(chan int)}); err != nil {
 		t.Fatalf("Trace: %v", err)
 	}
-	waitFor(t, 2*time.Second, "failed flush", func() bool { return c.Stats().Flushes == 1 })
+	// Wait on the counter being asserted: flushes is incremented before the
+	// send and failed only after it, so waiting on flushes races the worker.
+	waitFor(t, 2*time.Second, "failed flush", func() bool { return c.Stats().Failed == 1 })
 	if got := c.Stats().Failed; got != 1 {
 		t.Errorf("Failed = %d, want 1", got)
 	}

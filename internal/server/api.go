@@ -25,6 +25,15 @@ func (s *Server) handleLogin(_ context.Context, c *app.RequestContext) {
 	var body struct {
 		Password string `json:"password"`
 	}
+	// Say plainly that there is no login rather than answering "unauthorized",
+	// which would read as a wrong password and send a caller hunting for one.
+	if s.auth.disabled {
+		c.JSON(http.StatusBadRequest, map[string]string{
+			"error": "login is disabled for this console (admin.require_login is false); " +
+				"the API is already open",
+		})
+		return
+	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
