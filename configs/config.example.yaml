@@ -189,11 +189,20 @@ pricing:
 
 # Admin login (Phase 5). Single-user password auth.
 admin:
+  # This is a single-user local console, so there is no login by default: the
+  # only way in is loopback and a password you retype on every restart is
+  # friction with nothing to protect.
+  require_login: false
   username: "admin"
-  # bcrypt hash; generate and set it with:
+  # bcrypt hash; only needed when require_login is true. Generate and set it:
   #   huan-agent admin set-password
   # or via env: HUAN_ADMIN_PASSWORD_HASH
   password_hash: ""
+  # The agent's tools can read, write and EXECUTE, so a login-free admin on a
+  # non-loopback address would be a remote shell. The server therefore refuses
+  # to start with that combination. Set this only when something else
+  # authenticates in front (a reverse proxy, a VPN, an SSH tunnel).
+  allow_insecure_bind: false
 
 # Web chat in the admin UI (requires `huan-agent admin serve`).
 chat:

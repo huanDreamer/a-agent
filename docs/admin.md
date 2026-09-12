@@ -129,6 +129,41 @@ The registry is private (the process-global default is never touched), and every
 metric is emitted through a nil-safe API, so observability can be disabled
 without touching call sites.
 
+## Authentication
+
+The admin UI is a **single-user local console**, so there is no login by
+default:
+
+```yaml
+admin:
+  require_login: false       # default
+  allow_insecure_bind: false
+```
+
+The only way in is loopback, and a password you retype on every restart protects
+nothing. Leave it alone if that describes your setup.
+
+**Turn it on when the console is not only yours.** The agent's tools can read,
+write and execute, so a login-free admin reachable from the network is a remote
+shell. `huan-agent admin serve` therefore **refuses to start** with
+`require_login: false` on a non-loopback address:
+
+```
+refusing to serve a login-free admin on "0.0.0.0": it would expose command
+execution to the network. Bind 127.0.0.1, set admin.require_login: true, or set
+admin.allow_insecure_bind: true if it sits behind another authenticating layer
+```
+
+Three ways forward, in order of preference:
+
+1. Bind `127.0.0.1` (the default) and reach it over an SSH tunnel.
+2. Set `require_login: true` and a password:
+   ```bash
+   huan-agent admin set-password          # prompts, no echo
+   ```
+3. Set `allow_insecure_bind: true` **only** when a reverse proxy, VPN or tunnel
+   already authenticates callers — the app is then trusting that layer.
+
 ## Web chat (对话)
 
 The admin UI can run conversations against the agent, with the model's reasoning
