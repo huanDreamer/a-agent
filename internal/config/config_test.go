@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -460,4 +461,67 @@ feishu:
 	if app.Transport != "callback" || app.CallbackAddr != "127.0.0.1:9999" || app.CallbackPath != "/hook" {
 		t.Errorf("transport fields not loaded: %+v", app)
 	}
+}
+
+func TestDefaultDenyPatterns_CompileAndMatch(t *testing.T) {
+	// A pattern that does not compile would either panic at runtime or silently
+	// never match, so both are worth asserting.
+	for _, p := range DefaultDenyPatterns {
+		if _, err := regexp.Compile(p); err != nil {
+			t.Errorf("deny pattern %q does not compile: %v", p, err)
+		}
+	}
+
+	denied := []string{
+		"rm -rf /",
+		"rm -fr /",
+		"sudo rm -rf /",
+		"mkfs.ext4 /dev/sda1",
+		"dd if=/dev/zero of=/dev/sda",
+		"cat /dev/urandom > /dev/sda",
+		":(){ :|:& };:",
+		"chmod -R 777 /",
+		"shutdown -h now",
+		"reboot",
+	}
+	for _, cmd := range denied {
+		t.Run("denies "+cmd, func(t *testing.T) {
+			if !DeniedByDefault(cmd) {
+				t.Errorf("%q should be refused", cmd)
+			}
+		})
+	}
+
+	// Ordinary coding commands must NOT be caught, or the tool becomes useless.
+	allowed := []string{
+		"go test ./...",
+		"git status",
+		"rm -rf ./build",
+		"rm -rf node_modules",
+		"mkdir -p a/b",
+		"ls -la /tmp",
+		// A mention of a dangerous word is not the word as a command: refusing
+		// these would make the tool maddening to use.
+		"echo reboot-status",
+		"git commit -m \"fix reboot handling\"",
+		"grep -rn shutdown ./internal",
+		"go build -o /dev/null ./...",
+	}
+	for _, cmd := range allowed {
+		t.Run("allows "+cmd, func(t *testing.T) {
+			if DeniedByDefault(cmd) {
+				t.Errorf("%q should be allowed", cmd)
+			}
+		})
+	}
+}
+
+// DeniedByDefault reports whether any built-in pattern matches cmd.
+func DeniedByDefault(cmd string) bool {
+	for _, p := range DefaultDenyPatterns {
+		if re, err := regexp.Compile(p); err == nil && re.MatchString(cmd) {
+			return true
+		}
+	}
+	return false
 }

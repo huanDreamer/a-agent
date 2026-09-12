@@ -32,6 +32,7 @@ type Config struct {
 	Admin    AdminConfig    `mapstructure:"admin" json:"admin"`
 	Langfuse LangfuseConfig `mapstructure:"langfuse" json:"langfuse"`
 	Chat     ChatConfig     `mapstructure:"chat" json:"chat"`
+	Tools    ToolsConfig    `mapstructure:"tools" json:"tools"`
 }
 
 // ChatConfig configures the web chat feature.
@@ -179,6 +180,100 @@ type MCPServer struct {
 	Command string   `mapstructure:"command" json:"command"`
 	Args    []string `mapstructure:"args" json:"args"`
 	Env     []string `mapstructure:"env" json:"env"`
+}
+
+// ToolsConfig configures the filesystem and command tools that let the agent
+// actually work on a codebase.
+//
+// SECURITY: these tools let an LLM read and write real files and run real
+// commands. They are confined to Workspace, but a command's confinement is its
+// working directory, not a guarantee about what it can reach. Anyone who can
+// send the bot a message can therefore drive them — see docs/tools.md.
+type ToolsConfig struct {
+	// Workspace is the directory the file and command tools are confined to.
+	// Relative paths resolve against the process working directory. Empty
+	// still enables the tools, rooted at the process working directory.
+	Workspace string `mapstructure:"workspace" json:"workspace"`
+	// ReadOnly forbids writing files and running commands, leaving the agent
+	// able to read and search but not change anything.
+	ReadOnly bool `mapstructure:"read_only" json:"read_only"`
+	// EnableBash turns on the shell tool.
+	EnableBash bool `mapstructure:"enable_bash" json:"enable_bash"`
+	// BashTimeoutSeconds bounds one command. 0 uses the tool default (120s).
+	BashTimeoutSeconds int `mapstructure:"bash_timeout_seconds" json:"bash_timeout_seconds"`
+	// MaxReadKB caps one file read. 0 uses the default (512 KiB).
+	MaxReadKB int `mapstructure:"max_read_kb" json:"max_read_kb"`
+	// MaxWriteMB caps one file write. 0 uses the default (4 MiB).
+	MaxWriteMB int `mapstructure:"max_write_mb" json:"max_write_mb"`
+	// MaxListEntries caps a listing or glob result. 0 uses the default (500).
+	MaxListEntries int `mapstructure:"max_list_entries" json:"max_list_entries"`
+	// DenyPatterns are RE2 regexes that refuse a matching command. A speed bump
+	// for obviously destructive commands, NOT a security boundary: an LLM can
+	// trivially write an equivalent command that does not match.
+	DenyPatterns []string `mapstructure:"deny_patterns" json:"deny_patterns"`
+}
+
+// DefaultDenyPatterns are refuse-on-match patterns for commands that are almost
+// never what a coding agent means and are catastrophic when they are.
+var DefaultDenyPatterns = []string{
+	`rm\s+(-[a-zA-Z]+\s+)*/\s*$`,
+	`mkfs(\.|\s)`,
+	`dd\s+[^|]*of=/dev/(disk|sd|nvme|hd)`,
+	`>\s*/dev/(disk|sd|nvme|hd)`,
+	`:\(\)\s*\{.*\};\s*:`,
+	`chmod\s+-R\s+777\s+/\s*$`,
+	// Anchored to a command position, so "echo reboot-status" or a commit
+	// message mentioning a reboot is not refused while `reboot` is.
+	`(^|[;&|]\s*)(sudo\s+)?(shutdown|reboot|halt|poweroff)\b`,
+}
+
+// WorkspaceOrDefault returns the configured workspace root, or the process
+// working directory when unset. A second return of false means no root could
+// be determined.
+func (c ToolsConfig) WorkspaceOrDefault() (string, bool) {
+	if strings.TrimSpace(c.Workspace) != "" {
+		return c.Workspace, true
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	return wd, true
+}
+
+// BashTimeout returns the configured command timeout.
+func (c ToolsConfig) BashTimeout() time.Duration {
+	if c.BashTimeoutSeconds <= 0 {
+		return 120 * time.Second
+	}
+	return time.Duration(c.BashTimeoutSeconds) * time.Second
+}
+
+// Limits converts the size settings into limits, applying defaults for
+// anything unset.
+func (c ToolsConfig) Limits() (maxRead, maxWrite int64, maxList int) {
+	maxRead = int64(c.MaxReadKB) << 10
+	if maxRead <= 0 {
+		maxRead = 512 << 10
+	}
+	maxWrite = int64(c.MaxWriteMB) << 20
+	if maxWrite <= 0 {
+		maxWrite = 4 << 20
+	}
+	maxList = c.MaxListEntries
+	if maxList <= 0 {
+		maxList = 500
+	}
+	return maxRead, maxWrite, maxList
+}
+
+// DenyOrDefault returns the configured deny patterns, falling back to the
+// built-in set when none are configured.
+func (c ToolsConfig) DenyOrDefault() []string {
+	if len(c.DenyPatterns) > 0 {
+		return c.DenyPatterns
+	}
+	return DefaultDenyPatterns
 }
 
 // SkillsConfig configures the on-disk skill loader.
@@ -491,6 +586,13 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("langfuse.secret_key", "")
 	v.SetDefault("langfuse.environment", "production")
 	v.SetDefault("langfuse.release", "")
+	v.SetDefault("tools.workspace", "")
+	v.SetDefault("tools.read_only", false)
+	v.SetDefault("tools.enable_bash", true)
+	v.SetDefault("tools.bash_timeout_seconds", 120)
+	v.SetDefault("tools.max_read_kb", 512)
+	v.SetDefault("tools.max_write_mb", 4)
+	v.SetDefault("tools.max_list_entries", 500)
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "console")
 	v.SetDefault("database.path", "./data/huan-agent.db")

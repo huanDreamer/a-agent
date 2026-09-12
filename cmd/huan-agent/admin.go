@@ -59,7 +59,7 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 
 	// Tools are shared with the chat REPL so the web UI can do what the CLI can.
 	registry := tool.NewRegistry()
-	if err := registerBuiltinTools(registry); err != nil {
+	if err := registerBuiltinTools(registry, cfg); err != nil {
 		logger.Warn("web chat: builtin tools unavailable", zap.Error(err))
 	}
 

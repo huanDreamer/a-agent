@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
+	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -29,6 +30,7 @@ import (
 	"github.com/huan/huan-agent/internal/tool"
 	"github.com/huan/huan-agent/internal/tool/builtin"
 	"github.com/huan/huan-agent/internal/usage"
+	"github.com/huan/huan-agent/internal/workspace"
 )
 
 var (
@@ -324,7 +326,7 @@ func buildAgent(
 	}
 
 	reg := tool.NewRegistry()
-	if err := registerBuiltinTools(reg); err != nil {
+	if err := registerBuiltinTools(reg, cfg); err != nil {
 		return nil, nil, nil, fmt.Errorf("register builtin tools: %w", err)
 	}
 
@@ -389,20 +391,110 @@ func buildAgent(
 	return ag, reg, clients, nil
 }
 
-func registerBuiltinTools(reg *tool.Registry) error {
-	makers := []func() (tool.Tool, error){
-		func() (tool.Tool, error) { return builtin.NewTimeTool() },
-		func() (tool.Tool, error) { return builtin.NewCalcTool() },
-		func() (tool.Tool, error) { return builtin.NewEchoTool() },
+// registerBuiltinTools populates a registry with the agent's tools.
+//
+// The always-on tools (time/calc/echo) are harmless. The workspace tools are
+// what make the agent able to work on a codebase, and they are what makes it
+// dangerous: they read, write and execute against a real directory. They are
+// therefore confined by internal/workspace and tagged with a capability so a
+// caller can expose read-only access to a less trusted surface.
+func registerBuiltinTools(reg *tool.Registry, cfg *config.Config) error {
+	basics := []struct {
+		make func() (tool.Tool, error)
+	}{
+		{func() (tool.Tool, error) { return builtin.NewTimeTool() }},
+		{func() (tool.Tool, error) { return builtin.NewCalcTool() }},
+		{func() (tool.Tool, error) { return builtin.NewEchoTool() }},
 	}
-	for _, m := range makers {
-		t, err := m()
+	for _, b := range basics {
+		t, err := b.make()
 		if err != nil {
 			return err
 		}
-		if err := reg.Register(t); err != nil {
+		if err := reg.Register(tool.WithCapability(t, tool.CapRead)); err != nil {
 			return err
 		}
+	}
+	return registerWorkspaceTools(reg, cfg)
+}
+
+// registerWorkspaceTools adds the filesystem and command tools, confined to
+// the configured workspace. A missing workspace root only disables these
+// tools; the agent still chats.
+func registerWorkspaceTools(reg *tool.Registry, cfg *config.Config) error {
+	root, ok := cfg.Tools.WorkspaceOrDefault()
+	if !ok {
+		return nil
+	}
+	maxRead, maxWrite, maxList := cfg.Tools.Limits()
+	ws, err := workspace.New(root, workspace.Options{
+		ReadOnly: cfg.Tools.ReadOnly,
+		Limits: workspace.Limits{
+			MaxReadBytes:   maxRead,
+			MaxWriteBytes:  maxWrite,
+			MaxListEntries: maxList,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("init workspace: %w", err)
+	}
+
+	// Reads and searches.
+	readers := []struct {
+		name string
+		make func(*workspace.Workspace) (einotool.InvokableTool, error)
+	}{
+		{"read_file", builtin.NewReadFileTool},
+		{"list_dir", builtin.NewListDirTool},
+		{"glob", builtin.NewGlobTool},
+		{"grep", builtin.NewGrepTool},
+	}
+	for _, r := range readers {
+		t, merr := r.make(ws)
+		if merr != nil {
+			return fmt.Errorf("build %s tool: %w", r.name, merr)
+		}
+		if err := reg.Register(tool.WithCapability(t, tool.CapRead)); err != nil {
+			return fmt.Errorf("register %s: %w", r.name, err)
+		}
+	}
+
+	// Writes and execution are withheld entirely in a read-only workspace, so
+	// the model cannot even see tools it is not allowed to use.
+	if cfg.Tools.ReadOnly {
+		return nil
+	}
+
+	writers := []struct {
+		name string
+		make func(*workspace.Workspace) (einotool.InvokableTool, error)
+	}{
+		{"write_file", builtin.NewWriteFileTool},
+		{"edit_file", builtin.NewEditFileTool},
+	}
+	for _, w := range writers {
+		t, merr := w.make(ws)
+		if merr != nil {
+			return fmt.Errorf("build %s tool: %w", w.name, merr)
+		}
+		if err := reg.Register(tool.WithCapability(t, tool.CapWrite)); err != nil {
+			return fmt.Errorf("register %s: %w", w.name, err)
+		}
+	}
+
+	if !cfg.Tools.EnableBash {
+		return nil
+	}
+	bashTool, berr := builtin.NewBashTool(ws, builtin.BashPolicy{
+		Enabled:      true,
+		Timeout:      cfg.Tools.BashTimeout(),
+		DenyPatterns: cfg.Tools.DenyOrDefault(),
+	})
+	if berr != nil {
+		return fmt.Errorf("build bash tool: %w", berr)
+	}
+	if err := reg.Register(tool.WithCapability(bashTool, tool.CapExec)); err != nil {
+		return fmt.Errorf("register bash: %w", err)
 	}
 	return nil
 }

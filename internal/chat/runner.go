@@ -327,7 +327,6 @@ func (r *Runner) runTool(ctx context.Context, tc schema.ToolCall, req Request,
 		Input:   map[string]any{"name": run.Name, "arguments": run.Args},
 	})
 	started := nowFunc()
-	defer func() { run.DurationMs = nowFunc().Sub(started).Milliseconds() }()
 
 	t, ok := r.toolsTool(run.Name)
 	if !ok {
@@ -344,6 +343,11 @@ func (r *Runner) runTool(ctx context.Context, tc schema.ToolCall, req Request,
 			run.Result = out
 		}
 	}
+
+	// Measure before reporting. A deferred assignment here would run after the
+	// emit, so every tool would be reported as taking 0ms — which is what the
+	// UI's 耗时 column and the audit log would then faithfully record.
+	run.DurationMs = nowFunc().Sub(started).Milliseconds()
 
 	r.tracer.EndSpan(ctx, spanID, toolSpanOutput(run), run.Err)
 	emit(Event{

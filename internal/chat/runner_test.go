@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	einotool "github.com/cloudwego/eino/components/tool"
@@ -989,5 +990,47 @@ func TestToolInfos_PreservesDeclaredProperties(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"required"`) {
 		t.Errorf("required list was lost: %s", b)
+	}
+}
+
+func TestRun_ToolDurationIsMeasured(t *testing.T) {
+	// Regression: the duration used to be assigned in a deferred closure that
+	// ran after the event was emitted, so every tool reported 0ms in the UI and
+	// in the audit log.
+	slow := &fakeTool{name: "slow", desc: "d", run: func(context.Context, string) (string, error) {
+		time.Sleep(25 * time.Millisecond)
+		return "done", nil
+	}}
+	m := &fakeModel{turns: []*schema.Message{
+		{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
+			ID: "c1", Type: "function",
+			Function: schema.FunctionCall{Name: "slow", Arguments: "{}"},
+		}}},
+		{Role: schema.Assistant, Content: "ok"},
+	}}
+	r, err := New(Config{Model: m, Tools: newRegistry(t, slow), Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	events, emit := collect()
+	res, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "x"}},
+	}, emit)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var fromEvent int64 = -1
+	for _, e := range *events {
+		if e.Type == EventToolResult {
+			fromEvent = e.DurationMs
+		}
+	}
+	if fromEvent < 20 {
+		t.Errorf("tool_result duration = %dms, want >= 20ms (the tool slept 25ms)", fromEvent)
+	}
+	if len(res.Tools) != 1 || res.Tools[0].DurationMs < 20 {
+		t.Errorf("Result tool duration = %dms, want >= 20ms", res.Tools[0].DurationMs)
 	}
 }
