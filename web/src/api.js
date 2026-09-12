@@ -122,8 +122,12 @@ function messageOf(data, fallback) {
  * fired (the 停止 button), which is not an error. Rejects with ApiError when the
  * request itself fails, including a non-200 JSON error before any event.
  */
-export async function streamChatTurn(sessionId, content, { signal, onEvent } = {}) {
+export async function streamChatTurn(sessionId, content, { signal, onEvent, attachments } = {}) {
   const url = buildUrl(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`)
+  const body = { content }
+  // Omitted entirely when there is nothing attached, so the request body keeps
+  // the shape the pre-attachment server expects.
+  if (Array.isArray(attachments) && attachments.length) body.attachments = attachments
 
   let response
   try {
@@ -131,7 +135,7 @@ export async function streamChatTurn(sessionId, content, { signal, onEvent } = {
       method: 'POST',
       credentials: 'same-origin',
       headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(body),
       signal,
     })
   } catch (cause) {
@@ -223,6 +227,82 @@ function isAbort(cause) {
   return Boolean(cause) && (cause.name === 'AbortError' || cause.code === 20)
 }
 
+/**
+ * Upload one file as an attachment of a conversation.
+ *
+ * `XMLHttpRequest` rather than `fetch` on purpose: it is the only way to get
+ * real upload progress in a browser without a streaming request body, and the
+ * composer shows a percentage while a large file is in flight.
+ *
+ * Resolves with the `attachment` object of the response (id, kind, mime, bytes,
+ * name, path, url). Rejects with ApiError carrying the HTTP status, so a 415
+ * (unsupported type) and a 413 (too large) both reach the caller as messages.
+ */
+export function uploadAttachment(sessionId, file, { onProgress } = {}) {
+  const url = buildUrl(`/api/chat/sessions/${encodeURIComponent(sessionId)}/attachments`)
+  return new Promise((resolve, reject) => {
+    const form = new FormData()
+    form.append('file', file, file.name || 'upload')
+
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', url)
+    xhr.responseType = 'text'
+    xhr.withCredentials = true
+    xhr.setRequestHeader('Accept', 'application/json')
+
+    if (xhr.upload && typeof onProgress === 'function') {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress(event.loaded / event.total)
+      }
+    }
+
+    xhr.onload = () => {
+      let data = null
+      try {
+        data = xhr.responseText ? JSON.parse(xhr.responseText) : null
+      } catch (err) {
+        data = null
+      }
+      if (xhr.status === 401) {
+        notifyUnauthorized()
+        reject(new ApiError(messageOf(data, '服务端要求登录（HTTP 401）'), 401, data))
+        return
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new ApiError(messageOf(data, `上传失败（HTTP ${xhr.status}）`), xhr.status, data))
+        return
+      }
+      const attachment = data && data.attachment ? data.attachment : null
+      if (!attachment || !attachment.id) {
+        reject(new ApiError('服务器没有返回附件信息', 0, data))
+        return
+      }
+      resolve(attachment)
+    }
+
+    xhr.onerror = () => reject(new ApiError('无法连接到服务器，上传失败', 0, null))
+    xhr.onabort = () => reject(new ApiError('上传已取消', 0, null))
+    xhr.send(form)
+  })
+}
+
+/**
+ * Absolute URL of a stored attachment.
+ *
+ * The upload response carries `url` as a root-relative path; a message reloaded
+ * from the database only carries the asset id, so the path is rebuilt from the
+ * documented route. Both go through `apiBase()` for a deployment behind a path
+ * prefix.
+ */
+export function assetUrl({ id, url } = {}) {
+  const path =
+    typeof url === 'string' && url !== ''
+      ? url
+      : `/api/chat/attachments/${encodeURIComponent(id === null || id === undefined ? '' : id)}`
+  if (/^https?:\/\//i.test(path)) return path
+  return `${apiBase()}${path}`
+}
+
 /** Optional usage filters: since/until are RFC3339, the rest are exact matches. */
 function usageQuery(filters = {}) {
   return {
@@ -281,4 +361,34 @@ export const api = {
 
   // --- meta -------------------------------------------------------------
   meta: () => request('/api/meta'),
+
+  // --- llm providers / models / capability bindings ----------------------
+  // Contract: provider records never carry the API key. `has_api_key` is a
+  // boolean and `api_key_hint` is a masked suffix; the key is write-only, sent
+  // either in the provider body or through the dedicated /key route, where an
+  // empty string clears the stored key.
+  llmProviders: () => request('/api/llm/providers'),
+  saveLlmProvider: (body) => request('/api/llm/providers', { method: 'POST', body }),
+  deleteLlmProvider: (id) =>
+    request(`/api/llm/providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  setLlmProviderKey: (id, apiKey) =>
+    request(`/api/llm/providers/${encodeURIComponent(id)}/key`, {
+      method: 'PUT',
+      body: { api_key: apiKey },
+    }),
+  testLlmProvider: (id) =>
+    request(`/api/llm/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  refreshLlmProviderModels: (id) =>
+    request(`/api/llm/providers/${encodeURIComponent(id)}/models/refresh`, { method: 'POST' }),
+
+  llmModels: (provider) => request('/api/llm/models', { query: { provider } }),
+  saveLlmModel: (body) => request('/api/llm/models', { method: 'PUT', body }),
+  deleteLlmModel: (providerId, modelId) =>
+    request('/api/llm/models', {
+      method: 'DELETE',
+      body: { provider_id: providerId, model_id: modelId },
+    }),
+
+  llmBindings: () => request('/api/llm/bindings'),
+  saveLlmBinding: (body) => request('/api/llm/bindings', { method: 'PUT', body }),
 }

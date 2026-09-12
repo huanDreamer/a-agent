@@ -24,6 +24,7 @@ import (
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/mcp"
+	"github.com/huan/huan-agent/internal/media"
 	"github.com/huan/huan-agent/internal/obs"
 	"github.com/huan/huan-agent/internal/skill"
 	"github.com/huan/huan-agent/internal/store"
@@ -326,7 +327,7 @@ func buildAgent(
 	}
 
 	reg := tool.NewRegistry()
-	if err := registerBuiltinTools(reg, cfg); err != nil {
+	if err := registerBuiltinTools(reg, cfg, st, logger); err != nil {
 		return nil, nil, nil, fmt.Errorf("register builtin tools: %w", err)
 	}
 
@@ -398,7 +399,7 @@ func buildAgent(
 // dangerous: they read, write and execute against a real directory. They are
 // therefore confined by internal/workspace and tagged with a capability so a
 // caller can expose read-only access to a less trusted surface.
-func registerBuiltinTools(reg *tool.Registry, cfg *config.Config) error {
+func registerBuiltinTools(reg *tool.Registry, cfg *config.Config, st store.Store, logger *zap.Logger) error {
 	basics := []struct {
 		make func() (tool.Tool, error)
 	}{
@@ -415,13 +416,13 @@ func registerBuiltinTools(reg *tool.Registry, cfg *config.Config) error {
 			return err
 		}
 	}
-	return registerWorkspaceTools(reg, cfg)
+	return registerWorkspaceTools(reg, cfg, st, logger)
 }
 
 // registerWorkspaceTools adds the filesystem and command tools, confined to
 // the configured workspace. A missing workspace root only disables these
 // tools; the agent still chats.
-func registerWorkspaceTools(reg *tool.Registry, cfg *config.Config) error {
+func registerWorkspaceTools(reg *tool.Registry, cfg *config.Config, st store.Store, logger *zap.Logger) error {
 	root, ok := cfg.Tools.WorkspaceOrDefault()
 	if !ok {
 		return nil
@@ -438,6 +439,12 @@ func registerWorkspaceTools(reg *tool.Registry, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("init workspace: %w", err)
 	}
+
+	// The media tools read files from and write images into the same
+	// workspace, and this is the one place it is built, so they are registered
+	// from here. A caller without a workspace gets no media tools at all: an
+	// unconfined media tool is worse than a missing one.
+	registerMediaTools(reg, cfg, st, ws, logger)
 
 	// Reads and searches.
 	readers := []struct {
@@ -497,6 +504,116 @@ func registerWorkspaceTools(reg *tool.Registry, cfg *config.Config) error {
 		return fmt.Errorf("register bash: %w", err)
 	}
 	return nil
+}
+
+// mediaToolCandidate is one media tool together with the model capability that
+// makes it usable and the access it needs.
+type mediaToolCandidate struct {
+	name string
+	// capability is the store's model capability: what the model can do.
+	capability store.Capability
+	// access is the tool's own capability (read/write), a different vocabulary:
+	// what the tool does to the machine.
+	access tool.Capability
+	build  func(*workspace.Workspace, media.Target) (einotool.InvokableTool, error)
+}
+
+// mediaToolCandidates is every media tool this build offers.
+var mediaToolCandidates = []mediaToolCandidate{
+	{name: "describe_image", capability: store.CapVision, access: tool.CapRead, build: builtin.NewDescribeImageTool},
+	{name: "transcribe_audio", capability: store.CapAudioTranscribe, access: tool.CapRead, build: builtin.NewTranscribeAudioTool},
+	// generate_image writes a file, so it is a write tool and is withheld from
+	// a read-only workspace.
+	{name: "generate_image", capability: store.CapImageGen, access: tool.CapWrite, build: builtin.NewGenerateImageTool},
+}
+
+// registerMediaTools adds the image and audio tools whose capability is bound
+// to a model the operator configured.
+//
+// This is the whole of the "must not be registered at all" contract. A tool is
+// built only when media.Resolver finds an enabled provider and model for its
+// capability, so a deployment with no vision model bound never lets the chat
+// model learn that describe_image exists, and it cannot spend a turn calling
+// something that cannot work. When nothing is bound the tool is skipped with an
+// informational log naming the capability that is missing, and the agent still
+// chats: a fresh install with no providers registers nothing here and starts
+// normally.
+//
+// It reports nothing and returns nothing. Every failure is logged and skipped
+// rather than propagated, because a half-configured catalog must not stop the
+// server or the REPL from starting.
+//
+// Every surface that builds its tools through registerBuiltinTools gets these,
+// which today is the CLI and the web chat. The Feishu bot answers with a plain
+// chat model and builds no tool registry at all, so there is nothing for it to
+// register into; this function stays the single place a media tool is added.
+func registerMediaTools(reg *tool.Registry, cfg *config.Config, st store.Store, ws *workspace.Workspace, logger *zap.Logger) {
+	if reg == nil || logger == nil {
+		return
+	}
+	// The media tools read and write files, so they need the workspace the file
+	// tools were built with. Without one they are not registered at all rather
+	// than registered against an unconfined path.
+	if ws == nil {
+		logger.Info("media tools skipped: no workspace configured",
+			zap.Strings("tools", mediaToolNames()))
+		return
+	}
+	if st == nil {
+		logger.Info("media tools skipped: no model catalog configured",
+			zap.Strings("tools", mediaToolNames()))
+		return
+	}
+
+	// The resolver is the seam between the catalog and the tools: everything
+	// below depends on the interface, so a test (or another catalog) can
+	// substitute one.
+	var resolver media.Resolver = media.NewResolver(st, os.Getenv)
+	// Resolution reads local catalog rows at start-up; there is no request to
+	// carry a deadline from, and it must not be cancelled by one that ends.
+	ctx := context.Background()
+
+	for _, c := range mediaToolCandidates {
+		// generate_image writes into the workspace, so a read-only workspace
+		// withholds it entirely — the same rule the file tools follow.
+		if c.access == tool.CapWrite && cfg.Tools.ReadOnly {
+			logger.Info("media tool skipped: workspace is read-only",
+				zap.String("tool", c.name), zap.String("capability", string(c.capability)))
+			continue
+		}
+		target, ok := resolver.For(ctx, c.capability)
+		if !ok {
+			logger.Info("media tool skipped: capability is bound to no usable model",
+				zap.String("tool", c.name), zap.String("capability", string(c.capability)))
+			continue
+		}
+		t, err := c.build(ws, target)
+		if err != nil {
+			logger.Warn("media tool unavailable",
+				zap.String("tool", c.name), zap.String("capability", string(c.capability)), zap.Error(err))
+			continue
+		}
+		if err := reg.Register(tool.WithCapability(t, c.access)); err != nil {
+			logger.Warn("media tool not registered", zap.String("tool", c.name), zap.Error(err))
+			continue
+		}
+		logger.Info("media tool registered",
+			zap.String("tool", c.name),
+			zap.String("capability", string(c.capability)),
+			zap.String("provider", target.ProviderID),
+			zap.String("model", target.ModelID),
+		)
+	}
+}
+
+// mediaToolNames lists the media tools, for the log line that explains what was
+// skipped when there is nowhere for them to run.
+func mediaToolNames() []string {
+	out := make([]string, 0, len(mediaToolCandidates))
+	for _, c := range mediaToolCandidates {
+		out = append(out, c.name)
+	}
+	return out
 }
 
 func agentOnce(ctx context.Context, ag *agent.Agent, history *[]*schema.Message) error {

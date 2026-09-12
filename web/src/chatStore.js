@@ -7,6 +7,7 @@
 
 import { computed, reactive } from 'vue'
 import { api, streamChatTurn } from './api.js'
+import { normalize as normalizeAttachments } from './attachments.js'
 
 const SESSION_LIMIT = 100
 const NOTICE_MS = 2600
@@ -41,6 +42,8 @@ export const chat = reactive({
   actionError: '',
   /** Content of a failed send, offered again by the banner's 重试 button. */
   pendingContent: '',
+  /** Attachments of that failed send: already uploaded, so they are reused. */
+  pendingAttachments: [],
   /** Transient confirmation line ("模型已切换"). */
   notice: '',
 })
@@ -206,6 +209,9 @@ export function buildItems(messages) {
         key: `user-${row.id ?? nextKey('user')}`,
         role: 'user',
         text: row.content || '',
+        // The persisted column is a JSON string of asset ids, exactly like
+        // `tool_calls` and `usage`; normalize() parses it defensively.
+        attachments: normalizeAttachments(row.attachments),
         createdAt: row.created_at || '',
         error: '',
       })
@@ -588,6 +594,11 @@ let streamSeq = 0
 /**
  * Send one message and stream the answer.
  *
+ * `content` may be empty when `attachments` carries at least one uploaded asset
+ * — an image with no caption is a normal message. The attachment records are
+ * the ones the upload route returned, so the ids are already real and only the
+ * ids travel in the request body.
+ *
  * On `done` the server's text replaces what was streamed (it is authoritative:
  * the ReAct loop may have produced a preamble before calling a tool). On
  * `error` the failure becomes a warning bubble in the conversation. When the
@@ -595,9 +606,10 @@ let streamSeq = 0
  * reloaded from the server, which is the only place with the persisted ids,
  * tool results and summed usage.
  */
-export async function sendMessage(rawContent) {
+export async function sendMessage(rawContent, { attachments = [] } = {}) {
   const content = String(rawContent === null || rawContent === undefined ? '' : rawContent).trim()
-  if (content === '') return
+  const files = (Array.isArray(attachments) ? attachments : []).filter((a) => a && a.id)
+  if (content === '' && files.length === 0) return
   if (chat.streaming) return
   if (!chat.activeId) {
     chat.actionError = '请先选择或新建一个对话'
@@ -607,6 +619,7 @@ export async function sendMessage(rawContent) {
   const sessionId = chat.activeId
   chat.actionError = ''
   chat.pendingContent = ''
+  chat.pendingAttachments = []
   chat.notice = ''
 
   // The live items are wrapped in `reactive` explicitly: the stream appends to
@@ -616,6 +629,7 @@ export async function sendMessage(rawContent) {
     key: nextKey('user-live'),
     role: 'user',
     text: content,
+    attachments: normalizeAttachments(files),
     createdAt: new Date().toISOString(),
     error: '',
   })
@@ -643,6 +657,7 @@ export async function sendMessage(rawContent) {
   try {
     const outcome = await streamChatTurn(sessionId, content, {
       signal: controller.signal,
+      attachments: files.map((file) => file.id),
       onEvent: (event) => handleEvent(turn, event),
     })
     aborted = Boolean(outcome && outcome.aborted)
@@ -656,9 +671,11 @@ export async function sendMessage(rawContent) {
       turn.streaming = false
     } else {
       // Nothing arrived: the optimistic bubbles cannot be trusted, so drop them
-      // and offer the text again in the composer.
+      // and offer the text (and the already-uploaded attachments) again in the
+      // composer.
       chat.items = chat.items.filter((item) => item !== userItem && item !== turn)
       chat.pendingContent = content
+      chat.pendingAttachments = files
       chat.actionError = errorText(err, '发送失败，请重试')
     }
     chat.streamTick += 1
@@ -772,4 +789,5 @@ function handleEvent(turn, event) {
 export function dismissActionError() {
   chat.actionError = ''
   chat.pendingContent = ''
+  chat.pendingAttachments = []
 }

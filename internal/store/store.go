@@ -64,6 +64,13 @@ type Store interface {
 	ListChatMessages(ctx context.Context, sessionID string, limit int) ([]ChatMessage, error)
 	DeleteChatMessages(ctx context.Context, sessionID string) error
 
+	// Media attachments uploaded for a chat session (Phase 5 chat).
+	// The bytes live in the workspace; these rows are what a message references.
+	CreateMediaAsset(ctx context.Context, a MediaAsset) error
+	GetMediaAsset(ctx context.Context, id string) (MediaAsset, error)
+	ListMediaAssets(ctx context.Context, sessionID string) ([]MediaAsset, error)
+	FindMediaAssetBySHA256(ctx context.Context, sessionID, digest string) (MediaAsset, error)
+
 	// Underlying handle, used sparingly (e.g. health checks).
 	DB() *sql.DB
 }

@@ -128,6 +128,11 @@ func toOpenAITools(specs []*schema.ToolInfo) []openai.Tool {
 //
 // ReasoningContent is deliberately NOT sent back. Providers that emit it reject
 // it on input, and the stored reasoning is for display only.
+//
+// A user message carrying UserInputMultiContent (an attached image) is sent as
+// the multimodal content array instead of as a plain string. The SDK refuses a
+// message that sets both Content and MultiContent, so Content is cleared in that
+// case and the text travels as the array's first part.
 func (m *openAIModel) toOpenAIMessages(msgs []*schema.Message) []openai.ChatCompletionMessage {
 	out := make([]openai.ChatCompletionMessage, 0, len(msgs))
 	for _, msg := range msgs {
@@ -136,6 +141,10 @@ func (m *openAIModel) toOpenAIMessages(msgs []*schema.Message) []openai.ChatComp
 			Content:    msg.Content,
 			Name:       msg.Name,
 			ToolCallID: msg.ToolCallID,
+		}
+		if parts := toOpenAIMultiContent(msg.UserInputMultiContent); len(parts) > 0 {
+			converted.Content = ""
+			converted.MultiContent = parts
 		}
 		if len(msg.ToolCalls) > 0 {
 			converted.ToolCalls = make([]openai.ToolCall, 0, len(msg.ToolCalls))
@@ -163,6 +172,67 @@ func (m *openAIModel) toOpenAIMessages(msgs []*schema.Message) []openai.ChatComp
 		out = append(out, converted)
 	}
 	return out
+}
+
+// toOpenAIMultiContent converts eino's user input parts into the OpenAI content
+// array. It returns nil when there is nothing to send as parts, which leaves the
+// message text-only.
+//
+// An image part may carry a URL or inline base64 bytes; inline bytes are rendered
+// as an RFC-2397 data URL, which is the only way the chat-completions API
+// accepts an image that has no address of its own. A part that cannot be
+// rendered (no URL, base64 without a MIME type, an unsupported type such as
+// audio) is dropped rather than sent in a shape the provider would reject — the
+// whole request fails on a malformed content array, so dropping the one part is
+// the lesser failure.
+func toOpenAIMultiContent(parts []schema.MessageInputPart) []openai.ChatMessagePart {
+	var out []openai.ChatMessagePart
+	for _, p := range parts {
+		switch p.Type {
+		case schema.ChatMessagePartTypeText:
+			if p.Text == "" {
+				continue
+			}
+			out = append(out, openai.ChatMessagePart{
+				Type: openai.ChatMessagePartTypeText,
+				Text: p.Text,
+			})
+		case schema.ChatMessagePartTypeImageURL:
+			url := imagePartURL(p.Image)
+			if url == "" {
+				continue
+			}
+			part := openai.ChatMessagePart{
+				Type:     openai.ChatMessagePartTypeImageURL,
+				ImageURL: &openai.ChatMessageImageURL{URL: url},
+			}
+			if p.Image.Detail == schema.ImageURLDetailHigh || p.Image.Detail == schema.ImageURLDetailLow {
+				part.ImageURL.Detail = openai.ImageURLDetail(p.Image.Detail)
+			}
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// imagePartURL renders one image part as a URL the API accepts, or "" when the
+// part carries neither usable bytes nor a URL.
+func imagePartURL(img *schema.MessageInputImage) string {
+	if img == nil {
+		return ""
+	}
+	if img.Base64Data != nil && *img.Base64Data != "" {
+		if img.MIMEType == "" {
+			// A data URL needs its media type; guessing one would send the
+			// provider a payload it may reject as malformed.
+			return ""
+		}
+		return "data:" + img.MIMEType + ";base64," + *img.Base64Data
+	}
+	if img.URL != nil {
+		return *img.URL
+	}
+	return ""
 }
 
 func (m *openAIModel) wrapErr(err error, statusCode int, body string) error {

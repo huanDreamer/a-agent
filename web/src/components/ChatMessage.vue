@@ -6,6 +6,7 @@
 // Markdown by MarkdownText) and the turn footer with token usage. The user's
 // own message stays plain text — it is never rendered as Markdown.
 import { computed, ref } from 'vue'
+import AttachmentView from './AttachmentView.vue'
 import Icon from './Icon.vue'
 import JsonBlock from './JsonBlock.vue'
 import MarkdownText from './MarkdownText.vue'
@@ -103,7 +104,18 @@ async function copy() {
 
 <template>
   <div v-if="item.role === 'user'" class="msg msg-user">
-    <div class="bubble bubble-user">{{ item.text }}</div>
+    <div class="bubble bubble-user">
+      <!-- Attachments sit above the text: an image is the message, the caption
+           is the annotation. A message may carry attachments and no text. -->
+      <div v-if="item.attachments && item.attachments.length" class="attach-row">
+        <AttachmentView
+          v-for="file in item.attachments"
+          :key="file.id"
+          :attachment="file"
+        />
+      </div>
+      <div v-if="item.text" class="bubble-text">{{ item.text }}</div>
+    </div>
     <div class="msg-time" :title="timeTitle">{{ timeLabel }}</div>
   </div>
 

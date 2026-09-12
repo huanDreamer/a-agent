@@ -178,6 +178,21 @@ func (w *Workspace) ResolveForWrite(p string, size int64) (string, error) {
 	return w.Resolve(p)
 }
 
+// ResolveForUpload is Resolve plus the read-only check, WITHOUT the write-size
+// limit.
+//
+// The write limit bounds what the agent's tools may put on disk, which is an
+// untrusted-ish actor choosing its own file sizes. An upload is the operator's
+// own action and is bounded by the attachment cap instead; applying the tool
+// limit here would refuse an ordinary photo because the limit is sized for
+// source files.
+func (w *Workspace) ResolveForUpload(p string) (string, error) {
+	if w.readOnly {
+		return "", fmt.Errorf("%w: %s", ErrReadOnly, p)
+	}
+	return w.Resolve(p)
+}
+
 // contains reports whether abs is the root or inside it.
 func (w *Workspace) contains(abs string) bool {
 	if abs == w.root {

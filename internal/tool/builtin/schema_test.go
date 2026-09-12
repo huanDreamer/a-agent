@@ -9,6 +9,7 @@ import (
 
 	"github.com/cloudwego/eino/schema"
 
+	"github.com/huan/huan-agent/internal/media"
 	"github.com/huan/huan-agent/internal/tool"
 	"github.com/huan/huan-agent/internal/workspace"
 )
@@ -34,6 +35,10 @@ func TestSchemaDescriptions_AreNotTruncated(t *testing.T) {
 		"glob":       GlobInput{},
 		"grep":       GrepInput{},
 		"bash":       BashInput{},
+
+		"describe_image":   DescribeImageInput{},
+		"generate_image":   GenerateImageInput{},
+		"transcribe_audio": TranscribeAudioInput{},
 	} {
 		t.Run(name, func(t *testing.T) {
 			rt := reflect.TypeOf(sample)
@@ -147,6 +152,15 @@ func TestToolDescriptionsAreSubstantive(t *testing.T) {
 		},
 		"grep": func() (tool.Tool, error) { return NewGrepTool(ws) },
 		"bash": func() (tool.Tool, error) { return NewBashTool(ws, DefaultBashPolicy()) },
+		// The media tools are built from a resolved target, which in production
+		// only exists when a model is bound to the capability. Here a fixed
+		// target is enough: the schema and the description are the same whichever
+		// model answers.
+		"describe_image": func() (tool.Tool, error) { return NewDescribeImageTool(ws, schemaTestTarget()) },
+		"generate_image": func() (tool.Tool, error) { return NewGenerateImageTool(ws, schemaTestTarget()) },
+		"transcribe_audio": func() (tool.Tool, error) {
+			return NewTranscribeAudioTool(ws, schemaTestTarget())
+		},
 	}
 	for name, mk := range makeTools {
 		t.Run(name, func(t *testing.T) {
@@ -186,3 +200,15 @@ func TestToolDescriptionsAreSubstantive(t *testing.T) {
 
 // unusedSchema keeps the schema import honest if the build tags change.
 var _ = schema.ToolInfo{}
+
+// schemaTestTarget is a media target that is never called: these tests only
+// ever build a tool and read its schema. The base URL is an http one so
+// construction-time validation passes.
+func schemaTestTarget() media.Target {
+	return media.Target{
+		ProviderID: "test",
+		ModelID:    "test-model",
+		BaseURL:    "http://127.0.0.1:9/v1",
+		Kind:       media.KindOpenAI,
+	}
+}

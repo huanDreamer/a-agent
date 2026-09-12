@@ -1479,7 +1479,6 @@ table.data tbody tr.selected {
   max-width: 82%;
   background: var(--muted);
   color: var(--foreground);
-  white-space: pre-wrap;
 }
 
 .bubble-assistant {
@@ -1781,6 +1780,331 @@ table.data tbody tr.selected {
 .composer-stop:hover {
   background: var(--muted);
   border-color: var(--destructive);
+}
+
+/* --- attachments in the composer ------------------------------------- */
+
+/* The 📎 button: a bare icon that matches the 34px send button's height. */
+.composer-attach {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--muted-strong);
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  padding: 0;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.composer-attach:hover:not(:disabled) {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+.composer-attach:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Driven by the 📎 button; kept out of the layout but still a real input. */
+.composer-picker {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.composer-files {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 2px 4px 6px;
+}
+
+.composer-file {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 5px 6px 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--muted);
+}
+
+.composer-file.failed {
+  border-color: var(--destructive);
+}
+
+.composer-file-thumb {
+  width: 30px;
+  height: 30px;
+  object-fit: cover;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.composer-file-ico {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-xs);
+  background: var(--card);
+  border: 1px solid var(--border);
+  display: grid;
+  place-items: center;
+  color: var(--muted-strong);
+  flex: 0 0 auto;
+}
+
+.composer-file-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 200px;
+}
+
+.composer-file-name {
+  font-size: 12px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-file-meta {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-file.failed .composer-file-meta {
+  color: var(--destructive);
+}
+
+/* Upload progress: a hairline along the bottom edge of the chip. */
+.composer-file-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  overflow: hidden;
+  background: var(--border);
+}
+
+.composer-file-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--primary);
+  transition: width 0.15s ease;
+}
+
+.composer-file-x {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--muted-foreground);
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  padding: 0;
+  border-radius: var(--radius-xs);
+  display: grid;
+  place-items: center;
+}
+
+.composer-file-x:hover {
+  background: var(--card);
+  color: var(--foreground);
+}
+
+/* A rejected file / failed upload: one line, above the textarea. */
+.composer-notice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 4px 4px;
+  padding: 6px 9px;
+  border: 1px solid var(--destructive);
+  border-radius: var(--radius-sm);
+  color: var(--destructive);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* Drag & drop: the whole container becomes the drop target. */
+.composer-box.dropping {
+  border-color: var(--ring);
+  border-style: dashed;
+  background: var(--muted);
+}
+
+.composer-drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 6px 0 2px;
+  font-size: 12.5px;
+  color: var(--muted-strong);
+}
+
+/* --- attachments in the transcript ----------------------------------- */
+
+.attach-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.bubble-text {
+  white-space: pre-wrap;
+}
+
+.attach {
+  max-width: 100%;
+}
+
+.attach-thumb {
+  appearance: none;
+  position: relative;
+  display: block;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  overflow: hidden;
+  line-height: 0;
+}
+
+.attach-thumb img {
+  display: block;
+  max-width: 240px;
+  max-height: 240px;
+  width: auto;
+  height: auto;
+}
+
+/* The magnifier only appears on hover: it is a hint, not decoration. */
+.attach-thumb-ico {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--overlay);
+  color: var(--card);
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.attach-thumb:hover .attach-thumb-ico,
+.attach-thumb:focus-visible .attach-thumb-ico {
+  opacity: 1;
+}
+
+.attach-audio {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+}
+
+.attach-audio-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--muted-strong);
+  min-width: 0;
+}
+
+.attach-audio audio {
+  width: 100%;
+  min-width: 220px;
+  max-width: 320px;
+  height: 34px;
+}
+
+.attach-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--foreground);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.attach-file:hover {
+  border-color: var(--border-strong);
+  background: var(--muted);
+}
+
+.attach-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Lightbox: the same image, over a fixed backdrop. Teleported to <body> so it
+   escapes the message bubble's stacking context. */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: var(--overlay);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+}
+
+.lightbox-img {
+  max-width: 100%;
+  max-height: calc(100vh - 110px);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  background: var(--card);
+}
+
+.lightbox-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  background: var(--card);
+  color: var(--foreground);
+  border: 1px solid var(--border);
+  font-size: 12.5px;
 }
 
 .chat-jump {
@@ -2497,7 +2821,342 @@ table.data tbody tr.row-click:focus-visible {
   margin-top: 10px;
 }
 
-/* ---------------------------------------------------------- responsive --- */
+/* --------------------------------------------------------- 模型管理 ------ */
+
+/* Provider rows: one per provider, in a list rather than a table because each
+   row owns an action strip, a key status, an optional explanation and an
+   optional test result — all of which wrap at narrow widths. */
+.prov-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+
+.prov-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 12px 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.prov-row.selected {
+  box-shadow: inset 3px 0 0 var(--primary);
+  padding-left: 10px;
+}
+
+.prov-row.off .prov-pick {
+  opacity: 0.62;
+}
+
+/* The name + base_url block is itself the "select this provider" button. */
+.prov-pick {
+  appearance: none;
+  border: none;
+  background: none;
+  text-align: left;
+  flex: 1 1 260px;
+  min-width: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-radius: var(--radius-sm);
+  color: var(--foreground);
+}
+
+.prov-pick:hover .prov-name {
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 3px;
+}
+
+.prov-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.prov-url {
+  color: var(--muted-foreground);
+  overflow-wrap: anywhere;
+}
+
+.prov-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 0 1 auto;
+}
+
+.prov-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+  margin-left: auto;
+  justify-content: flex-end;
+}
+
+.prov-note,
+.prov-error,
+.prov-test {
+  flex: 1 1 100%;
+}
+
+.prov-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.prov-test {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  background: var(--muted);
+  color: var(--muted-strong);
+}
+
+.prov-test.ok {
+  border-color: var(--success-soft);
+  background: var(--success-fill);
+  color: var(--success);
+}
+
+.prov-test.bad {
+  border-color: var(--destructive);
+  color: var(--destructive);
+}
+
+/* Add / edit form: a quiet inset panel, so it reads as a mode, not a card. */
+.prov-form {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--muted);
+}
+
+.prov-form-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13.5px;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.form-grid .field-wide {
+  grid-column: 1 / -1;
+}
+
+.field-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted-strong);
+}
+
+.field-hint {
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+
+.field-error {
+  font-size: 11.5px;
+  color: var(--destructive);
+}
+
+.field-inline .row {
+  min-height: 34px;
+}
+
+.prov-form-foot {
+  margin-top: 14px;
+}
+
+.prov-form .banner {
+  margin-top: 12px;
+}
+
+/* Model rows: id, editable display name, toggleable capability chips, flags. */
+.models {
+  margin-top: 20px;
+}
+
+.models-head {
+  margin-bottom: 8px;
+}
+
+.model-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.model-id {
+  flex: 0 1 200px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-name {
+  flex: 1 1 150px;
+  min-width: 0;
+  padding: 5px 8px;
+  font-size: 12.5px;
+}
+
+.model-caps {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  flex: 0 1 auto;
+}
+
+/* A capability chip is a button: on = declared, off = a quiet dashed outline
+   the user can click to declare it. */
+.cap-chip {
+  appearance: none;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px dashed var(--border-strong);
+  background: transparent;
+  color: var(--muted-foreground);
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.cap-chip:hover {
+  color: var(--foreground);
+  border-color: var(--ring);
+}
+
+.cap-chip.on {
+  border-style: solid;
+  border-color: var(--info-soft);
+  background: var(--info-fill);
+  color: var(--info);
+  font-weight: 500;
+}
+
+.model-flags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.model-error {
+  flex: 1 1 100%;
+  max-width: none;
+}
+
+.model-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.model-add-id {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.model-add-name {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+/* ------------------------------------------------- 能力绑定（模型） ------ */
+
+.bind-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.bind-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 12px 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.bind-row:last-child {
+  border-bottom: none;
+}
+
+.bind-text {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.bind-pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 1 380px;
+  min-width: 0;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.bind-select {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.bind-now {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+}
+
+.bind-error {
+  flex: 1 1 100%;
+  max-width: none;
+}
+
+/* --------------------------------------------------------- responsive --- */
 
 /* ≤900px: the sidebar leaves the layout and becomes an overlay drawer. */
 @media (max-width: 900px) {

@@ -27,6 +27,7 @@ import (
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/tool"
 	"github.com/huan/huan-agent/internal/version"
+	"github.com/huan/huan-agent/internal/workspace"
 )
 
 // buildChatDeps assembles the web-chat wiring: a model registry, the built-in
@@ -60,7 +61,7 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 
 	// Tools are shared with the chat REPL so the web UI can do what the CLI can.
 	registry := tool.NewRegistry()
-	if err := registerBuiltinTools(registry, cfg); err != nil {
+	if err := registerBuiltinTools(registry, cfg, st, logger); err != nil {
 		logger.Warn("web chat: builtin tools unavailable", zap.Error(err))
 	}
 
@@ -90,8 +91,43 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 		Builder:      server.NewModelBuilder(reg),
 		Tools:        registry,
 		SystemPrompt: cfg.Chat.SystemPrompt,
-		Usage:        usageSink{rec: rec},
+		// The same confinement the file tools use, so an uploaded attachment
+		// lands somewhere the agent can read it and the workspace's
+		// read-only mode and write limit apply to uploads too.
+		Workspace: chatWorkspace(cfg, logger),
+		Usage:     usageSink{rec: rec},
 	}
+}
+
+// chatWorkspace opens the workspace the web chat stores attachments in.
+//
+// A missing or unusable root returns nil rather than failing the whole server:
+// chat still works, and only uploads are refused (with a message saying so).
+func chatWorkspace(cfg *config.Config, logger *zap.Logger) *workspace.Workspace {
+	root, ok := cfg.Tools.WorkspaceOrDefault()
+	if !ok {
+		logger.Warn("web chat: attachments disabled, no workspace root resolved")
+		return nil
+	}
+	maxRead, maxWrite, maxList := cfg.Tools.Limits()
+	ws, err := workspace.New(root, workspace.Options{
+		ReadOnly: cfg.Tools.ReadOnly,
+		Limits: workspace.Limits{
+			MaxReadBytes:   maxRead,
+			MaxWriteBytes:  maxWrite,
+			MaxListEntries: maxList,
+		},
+	})
+	if err != nil {
+		logger.Warn("web chat: attachments disabled, workspace unusable", zap.Error(err))
+		return nil
+	}
+	if ws.ReadOnly() {
+		// Worth saying out loud: a read-only workspace silently makes every
+		// upload fail, and the reason is a config flag rather than a bug.
+		logger.Info("web chat: workspace is read-only, attachment uploads will be refused")
+	}
+	return ws
 }
 
 // usageSink adapts the server's narrow recorder interface onto usage.Recorder,
@@ -208,6 +244,14 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 		logger.Warn("langfuse.enable is set but the host or API keys are missing; tracing stays off")
 	}
 	tracer := langfuse.NewTracer(lf)
+
+	// Seed the LLM catalog from the config file, so providers declared there
+	// appear in the console's model management alongside any added at runtime.
+	// A failure is not fatal: the config providers would be missing from the UI,
+	// but chat still works from the config, and failing to start would be worse.
+	if err := llm.SyncConfigProviders(cmd.Context(), st, cfg.LLM.Providers, cfg.LLM.DefaultProvider); err != nil {
+		logger.Warn("sync config providers failed", zap.Error(err))
+	}
 
 	// Usage accounting for web-chat turns. Without it the analytics count only
 	// CLI and Feishu traffic, and 统计监控 looks empty to a user who works in the

@@ -51,6 +51,14 @@ type ChatMessage struct {
 	ToolName   string `json:"tool_name,omitempty"`
 	// UsageJSON holds the token usage for an assistant message.
 	UsageJSON string `json:"usage,omitempty"`
+	// Attachments is a JSON array of media asset ids (added in migration 6), so
+	// a reloaded conversation still shows the files that were sent with it.
+	//
+	// Like ToolCalls and UsageJSON it is carried as a JSON *string* rather than
+	// as a nested array: the column is text, the UI already parses its siblings
+	// defensively, and an empty value must stay distinguishable from "no
+	// attachments" without the shape changing under a client.
+	Attachments string `json:"attachments,omitempty"`
 	// Error records a failed turn so the UI can show it after a reload.
 	Error     string    `json:"error,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
@@ -227,10 +235,10 @@ func (s *sqliteStore) AppendChatMessage(ctx context.Context, sessionID string, m
 	}
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO chat_messages
-		  (session_id, role, content, reasoning, tool_calls, tool_call_id, tool_name, usage_json, error, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  (session_id, role, content, reasoning, tool_calls, tool_call_id, tool_name, usage_json, error, attachments, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sessionID, m.Role, m.Content, m.Reasoning, m.ToolCalls,
-		m.ToolCallID, m.ToolName, m.UsageJSON, m.Error, m.CreatedAt)
+		m.ToolCallID, m.ToolName, m.UsageJSON, m.Error, m.Attachments, m.CreatedAt)
 	if err != nil {
 		return 0, fmt.Errorf("insert chat message: %w", err)
 	}
@@ -245,7 +253,7 @@ func (s *sqliteStore) AppendChatMessage(ctx context.Context, sessionID string, m
 // no limit.
 func (s *sqliteStore) ListChatMessages(ctx context.Context, sessionID string, limit int) ([]ChatMessage, error) {
 	q := `SELECT id, role, content, reasoning, tool_calls, tool_call_id, tool_name,
-	             usage_json, error, created_at
+	             usage_json, error, attachments, created_at
 	      FROM chat_messages WHERE session_id = ? ORDER BY id ASC`
 	args := []any{sessionID}
 	if limit > 0 {
@@ -264,7 +272,7 @@ func (s *sqliteStore) ListChatMessages(ctx context.Context, sessionID string, li
 		var m ChatMessage
 		var created sql.NullTime
 		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.Reasoning, &m.ToolCalls,
-			&m.ToolCallID, &m.ToolName, &m.UsageJSON, &m.Error, &created); err != nil {
+			&m.ToolCallID, &m.ToolName, &m.UsageJSON, &m.Error, &m.Attachments, &created); err != nil {
 			return nil, fmt.Errorf("scan chat message: %w", err)
 		}
 		m.CreatedAt = nullTime(created)

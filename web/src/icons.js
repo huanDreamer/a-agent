@@ -37,6 +37,17 @@ export const ICON_PATHS = {
   // 统计监控: Lucide bar-chart-3.
   'bar-chart': 'M3 3v18h18|M18 17V9|M13 17V5|M8 17v-3',
   cpu: 'M4 4h16v16H4z|M9 9h6v6H9z|M9 2v2|M15 2v2|M9 20v2|M15 20v2|M2 9h2|M2 15h2|M20 9h2|M20 15h2',
+  // 附件: attach (paperclip), the drop/upload glyph, an image and an audio cue.
+  paperclip:
+    'm16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551',
+  upload: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4|m17 8-5-5-5 5|M12 3v12',
+  x: 'M18 6 6 18|m6 6 12 12',
+  eye: 'M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0|M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6',
+  headphones:
+    'M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3',
+  // 模型管理: 测试连接 (plug) and a positive test result (circle-check).
+  plug: 'M12 22v-5|M9 8V2|M15 8V2|M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z',
+  'circle-check': 'M21.801 10A10 10 0 1 1 17 3.335|m9 11 3 3L22 4',
 }
 
 /** Icons whose first segment is a rounded rect instead of a path. */

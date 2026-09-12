@@ -53,6 +53,21 @@ export function formatCompact(value, digits = 1) {
   return String(Math.round(n))
 }
 
+/** 12345 -> "12.1 KB" ; attachment sizes, in binary units. */
+export function formatBytes(value) {
+  const n = toNumber(value)
+  if (n === null || n < 0) return DASH
+  if (n < 1024) return `${Math.round(n)} B`
+  const units = ['KB', 'MB', 'GB']
+  let scaled = n / 1024
+  let index = 0
+  while (scaled >= 1024 && index < units.length - 1) {
+    scaled /= 1024
+    index += 1
+  }
+  return `${stripTrailingZeros(scaled.toFixed(1))} ${units[index]}`
+}
+
 /** Exact token count with separators, for `title` tooltips next to a compact value. */
 export function formatExactTokens(value) {
   const n = toNumber(value)

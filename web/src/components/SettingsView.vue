@@ -3,14 +3,16 @@
 //
 //   1. 外观           主题（亮色 / 暗色 / 跟随系统），来自 theme.js;
 //   2. 服务信息       provider / model / 版本 / 开关状态，只读，来自 GET /api/meta;
-//   3. 模型目录       可选 provider / model，只读，来自 GET /api/chat/models;
-//   4. 工作区与工具   已注册的工具、单轮步数上限与工作区配置说明，只读;
-//   5. 技能           SkillsPanel（原 技能 页面）。
+//   3. 模型目录       当前可调用的 provider / model，只读，来自 GET /api/chat/models;
+//   4. 模型管理       可写的 provider / 模型 / 能力绑定（ModelManager）;
+//   5. 工作区与工具   已注册的工具、单轮步数上限与工作区配置说明，只读;
+//   6. 技能           SkillsPanel（原 技能 页面）。
 //
 // There is deliberately no account, password, login or logout section.
 import { computed } from 'vue'
 import AsyncBlock from './AsyncBlock.vue'
 import Icon from './Icon.vue'
+import ModelManager from './ModelManager.vue'
 import SkillsPanel from './SkillsPanel.vue'
 import ViewHead from './ViewHead.vue'
 import { chat, chatModels, defaultModel, loadCatalog, maxSteps } from '../chatStore.js'
@@ -178,12 +180,16 @@ const catalog = computed(() =>
             <p v-if="defaultModel" class="muted-note card-foot">
               新建对话默认使用
               <code class="md-code">{{ defaultModel.provider }} / {{ defaultModel.model }}</code>
-              ，单轮最多 {{ formatCount(maxSteps) }} 步。
+              ，单轮最多 {{ formatCount(maxSteps) }} 步。这张表是「当前能调用什么」，下面的
+              模型管理才是「有哪些 provider 与模型」。
             </p>
           </AsyncBlock>
         </div>
 
-        <!-- 4. workspace + tools (informational only) -->
+        <!-- 4. model management: providers, their models, capability bindings -->
+        <ModelManager />
+
+        <!-- 5. workspace + tools (informational only) -->
         <div class="card">
           <div class="card-head">
             <div class="card-title">
@@ -213,7 +219,7 @@ const catalog = computed(() =>
           </p>
         </div>
 
-        <!-- 5. skills -->
+        <!-- 6. skills -->
         <SkillsPanel />
       </div>
     </div>

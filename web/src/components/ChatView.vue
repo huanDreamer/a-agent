@@ -255,9 +255,9 @@ async function onCreate() {
   if (created) nextTick(() => composer.value?.focus())
 }
 
-function onSend(text) {
+function onSend(text, attachments) {
   confirmClear.value = false
-  sendMessage(text)
+  sendMessage(text, { attachments: attachments || [] })
 }
 
 function reloadMessages() {
@@ -291,10 +291,10 @@ onBeforeUnmount(stopSettling)
       <Icon name="circle-alert" :size="16" />
       <span class="banner-text">{{ chat.actionError }}</span>
       <button
-        v-if="chat.pendingContent"
+        v-if="chat.pendingContent || chat.pendingAttachments.length"
         type="button"
         class="btn sm"
-        @click="sendMessage(chat.pendingContent)"
+        @click="sendMessage(chat.pendingContent, { attachments: chat.pendingAttachments })"
       >
         重试
       </button>
@@ -412,6 +412,7 @@ onBeforeUnmount(stopSettling)
         ref="composer"
         :streaming="streaming"
         :pending="chat.pendingContent"
+        :pending-attachments="chat.pendingAttachments"
         @send="onSend"
         @stop="stopStreaming"
       />
@@ -443,7 +444,14 @@ onBeforeUnmount(stopSettling)
         </AsyncBlock>
       </div>
 
-      <ChatComposer disabled :streaming="false" :pending="''" @send="onSend" @stop="stopStreaming" />
+      <ChatComposer
+        disabled
+        :streaming="false"
+        :pending="''"
+        :pending-attachments="[]"
+        @send="onSend"
+        @stop="stopStreaming"
+      />
     </template>
   </div>
 </template>

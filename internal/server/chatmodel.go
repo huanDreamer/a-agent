@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -97,7 +98,13 @@ const maxRunnerCache = 32
 // replayed as model input: they are display-only, and replaying an assistant
 // tool_call without its paired tool result is exactly what makes providers
 // reject a request.
-func (s *Server) buildHistory(ctx context.Context, sess store.ChatSession, newUser string) ([]*schema.Message, error) {
+//
+// Attachment bytes are not replayed either. A stored user message carries only
+// its own text — the asset ids in its attachments column are for rendering the
+// conversation, not for the model — so an image is inlined exactly once, on the
+// turn it was sent. Re-inlining it here would re-upload the same base64 payload
+// on every later turn of the conversation.
+func (s *Server) buildHistory(ctx context.Context, sess store.ChatSession, newUser *schema.Message) ([]*schema.Message, error) {
 	limit := s.chatHistoryLimit()
 	stored, err := s.store.ListChatMessages(ctx, sess.ID, 0)
 	if err != nil {
@@ -131,8 +138,50 @@ func (s *Server) buildHistory(ctx context.Context, sess store.ChatSession, newUs
 		// is already reflected in the assistant's next answer.
 	}
 
-	msgs = append(msgs, &schema.Message{Role: schema.User, Content: newUser})
+	if newUser != nil {
+		msgs = append(msgs, newUser)
+	}
 	return msgs, nil
+}
+
+// sessionModelTarget returns the (provider, model) a session's turns run on.
+//
+// It follows the same fallbacks the usage attribution uses, so the model a turn
+// is billed to and the model whose capabilities decide how an attachment is sent
+// cannot disagree.
+func (s *Server) sessionModelTarget(sess store.ChatSession) (string, string) {
+	provider, model := sess.Provider, sess.Model
+	if provider == "" {
+		provider = s.cfg.Provider
+	}
+	if model == "" {
+		model = s.cfg.Model
+	}
+	return provider, model
+}
+
+// sessionSupportsVision reports whether the model this session runs on declares
+// the vision capability.
+//
+// Capabilities are a hint the operator confirms: the providers' /models endpoint
+// does not report them, so an unknown model is treated as text-only. That is the
+// safe direction — sending image parts to a model that cannot accept them fails
+// the whole turn, while a text-only turn that points at the file still works,
+// because the agent can look at it with describe_image.
+func (s *Server) sessionSupportsVision(ctx context.Context, sess store.ChatSession) bool {
+	provider, model := s.sessionModelTarget(sess)
+	if provider == "" || model == "" {
+		return false
+	}
+	m, err := s.store.GetModel(ctx, provider, model)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Warn("chat: read model capabilities failed",
+				zapString("provider", provider), zapString("model", model), zapError(err))
+		}
+		return false
+	}
+	return m.Has(store.CapVision)
 }
 
 // chatHistoryLimit returns the configured replay limit.

@@ -17,6 +17,7 @@ import (
 	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/tool"
+	"github.com/huan/huan-agent/internal/workspace"
 )
 
 // defaultSystemPrompt is used when config does not override it.
@@ -72,6 +73,17 @@ type ChatDeps struct {
 	Tools *tool.Registry
 	// SystemPrompt overrides the default.
 	SystemPrompt string
+	// Workspace confines the chat to one directory. It is where uploaded
+	// attachments are stored and read back from, so uploads are refused — with a
+	// clear message — when it is nil or read-only rather than written somewhere
+	// the agent's tools cannot reach.
+	Workspace *workspace.Workspace
+	// MaxAttachmentBytes overrides MaxAttachmentBytes for one upload. Zero uses
+	// the default; a deployment with a smaller storage budget can lower it.
+	MaxAttachmentBytes int64
+	// MaxInlineImageBytes overrides MaxInlineImageBytes, the cap on an image that
+	// is base64-inlined into a model request. Zero uses the default.
+	MaxInlineImageBytes int64
 	// Usage records token usage for the admin analytics. Optional: when nil the
 	// conversation still works and simply is not counted.
 	//
@@ -130,9 +142,30 @@ func (s *Server) registerChatRoutes(authed *route.RouterGroup) {
 	authed.PATCH("/chat/sessions/:id", s.handlePatchSession)
 	authed.DELETE("/chat/sessions/:id", s.handleDeleteSession)
 	authed.POST("/chat/sessions/:id/clear", s.handleClearSession)
+	// Attachment endpoints: an upload stores a file in the workspace and records
+	// it as a media asset, and the download serves those bytes back so a
+	// reloaded conversation can render the image that was sent with it.
+	authed.POST("/chat/sessions/:id/attachments", s.handleUploadAttachment)
+	authed.GET("/chat/attachments/:id", s.handleGetAttachment)
 	// Streaming endpoint: Server-Sent Events, because the browser needs partial
 	// output as the model produces it.
 	authed.POST("/chat/sessions/:id/messages", s.handleSendMessage)
+}
+
+// maxAttachmentBytes returns the effective per-upload cap.
+func (s *Server) maxAttachmentBytes() int64 {
+	if v := s.chat.MaxAttachmentBytes; v > 0 {
+		return v
+	}
+	return MaxAttachmentBytes
+}
+
+// maxInlineImageBytes returns the effective cap on an inlined image.
+func (s *Server) maxInlineImageBytes() int64 {
+	if v := s.chat.MaxInlineImageBytes; v > 0 {
+		return v
+	}
+	return MaxInlineImageBytes
 }
 
 // handleChatModels lists the selectable providers and the available tools.
@@ -368,13 +401,15 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 	id := c.Param("id")
 	var body struct {
 		Content string `json:"content"`
+		// Attachments are media asset ids uploaded for this session. Optional.
+		Attachments []string `json:"attachments"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
 	content := strings.TrimSpace(body.Content)
-	if content == "" {
+	if content == "" && !hasAnyID(body.Attachments) {
 		c.JSON(http.StatusBadRequest, map[string]string{"error": "content is required"})
 		return
 	}
@@ -389,6 +424,37 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	// Resolve the attachments before anything is persisted, so a rejected id
+	// (unknown, or belonging to another session) leaves no half-sent message
+	// behind. Only this turn's attachments are inlined: replaying stored images
+	// on every later turn would re-send megabytes of base64 as prompt tokens for
+	// a conversation that already contains the answer.
+	inline, notes, assetIDs, err := s.loadTurnAttachments(ctx, sess, body.Attachments)
+	if err != nil {
+		s.answerStatusError(c, "load chat attachments", err)
+		return
+	}
+	turnText := content
+	if len(notes) > 0 {
+		note := attachmentNote(notes)
+		if turnText == "" {
+			turnText = note
+		} else {
+			turnText += "\n\n" + note
+		}
+	}
+	if turnText == "" {
+		turnText = defaultAttachmentText
+	}
+	// What is persisted is the user's own text, not the note appended for the
+	// model: a reloaded transcript should show the message the user wrote, with
+	// its attachments rendered from the ids, rather than a system note that
+	// looks like the user typed it.
+	persisted := content
+	if persisted == "" {
+		persisted = defaultAttachmentText
+	}
+
 	// Build the model for this session's choice before opening the stream, so a
 	// misconfiguration is reported as a normal JSON error instead of a broken
 	// stream.
@@ -398,7 +464,7 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
-	history, err := s.buildHistory(ctx, sess, content)
+	history, err := s.buildHistory(ctx, sess, buildUserMessage(turnText, inline))
 	if err != nil {
 		s.fail(c, "build chat history", err)
 		return
@@ -407,7 +473,7 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 	// Persist the user's message before running, so a crash mid-turn does not
 	// lose it.
 	if _, err := s.store.AppendChatMessage(ctx, sess.ID, store.ChatMessage{
-		Role: store.RoleUser, Content: content,
+		Role: store.RoleUser, Content: persisted, Attachments: attachmentsJSON(assetIDs),
 	}); err != nil {
 		s.fail(c, "persist user message", err)
 		return

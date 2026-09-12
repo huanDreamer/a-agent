@@ -268,3 +268,34 @@ func TestResolve_NestedMissingPathIsAllowed(t *testing.T) {
 		t.Errorf("err = %v, want ErrOutsideWorkspace", err)
 	}
 }
+
+func TestResolveForUpload_IgnoresTheToolWriteLimit(t *testing.T) {
+	// The write limit is sized for source files and bounds what the agent's
+	// tools may write. An upload is the operator's own action, so applying it
+	// would refuse an ordinary photo; the attachment cap bounds it instead.
+	ws, _ := newWS(t, Options{Limits: Limits{MaxWriteBytes: 16}})
+
+	// The tool path is still bounded.
+	if _, err := ws.ResolveForWrite("shot.png", 5<<20); err == nil {
+		t.Error("a tool write over the limit must still be refused")
+	}
+	// The upload path is not.
+	if _, err := ws.ResolveForUpload("shot.png"); err != nil {
+		t.Errorf("an upload should not be bounded by the tool write limit: %v", err)
+	}
+}
+
+func TestResolveForUpload_StillRespectsReadOnlyAndConfinement(t *testing.T) {
+	// Dropping the size limit must not drop anything else.
+	ro, _ := newWS(t, Options{ReadOnly: true})
+	if _, err := ro.ResolveForUpload("a.png"); !errors.Is(err, ErrReadOnly) {
+		t.Errorf("err = %v, want ErrReadOnly", err)
+	}
+
+	ws, _ := newWS(t, Options{})
+	for _, p := range []string{"../evil.png", "/etc/passwd"} {
+		if _, err := ws.ResolveForUpload(p); !errors.Is(err, ErrOutsideWorkspace) {
+			t.Errorf("ResolveForUpload(%q) err = %v, want ErrOutsideWorkspace", p, err)
+		}
+	}
+}

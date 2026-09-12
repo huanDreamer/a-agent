@@ -245,3 +245,28 @@ tools:
   # (rm -rf /, mkfs, dd of=/dev/..., fork bombs, shutdown/reboot). This is a
   # speed bump, NOT a boundary — an equivalent command that does not match runs.
   deny_patterns: []
+
+# ---------------------------------------------------------------------------
+# Media tools and model management
+#
+# Providers can now be managed at runtime from the console (设置 → 模型管理):
+# add a provider, fetch its model list from the OpenAI-compatible /models
+# endpoint, declare what each model can do, and bind a model to each capability.
+# Those live in the database. Anything declared below is synced into the
+# database at startup and shown read-only in the console, so the config stays
+# useful for a declarative bootstrap.
+#
+# A media tool exists only when its capability is bound to a usable model.
+# Unbound capability = the tool is not registered at all, so the model cannot
+# even see it.
+# ---------------------------------------------------------------------------
+# Capabilities and the tools they enable:
+#   vision            → describe_image    (send an image to a vision model)
+#   image_gen         → generate_image    (generate an image into the workspace)
+#   audio_transcribe  → transcribe_audio  (speech to text)
+#   audio_speech      → reserved; no tool ships yet
+#   embedding         → reserved; no tool ships yet
+#
+# NOTE the /models endpoint does not report capabilities — it returns ids only.
+# The console guesses from the model name and lets you correct it, which is the
+# only accurate source.

@@ -164,7 +164,22 @@ func New(cfg Config, st store.Store, table *pricing.Table, adminCfg config.Admin
 	s.ln = ln
 	s.addr = ln.Addr().String()
 
-	h := server.New(server.WithListener(ln), server.WithExitWaitTime(engineExitWait))
+	h := server.New(
+		server.WithListener(ln),
+		server.WithExitWaitTime(engineExitWait),
+		// Attachment uploads are multipart bodies that can legitimately be far
+		// larger than the engine's 4 MiB request cap, and the upload handler
+		// enforces its own limit while it reads. Streaming the body — instead of
+		// buffering and pre-parsing it — keeps that decision in the handler,
+		// which can answer with a JSON 413 rather than the engine's generic
+		// error, and keeps a large upload from being materialised whole in
+		// memory before it is even looked at.
+		//
+		// A body that fits the cap is still buffered, so every other endpoint's
+		// JSON body is read exactly as before.
+		server.WithStreamBody(true),
+		server.WithDisablePreParseMultipartForm(true),
+	)
 	s.hertz = h
 	s.registerRoutes(h)
 	return s, nil
@@ -175,6 +190,10 @@ func (s *Server) Addr() string { return s.addr }
 
 // registerRoutes wires the API, the metrics endpoint and the embedded UI.
 func (s *Server) registerRoutes(h *server.Hertz) {
+	// Bound what the engine buffers for a request that is not an attachment
+	// upload; see limitStreamedBody for why streaming the body needs it.
+	h.Use(s.limitStreamedBody)
+
 	if s.cfg.MetricsEnable {
 		h.GET(s.cfg.MetricsPath, s.handleMetrics)
 	}
@@ -197,6 +216,7 @@ func (s *Server) registerRoutes(h *server.Hertz) {
 	authed.GET("/audit", s.handleAudit)
 	authed.GET("/skills", s.handleSkills)
 	authed.POST("/skills/:name", s.handleSetSkill)
+	s.registerProviderRoutes(authed)
 	s.registerChatRoutes(authed)
 	s.registerTraceRoutes(authed)
 
