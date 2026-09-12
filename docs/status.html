@@ -202,13 +202,13 @@
     <div class="overall">
       <div class="overall-head">
         <span class="lbl">MVP 阶段完成度</span>
-        <span class="val">7 / 8 阶段</span>
+        <span class="val">7.5 / 8 阶段</span>
       </div>
-      <div class="track"><div class="fill green" data-w="87.5"></div></div>
+      <div class="track"><div class="fill green" data-w="93.75"></div></div>
       <div class="sub" style="margin-top:12px;font-size:13px">
-        Phase 0–5 已完成，含 Phase 5b（网页端对话与链路追踪）：会话管理、按会话选模型、
-        SSE 流式对话（可见思考过程与工具调用）、Langfuse 对接与追踪可视化。
-        剩余 Phase 6（生产加固）与 Phase 7（未来扩展）。
+        Phase 0–5 已完成，含 Phase 5b（网页对话 + 链路追踪）。
+        **Phase 6 已完成**：Agent 现在真正能干活 —— 读写文件、搜代码、执行命令（限定工作目录）。
+        剩余的只是生产加固（Docker、限流熔断、部署文档）。
       </div>
     </div>
   </div>
@@ -218,7 +218,7 @@
     <h2><span class="ico">📊</span>关键指标</h2>
     <p class="sec-note">数据来自当前仓库实测（<code>go test -cover</code>）。</p>
     <div class="stats">
-      <div class="stat g"><div class="n">7</div><div class="k">已完成阶段</div></div>
+      <div class="stat g"><div class="n">7.5</div><div class="k">已完成阶段</div></div>
       <div class="stat b"><div class="n">86.7%</div><div class="k">平均测试覆盖率</div></div>
       <div class="stat c"><div class="n">13</div><div class="k">internal 包</div></div>
       <div class="stat p"><div class="n">6,662</div><div class="k">业务代码行数</div></div>
@@ -327,6 +327,21 @@
           <span class="mini ok">langfuse 97.4%</span>
           <span class="mini ok">server 76.0%</span>
           <span class="mini ok">store 85.3%</span>
+        </div>
+      </div>
+
+      <div class="phase done">
+        <div class="phase-head">
+          <span class="phase-title">Phase 6 · Agent 工具能力</span>
+          <span class="phase-tag tag-done">完成</span>
+        </div>
+        <div class="phase-desc">工作区沙箱 + read_file / write_file / edit_file / list_dir /
+          glob / grep / bash。真正能读写文件、搜代码、跑命令的编码助手。</div>
+        <div class="phase-meta">
+          <span class="mini ok">workspace 88.9%</span>
+          <span class="mini ok">builtin 88.8%</span>
+          <span class="mini ok">tool 89.0%</span>
+          <span class="mini ok">bash.go 92.9%</span>
         </div>
       </div>
 
@@ -550,9 +565,9 @@
   </section>
 
   <div class="note">
-    <b>一句话总结：</b>Phase 0–5 全部完成，管理员后台现在是一个<b>真正可用的 Agent 客户端</b>——
-    网页对话（流式、可见思考与工具调用）、会话管理、按会话选模型、会话与用量统计、Langfuse 链路追踪与可视化。
-    <b>剩下是 Phase 6 的生产加固（Docker、限流熔断、健康检查、部署文档）与 Phase 7 的未来扩展</b>。
+    <b>一句话总结：</b>它已经是一个<b>能实际干活的编码助手</b>——能读文件、搜代码、改写文件、执行命令，
+    并在网页里实时展示每一步；配合会话管理、多模型选择、用量统计与 Langfuse 链路追踪。
+    <b>剩下的是生产加固（Docker、限流熔断、部署文档）与未来扩展</b>。
     <br><span style="font-size:12px;color:var(--text-dimmer)">生成时间：2026-09-06 · 数据源：仓库实测</span>
   </div>
 
