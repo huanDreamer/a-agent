@@ -21,6 +21,23 @@ type Store interface {
 
 	// Usage log accessors (Phase 1).
 	RecordUsage(ctx context.Context, e UsageEvent) error
+
+	// --- LLM catalog: providers, their models and capability bindings ---
+	UpsertProvider(ctx context.Context, p Provider) error
+	GetProvider(ctx context.Context, id string) (Provider, error)
+	ListProviders(ctx context.Context) ([]Provider, error)
+	SetProviderKey(ctx context.Context, id, key string) error
+	SetProviderError(ctx context.Context, id, msg string) error
+	DeleteProvider(ctx context.Context, id string) error
+
+	ReplaceFetchedModels(ctx context.Context, providerID string, models []Model) error
+	UpsertModel(ctx context.Context, m Model) error
+	ListModels(ctx context.Context, providerID string) ([]Model, error)
+	GetModel(ctx context.Context, providerID, modelID string) (Model, error)
+	DeleteModel(ctx context.Context, providerID, modelID string) error
+
+	SetBinding(ctx context.Context, b Binding) error
+	ListBindings(ctx context.Context) ([]Binding, error)
 	QueryUsage(ctx context.Context, f UsageFilter) ([]UsageRecord, error)
 
 	// Tool invocation audit log (Phase 2).

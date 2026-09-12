@@ -93,6 +93,66 @@ var migrations = []migration{
 		);
 		CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, id);`,
 	},
+	{
+		version: 5,
+		name:    "create_llm_catalog",
+		up: `CREATE TABLE IF NOT EXISTS llm_providers (
+			id           TEXT PRIMARY KEY,
+			name         TEXT NOT NULL DEFAULT '',
+			base_url     TEXT NOT NULL DEFAULT '',
+			api_key      TEXT NOT NULL DEFAULT '',
+			api_key_env  TEXT NOT NULL DEFAULT '',
+			kind         TEXT NOT NULL DEFAULT 'openai',
+			source       TEXT NOT NULL DEFAULT 'user',
+			enabled      INTEGER NOT NULL DEFAULT 1,
+			last_error   TEXT NOT NULL DEFAULT '',
+			created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS llm_models (
+			provider_id  TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
+			model_id     TEXT NOT NULL,
+			display_name TEXT NOT NULL DEFAULT '',
+			capabilities TEXT NOT NULL DEFAULT '',
+			enabled      INTEGER NOT NULL DEFAULT 1,
+			source       TEXT NOT NULL DEFAULT 'fetched',
+			fetched_at   TIMESTAMP,
+			PRIMARY KEY (provider_id, model_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_llm_models_provider ON llm_models(provider_id);
+
+		CREATE TABLE IF NOT EXISTS llm_bindings (
+			capability   TEXT PRIMARY KEY,
+			provider_id  TEXT NOT NULL DEFAULT '',
+			model_id     TEXT NOT NULL DEFAULT '',
+			updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS media_assets (
+			id           TEXT PRIMARY KEY,
+			session_id   TEXT NOT NULL DEFAULT '',
+			kind         TEXT NOT NULL DEFAULT '',
+			path         TEXT NOT NULL DEFAULT '',
+			mime         TEXT NOT NULL DEFAULT '',
+			bytes        INTEGER NOT NULL DEFAULT 0,
+			sha256       TEXT NOT NULL DEFAULT '',
+			created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_media_session ON media_assets(session_id);`,
+	},
+	{
+		version: 6,
+		name:    "add_message_attachments",
+		// Separate from the migration that created chat_messages rather than
+		// appended to it: a database that already applied that version would
+		// never run the added statement.
+		//
+		// Attachments are stored as a JSON array of asset ids on the message, so
+		// a reloaded conversation still shows the image that was sent with it —
+		// the file itself lives in media_assets.
+		up: `ALTER TABLE chat_messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '';`,
+	},
 }
 
 // Migrate applies any pending migrations idempotently.
