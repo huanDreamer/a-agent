@@ -13,7 +13,7 @@ import (
 // exported so the generated JSON schema documents the optional
 // timezone field.
 type TimeInput struct {
-	Timezone string `json:"timezone" jsonschema:"description=IANA timezone name, e.g. Asia/Shanghai. Empty = server local time"`
+	Timezone string `json:"timezone" jsonschema:"description=IANA timezone name such as Asia/Shanghai. Empty returns the server local zone"`
 }
 
 // TimeOutput is what the time tool returns.

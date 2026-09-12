@@ -13,7 +13,7 @@ import (
 
 // CalcInput is the parameter schema for the "calc" tool.
 type CalcInput struct {
-	Expression string `json:"expression" jsonschema:"description=Math expression to evaluate, e.g. (1+2)*3, required"`
+	Expression string `json:"expression" jsonschema:"description=Math expression to evaluate such as (1+2)*3,required"`
 }
 
 // CalcOutput is what the calc tool returns.
