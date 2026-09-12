@@ -212,3 +212,27 @@ langfuse:
   secret_key: ""           # NEVER commit; use HUAN_LANGFUSE_SECRET_KEY
   environment: "production"
   release: ""              # e.g. a git sha; empty = omitted
+
+# Tools that let the agent work on a codebase: read/write/edit files, search
+# them, and run commands. See docs/tools.md.
+#
+# SECURITY: this lets an LLM touch a real directory and run real commands, and
+# anyone who can message the bot can drive it. The WORKING DIRECTORY is
+# confined; what a command can otherwise reach is not. For a real boundary, run
+# the agent as a dedicated user in a container with only the project mounted.
+tools:
+  # The confinement root. Empty = the process working directory.
+  workspace: ""              # e.g. "/Users/me/code/my-project"
+  # Read and search only: write_file, edit_file and bash are withheld.
+  read_only: false
+  # Shell execution. Off = file editing without command execution.
+  enable_bash: true
+  bash_timeout_seconds: 120
+  # Per-call limits.
+  max_read_kb: 512
+  max_write_mb: 4
+  max_list_entries: 500
+  # RE2 patterns that refuse a matching command; empty uses the built-in set
+  # (rm -rf /, mkfs, dd of=/dev/..., fork bombs, shutdown/reboot). This is a
+  # speed bump, NOT a boundary — an equivalent command that does not match runs.
+  deny_patterns: []
