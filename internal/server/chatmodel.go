@@ -13,7 +13,6 @@ import (
 
 	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/config"
-	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/store"
 )
 
@@ -22,7 +21,7 @@ import (
 // A Runner holds its model, so a per-session model choice means a per-session
 // Runner. They are cheap (struct + options) and cached, so switching models is
 // not a rebuild on every message.
-func (s *Server) runnerFor(sess store.ChatSession) (*chat.Runner, error) {
+func (s *Server) runnerFor(ctx context.Context, sess store.ChatSession) (*chat.Runner, error) {
 	if s.chat.Runner == nil {
 		return nil, fmt.Errorf("server: chat is not enabled")
 	}
@@ -35,7 +34,7 @@ func (s *Server) runnerFor(sess store.ChatSession) (*chat.Runner, error) {
 		return r, nil
 	}
 
-	built, err := s.chat.Builder.Build(sess.Provider, sess.Model)
+	built, err := s.chat.Builder.Build(ctx, sess.Provider, sess.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -192,45 +191,6 @@ func (s *Server) chatHistoryLimit() int {
 	return config.DefaultChatHistoryLimit
 }
 
-// llmModelBuilder adapts the LLM registry to ModelBuilder.
-type llmModelBuilder struct {
-	reg *llm.Registry
-}
-
-// NewModelBuilder exposes a registry as a ModelBuilder.
-func NewModelBuilder(reg *llm.Registry) ModelBuilder {
-	return &llmModelBuilder{reg: reg}
-}
-
-// Build returns a chat model for a provider and model name.
-func (b *llmModelBuilder) Build(provider, modelName string) (any, error) {
-	if b.reg == nil {
-		return nil, fmt.Errorf("server: no LLM registry configured")
-	}
-	if strings.TrimSpace(provider) == "" {
-		provider = b.reg.DefaultName()
-	}
-	return b.reg.GetWithModel(provider, modelName)
-}
-
-// Catalog lists the selectable providers.
-func (b *llmModelBuilder) Catalog() []ModelChoice {
-	if b.reg == nil {
-		return nil
-	}
-	cat := b.reg.Catalog()
-	out := make([]ModelChoice, 0, len(cat))
-	for _, c := range cat {
-		out = append(out, ModelChoice{
-			Provider:  c.Name,
-			Model:     c.Model,
-			Default:   c.Default,
-			HasAPIKey: c.HasAPIKey,
-		})
-	}
-	return out
-}
-
 // usageJSON is the shape stored in ChatMessage.UsageJSON.
 type usageJSON struct {
 	PromptTokens     int `json:"prompt_tokens"`
@@ -260,6 +220,3 @@ func toolRunsFromJSON(raw string) []chat.ToolRun {
 	}
 	return runs
 }
-
-// compile-time check that the builder satisfies the interface.
-var _ ModelBuilder = (*llmModelBuilder)(nil)

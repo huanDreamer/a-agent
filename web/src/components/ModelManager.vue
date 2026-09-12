@@ -7,7 +7,16 @@
 //     (PUT /api/llm/models) — the capability chips a download produces are an
 //     inference from the model name, so the UI says so and lets the user fix it;
 //   * 能力绑定, the compact capability → provider/model editor that decides
-//     whether the media tools exist at all.
+//     whether the media tools exist at all;
+//   * 刷新全部, which asks the server to refetch every enabled provider's model
+//     list in one request.
+//
+// Read this together with 对话: both surfaces read GET /api/chat/models, so the
+// model count, the last-refreshed time and the stale marker shown here are the
+// same facts the composer's picker is built from — never a second derivation.
+// Anything this panel displays about models therefore comes from that endpoint
+// (via the chat store), while the provider *rows* still come from /api/llm/*
+// because they carry what only an editor needs (base_url, source, key hint).
 //
 // Two rules this panel never breaks:
 //
@@ -17,13 +26,20 @@
 //   2. A provider with source=config is re-synced from the config file at
 //      startup, so it is not editable here — the row says why instead of
 //      offering actions that would be silently undone.
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import AsyncBlock from './AsyncBlock.vue'
 import BindingEditor from './BindingEditor.vue'
 import Icon from './Icon.vue'
 import { api } from '../api.js'
 import { CAPABILITIES, checkBaseUrl, checkProviderId, normalizeCapabilities } from '../llm.js'
-import { formatCount } from '../format.js'
+import {
+  catalogProviderStats,
+  claimAutoRefresh,
+  loadCatalog,
+  refreshAllModels,
+  staleCatalogProviders,
+} from '../chatStore.js'
+import { formatAbsolute, formatCount, formatRelative } from '../format.js'
 import { useResource } from '../useResource.js'
 
 /* ------------------------------------------------------------- resources -- */
@@ -72,6 +88,22 @@ watch(providers, (list) => {
   const first = list[0]
   selectedId.value = first && first.id ? first.id : ''
 })
+
+/**
+ * The catalog's per-provider facts: how many models the provider has, when its
+ * list was last fetched, and whether it is stale. They come from
+ * GET /api/chat/models, the same snapshot 对话's picker uses.
+ */
+function providerStats(id) {
+  return catalogProviderStats.value.get(id) || null
+}
+
+/** A provider's display name, for a refresh report that only carries ids. */
+function providerName(id) {
+  const found = providers.value.find((p) => p && p.id === id)
+  return (found && (found.name || found.id)) || id
+}
+
 
 /* ------------------------------------------------------------ row + form -- */
 
@@ -191,8 +223,7 @@ async function saveForm() {
     form.api_key = ''
     selectedId.value = id
     setFlash(form.mode === 'add' ? `provider ${id} 已创建` : `provider ${id} 已保存`)
-    await reloadProviders()
-    await reloadModels()
+    await resync()
   } catch (err) {
     if (err && err.status === 401) return
     formError.value = errorText(err, '保存失败，请重试')
@@ -230,7 +261,9 @@ async function toggleEnabled(provider) {
       kind: provider.kind || 'openai',
       enabled: next,
     })
-    await reloadProviders()
+    // Enabling a provider changes what the catalog offers, so the composer's
+    // selector must be reloaded too.
+    await resync()
   } catch (err) {
     if (err && err.status === 401) return
     provider.enabled = previous
@@ -272,8 +305,7 @@ async function refreshModels(provider) {
     const res = (await api.refreshLlmProviderModels(id)) || {}
     const count = Array.isArray(res.models) ? res.models.length : 0
     setFlash(`${provider.name || id}：已刷新 ${formatCount(count)} 个模型`)
-    await reloadModels()
-    await reloadProviders()
+    await resync()
   } catch (err) {
     if (err && err.status === 401) return
     rowError[id] = errorText(err, '刷新模型失败')
@@ -291,8 +323,7 @@ async function removeProvider(provider) {
   try {
     await api.deleteLlmProvider(id)
     setFlash(`provider ${id} 已删除`)
-    await reloadProviders()
-    await reloadModels()
+    await resync()
   } catch (err) {
     if (err && err.status === 401) return
     rowError[id] = errorText(err, '删除失败，请重试')
@@ -311,7 +342,8 @@ async function clearKey(provider) {
   try {
     await api.setLlmProviderKey(id, '')
     setFlash(`provider ${id} 的密钥已清除`)
-    await reloadProviders()
+    // has_api_key is part of the catalog, so the picker's warning follows.
+    await resync()
   } catch (err) {
     if (err && err.status === 401) return
     rowError[id] = errorText(err, '清除密钥失败')
@@ -356,12 +388,15 @@ async function saveModel(model, { quiet = false } = {}) {
       enabled: model.enabled !== false,
     })
     if (!quiet) setFlash(`${model.model_id} 已保存`)
+    // A capability change decides whether the chat offers this model, so the
+    // catalog is reloaded even on the quiet path.
+    await loadCatalog({ quiet: true })
   } catch (err) {
     if (err && err.status === 401) return
     modelError[key] = errorText(err, '保存失败，请重试')
     // The server is authoritative: reload so the row cannot show a state that
     // was never stored.
-    await reloadModels()
+    await resync()
   } finally {
     delete modelBusy[key]
   }
@@ -385,8 +420,7 @@ async function removeModel(model) {
   modelError[key] = ''
   try {
     await api.deleteLlmModel(model.provider_id, model.model_id)
-    await reloadModels()
-    await reloadProviders()
+    await resync()
   } catch (err) {
     if (err && err.status === 401) return
     modelError[key] = errorText(err, '删除失败，请重试')
@@ -424,7 +458,7 @@ async function addModel() {
     addDraft.model_id = ''
     addDraft.display_name = ''
     setFlash(`${modelId} 已添加`)
-    await reloadModels()
+    await resync()
   } catch (err) {
     if (err && err.status === 401) return
     addError.value = errorText(err, '添加失败，请重试')
@@ -436,7 +470,113 @@ async function addModel() {
 function reloadAll() {
   reloadProviders()
   reloadModels()
+  loadCatalog({ quiet: true })
 }
+
+/**
+ * Reload every model surface after a write.
+ *
+ * The catalog is included on purpose: it is what 对话's picker and the counts on
+ * these rows both read, so a provider or model change that skipped it would
+ * leave the composer offering something the server no longer serves.
+ */
+async function resync() {
+  await Promise.all([
+    reloadProviders(),
+    reloadModels(),
+    // `quiet` keeps a background resync from flashing the loading state.
+    loadCatalog({ quiet: true }),
+  ])
+}
+
+/* --------------------------------------------------------- refresh (all) -- */
+
+/**
+ * Per-provider outcome of the last 刷新全部, and of the automatic pass:
+ * `{provider_id, ok, models_count, error}` straight from the server.
+ *
+ * A failed provider is a result to show, never an exception: a pass that
+ * refreshed seven of eight providers succeeded, and the eighth's reason is the
+ * useful part.
+ */
+const refresh = reactive({
+  running: false,
+  results: [],
+  error: '',
+  /** True when the pass was started by opening 设置 rather than by a click. */
+  automatic: false,
+})
+
+const refreshOk = computed(() => refresh.results.filter((r) => r && r.ok).length)
+const refreshFailed = computed(() => refresh.results.filter((r) => r && !r.ok).length)
+
+function describeRefresh(result) {
+  const name = providerName(result.provider_id)
+  if (result && result.ok) return `${name}：已刷新 ${formatCount(result.models_count)} 个模型`
+  return `${name}：刷新失败 — ${(result && result.error) || '请检查 base_url 与密钥'}`
+}
+
+/**
+ * Refresh every enabled provider that has an API key, then reload the catalog.
+ *
+ * One pass at a time: the button is disabled while a pass runs, so an automatic
+ * pass can never pile a second one on top.
+ */
+async function runRefreshAll({ automatic = false } = {}) {
+  if (refresh.running) return
+  refresh.running = true
+  refresh.error = ''
+  refresh.automatic = automatic
+  try {
+    const results = await refreshAllModels()
+    refresh.results = results
+    setFlash(
+      results.length === 0
+        ? '没有可刷新的 provider（需已启用且已配置 API Key）'
+        : `已刷新 ${refreshOk.value} 个 provider${refreshFailed.value ? `，${refreshFailed.value} 个失败` : ''}`,
+    )
+    // refreshAllModels already reloaded the catalog; the panels reload here.
+    await Promise.all([reloadProviders(), reloadModels()])
+  } catch (err) {
+    if (err && err.status === 401) return
+    refresh.error = errorText(err, '刷新全部失败，请重试')
+    refresh.results = []
+  } finally {
+    refresh.running = false
+  }
+}
+
+function dismissRefresh() {
+  refresh.results = []
+  refresh.error = ''
+  refresh.automatic = false
+}
+
+/**
+ * An automatic refresh for every provider that turns out to be stale, once per
+ * provider per page load.
+ *
+ * Opening 设置 is the moment a user wants current model lists, and the server's
+ * own pass only runs at startup — so a console left open for days would keep
+ * showing yesterday's list. The claim in the chat store is what keeps it
+ * bounded: a provider already attempted is never attempted again (so re-entering
+ * 设置, or a provider that keeps failing, cannot start a loop), and a pass never
+ * starts while another one is running. The 刷新全部 button is always there for a
+ * deliberate refresh.
+ */
+function maybeAutoRefresh() {
+  if (refresh.running) return
+  if (!claimAutoRefresh().length) return
+  runRefreshAll({ automatic: true })
+}
+
+onMounted(() => {
+  // On a cold start the catalog may still be in flight; the watcher below picks
+  // it up the moment it arrives.
+  maybeAutoRefresh()
+})
+
+watch(() => staleCatalogProviders.value.length, maybeAutoRefresh)
 
 function selectProvider(provider) {
   selectedId.value = provider.id
@@ -465,18 +605,60 @@ const inferredCount = computed(
       <div class="row">
         <button
           type="button"
+          class="btn sm"
+          :disabled="refresh.running"
+          title="重新拉取所有已启用且已配置密钥的 provider 的模型列表"
+          @click="runRefreshAll()"
+        >
+          <Icon name="refresh" :size="15" />
+          {{ refresh.running ? '刷新中…' : '刷新全部' }}
+        </button>
+        <button
+          type="button"
           class="btn ghost sm"
           :disabled="providerLoading"
           @click="reloadAll"
         >
           <Icon name="refresh" :size="15" />
-          刷新
+          重新读取
         </button>
         <button type="button" class="btn primary sm" @click="openAdd">
           <Icon name="plus" :size="15" />
           添加 provider
         </button>
       </div>
+    </div>
+
+    <!-- the per-provider report of the last 刷新全部 (manual or automatic) -->
+    <div v-if="refresh.error" class="banner error" role="alert">
+      <Icon name="circle-alert" :size="16" />
+      <span class="banner-text">{{ refresh.error }}</span>
+      <button type="button" class="btn sm" @click="runRefreshAll()">重试</button>
+      <button type="button" class="btn sm ghost" @click="dismissRefresh">关闭</button>
+    </div>
+
+    <div v-else-if="refresh.results.length" class="refresh-report" role="status">
+      <div class="refresh-head">
+        <Icon name="circle-check" :size="14" />
+        <span>
+          {{ refresh.automatic ? '已自动刷新过期的模型列表' : '刷新全部完成' }} ·
+          成功 {{ formatCount(refreshOk) }} 个<template v-if="refreshFailed">，失败
+            {{ formatCount(refreshFailed) }} 个</template>
+        </span>
+        <span class="spacer" />
+        <button type="button" class="btn sm ghost" @click="dismissRefresh">关闭</button>
+      </div>
+      <ul class="refresh-list">
+        <li
+          v-for="result in refresh.results"
+          :key="result.provider_id"
+          class="refresh-item"
+          :class="result.ok ? 'ok' : 'bad'"
+        >
+          <Icon :name="result.ok ? 'circle-check' : 'circle-alert'" :size="13" />
+          {{ describeRefresh(result) }}
+        </li>
+      </ul>
     </div>
 
     <AsyncBlock
@@ -528,6 +710,30 @@ const inferredCount = computed(
             </span>
             <span v-else class="tag bad" title="没有可用的 API Key，调用会失败">未配置密钥</span>
             <span v-if="provider.api_key_env" class="tag mono">{{ provider.api_key_env }}</span>
+
+            <!-- Model count and freshness come from GET /api/chat/models, the
+                 same snapshot 对话's picker uses, so this row and the composer
+                 cannot disagree about what a provider offers. -->
+            <template v-if="providerStats(provider.id)">
+              <span class="tag" :title="`其中 ${formatCount(providerStats(provider.id).chatModelCount)} 个可用于对话`">
+                {{ formatCount(providerStats(provider.id).modelCount) }} 个模型
+              </span>
+              <span
+                v-if="providerStats(provider.id).lastFetchedAt"
+                class="tag"
+                :title="`最近一次抓取：${formatAbsolute(providerStats(provider.id).lastFetchedAt)}`"
+              >
+                已刷新 {{ formatRelative(providerStats(provider.id).lastFetchedAt) }}
+              </span>
+              <span v-else class="tag">尚未抓取模型列表</span>
+              <span
+                v-if="providerStats(provider.id).stale"
+                class="tag warn"
+                title="模型列表已过期，点「刷新模型」或「刷新全部」重新抓取"
+              >
+                列表可能过期
+              </span>
+            </template>
           </div>
 
           <div class="prov-actions">

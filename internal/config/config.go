@@ -177,6 +177,32 @@ type LoggingConfig struct {
 type LLMConfig struct {
 	DefaultProvider string                 `mapstructure:"default_provider" json:"default_provider"`
 	Providers       map[string]LLMProvider `mapstructure:"providers" json:"providers"`
+	// AutoRefreshModels refreshes, at startup, the model list of every enabled
+	// provider whose cached list is stale. It runs in the background, so a slow
+	// provider delays nothing; a failure is recorded on the provider (last_error)
+	// and never stops the pass or the server.
+	AutoRefreshModels bool `mapstructure:"auto_refresh_models" json:"auto_refresh_models"`
+	// ModelsCacheTTLHours is how long a fetched model list stays fresh. Beyond
+	// it the list is "stale": the startup pass refetches it, and the console
+	// offers a refresh. Zero uses DefaultModelsCacheTTLHours.
+	ModelsCacheTTLHours int `mapstructure:"models_cache_ttl_hours" json:"models_cache_ttl_hours"`
+}
+
+// DefaultModelsCacheTTLHours is how long a fetched model list is trusted when
+// the config does not say otherwise.
+//
+// A model list changes rarely (a provider adds a model), so refetching it more
+// often than daily is traffic for nothing; a day also means a console that is
+// opened every morning picks up a new model within one start.
+const DefaultModelsCacheTTLHours = 24
+
+// ModelsCacheTTL returns how long a fetched model list is considered fresh.
+func (c LLMConfig) ModelsCacheTTL() time.Duration {
+	hours := c.ModelsCacheTTLHours
+	if hours <= 0 {
+		hours = DefaultModelsCacheTTLHours
+	}
+	return time.Duration(hours) * time.Hour
 }
 
 // LLMProvider is a single LLM backend entry.
@@ -490,6 +516,11 @@ func Default() *Config {
 		LLM: LLMConfig{
 			DefaultProvider: "",
 			Providers:       map[string]LLMProvider{},
+			// Refreshing is on by default: without it a provider added in the
+			// console has an empty model list until someone clicks 刷新模型, and
+			// the chat selector has nothing to offer.
+			AutoRefreshModels:   true,
+			ModelsCacheTTLHours: DefaultModelsCacheTTLHours,
 		},
 		Database: DatabaseConfig{
 			Path: "./data/huan-agent.db",
@@ -612,6 +643,10 @@ func SetDefaults(v *viper.Viper) {
 	// Fallback price (USD per 1000 tokens) for providers without an entry.
 	v.SetDefault("pricing.fallback.prompt_per_1k", 0.0)
 	v.SetDefault("pricing.fallback.completion_per_1k", 0.0)
+	// Model-list caching for the console's 模型管理 panel: refresh the enabled
+	// providers' lists at startup when they are older than the TTL.
+	v.SetDefault("llm.auto_refresh_models", true)
+	v.SetDefault("llm.models_cache_ttl_hours", DefaultModelsCacheTTLHours)
 	v.SetDefault("chat.enable", true)
 	v.SetDefault("chat.max_steps", 12)
 	v.SetDefault("chat.history_limit", DefaultChatHistoryLimit)

@@ -1023,6 +1023,14 @@ table.data tbody tr.selected {
   background: var(--accent-purple-fill);
 }
 
+/* A tag that asks for attention without being an error: a model list worth
+   refetching, a capability inference nobody has confirmed yet. */
+.tag.warn {
+  color: var(--warning-soft);
+  border-color: var(--warning-soft);
+  background: var(--warning-fill);
+}
+
 .cell-err {
   color: var(--destructive);
   font-size: 12.5px;
@@ -2899,7 +2907,12 @@ table.data tbody tr.row-click:focus-visible {
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  flex: 0 0 auto;
+  /* Shrinkable on purpose: at a narrow width a set of five buttons (测试连接、
+     刷新模型、编辑、清除密钥、删除) is wider than the row, and a max-content
+     flex item would push the row — and the card around it — into horizontal
+     overflow. Allowing it to shrink lets the buttons wrap inside the row. */
+  flex: 0 1 auto;
+  min-width: 0;
   margin-left: auto;
   justify-content: flex-end;
 }
@@ -2939,6 +2952,71 @@ table.data tbody tr.row-click:focus-visible {
 .prov-test.bad {
   border-color: var(--destructive);
   color: var(--destructive);
+}
+
+/* The per-provider report of a 刷新全部 / automatic refresh pass: one line per
+   provider, successes and failures together, so a partial pass is readable. */
+.refresh-report {
+  margin: 12px 0 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--muted);
+  font-size: 12.5px;
+  color: var(--muted-strong);
+}
+
+.refresh-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.refresh-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* A pass over many providers must not push the panel off screen. */
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.refresh-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+
+.refresh-item.ok {
+  color: var(--success-soft);
+}
+
+.refresh-item.bad {
+  color: var(--destructive);
+}
+
+/* Per-provider freshness on 设置 → 模型目录: one quiet line each. */
+.catalog-providers {
+  margin-top: 12px;
+  gap: 6px;
+}
+
+.catalog-provider {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--muted-strong);
+}
+
+.catalog-provider .cell-err {
+  flex: 1 1 100%;
 }
 
 /* Add / edit form: a quiet inset panel, so it reads as a mode, not a card. */

@@ -212,6 +212,99 @@ Behaviour worth knowing:
   paired result is what makes providers reject a request.
 - The first message auto-titles an untitled session.
 
+## Model management (模型管理)
+
+The model catalog lives in the **database** and is the single source of truth for
+both surfaces: `设置 → 模型管理` writes it (providers, their fetched model lists,
+per-model capabilities, capability bindings) and `对话`'s composer reads it. A
+provider added in the console is therefore immediately usable in a conversation,
+and both panels group, name and flag models identically.
+
+```yaml
+llm:
+  default_provider: "deepseek"    # still honoured, and still seeds the catalog
+  auto_refresh_models: true       # refetch stale lists in the background at start
+  models_cache_ttl_hours: 24      # how long a fetched list counts as fresh
+  providers:                      # seeded into the catalog as source=config
+    deepseek:
+      api_key: ""                 # or HUAN_LLM_PROVIDERS_DEEPSEEK_API_KEY
+```
+
+The config file still declares providers; it is seeded into the catalog at
+startup. Whether a provider is *enabled* is a runtime choice the console makes,
+and it is never overwritten by a restart.
+
+Endpoints (session cookie required):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/chat/models` | the catalog both surfaces read: models + providers + tools |
+| `GET/POST /api/llm/providers` | list / add or edit a provider |
+| `PUT /api/llm/providers/{id}/key` | set or clear a stored API key |
+| `POST /api/llm/providers/{id}/test` | call `{base_url}/models` and record the outcome |
+| `POST /api/llm/providers/{id}/models/refresh` | refetch one provider's list |
+| `POST /api/llm/models/refresh-all` | refetch every enabled provider that has a key |
+| `GET/PUT/DELETE /api/llm/models` | list / edit capabilities / delete a model |
+| `GET/PUT /api/llm/bindings` | the capability → provider/model bindings |
+
+`GET /api/chat/models` answers:
+
+```json
+{
+  "models": [
+    {
+      "provider": "deepseek", "provider_name": "DeepSeek",
+      "model": "deepseek-chat", "display_name": "DeepSeek Chat",
+      "capabilities": ["chat"], "chat_capable": true,
+      "default": true, "has_api_key": true
+    }
+  ],
+  "providers": [
+    {
+      "id": "deepseek", "name": "DeepSeek", "source": "config", "enabled": true,
+      "has_api_key": true, "model_count": 3, "enabled_model_count": 3,
+      "chat_model_count": 2, "last_fetched_at": "2026-09-12T14:03:06Z",
+      "stale": false, "last_error": ""
+    }
+  ],
+  "tools": ["read_file"], "max_steps": 12, "system_prompt": "…"
+}
+```
+
+Which models are offered:
+
+- only **enabled** providers contribute, and only their **enabled** models;
+- a provider's **chat-capable** models are what the chat can run, so they are
+  what is offered; when a provider has no chat-capable model at all its models
+  are still offered, marked `chat_capable: false`, because capabilities are
+  inferred from the model name and a wrong inference must not make a provider
+  vanish from the selector;
+- a provider with **no API key** is still listed, marked `has_api_key: false`,
+  so the composer can warn instead of hiding it;
+- ordering is deterministic: providers by name, then models by name.
+
+`POST /api/llm/models/refresh-all` answers `200` with a per-provider report —
+`{"results": [{"provider_id", "ok", "models_count", "error"}]}` — even when
+providers failed, because a broken key is a result rather than a request error.
+
+Which model a new conversation starts on, in order:
+
+1. `llm.default_provider`, when that provider is still offered and has a
+   chat-capable model (preferring the model the config names for it);
+2. the `chat` capability binding;
+3. the first chat-capable model in catalog order.
+
+`default: true` is set on at most one entry, and on none when nothing is
+chat-capable.
+
+Automatic refresh: at startup, every enabled provider that has a key and whose
+cached list is stale (never fetched, or older than `models_cache_ttl_hours`) is
+refetched in the background — bounded to three providers at a time and to 90s
+for the whole pass. A failure is recorded as the provider's `last_error` and
+logged at warn; it never stops the pass or the server. The console also triggers
+one automatic pass per provider when 设置 is opened and that provider is stale;
+`刷新全部` is the manual equivalent.
+
 ## Trace visualization (链路追踪)
 
 Every chat turn can be traced to Langfuse: one trace per turn, a generation

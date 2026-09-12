@@ -27,10 +27,13 @@ func testRegistry() *llm.Registry {
 }
 
 func TestModelBuilder_Build(t *testing.T) {
-	b := NewModelBuilder(testRegistry())
+	// No store: this covers the config-registry path, which must keep working
+	// for an install whose catalog is empty.
+	b := NewCatalogModelBuilder(nil, testRegistry(), ModelBuilderOptions{})
+	ctx := context.Background()
 
 	t.Run("explicit provider and model", func(t *testing.T) {
-		got, err := b.Build("deepseek", "deepseek-reasoner")
+		got, err := b.Build(ctx, "deepseek", "deepseek-reasoner")
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}
@@ -39,28 +42,31 @@ func TestModelBuilder_Build(t *testing.T) {
 		}
 	})
 	t.Run("empty provider uses the default", func(t *testing.T) {
-		if _, err := b.Build("", ""); err != nil {
+		if _, err := b.Build(ctx, "", ""); err != nil {
 			t.Errorf("Build with empty provider: %v", err)
 		}
 	})
 	t.Run("unknown provider errors", func(t *testing.T) {
-		if _, err := b.Build("nope", ""); err == nil {
+		if _, err := b.Build(ctx, "nope", ""); err == nil {
 			t.Error("want an error for an unknown provider")
 		}
 	})
-	t.Run("nil registry errors", func(t *testing.T) {
-		nb := NewModelBuilder(nil)
-		if _, err := nb.Build("deepseek", ""); err == nil {
-			t.Error("want an error when no registry is configured")
+	t.Run("no catalog and no registry errors", func(t *testing.T) {
+		nb := NewCatalogModelBuilder(nil, nil, ModelBuilderOptions{})
+		if _, err := nb.Build(ctx, "deepseek", ""); err == nil {
+			t.Error("want an error when neither a catalog nor a registry is configured")
 		}
-		if got := nb.Catalog(); got != nil {
-			t.Errorf("Catalog = %+v, want nil", got)
+		if _, err := nb.Build(ctx, "", ""); err == nil {
+			t.Error("want an error when nothing is configured")
+		}
+		if got := nb.Catalog(ctx); len(got.Models) != 0 || len(got.Providers) != 0 {
+			t.Errorf("Catalog = %+v, want an empty catalog", got)
 		}
 	})
 }
 
 func TestModelBuilder_Catalog(t *testing.T) {
-	cat := NewModelBuilder(testRegistry()).Catalog()
+	cat := NewCatalogModelBuilder(nil, testRegistry(), ModelBuilderOptions{}).Catalog(context.Background()).Models
 	if len(cat) != 2 {
 		t.Fatalf("catalog = %d entries, want 2", len(cat))
 	}
@@ -86,7 +92,7 @@ func TestModelBuilder_Catalog(t *testing.T) {
 // ---- per-session runner ----
 
 func TestRunnerFor_UsesSessionModel(t *testing.T) {
-	builder := NewModelBuilder(testRegistry())
+	builder := NewCatalogModelBuilder(nil, testRegistry(), ModelBuilderOptions{})
 	base, err := chat.New(chat.Config{
 		Model: &scriptedModel{}, Logger: zap.NewNop(),
 	})
@@ -102,11 +108,11 @@ func TestRunnerFor_UsesSessionModel(t *testing.T) {
 	}
 
 	// Two different model choices must yield two runners and be cached.
-	r1, err := s.runnerFor(store.ChatSession{Provider: "deepseek", Model: "deepseek-chat"})
+	r1, err := s.runnerFor(context.Background(), store.ChatSession{Provider: "deepseek", Model: "deepseek-chat"})
 	if err != nil {
 		t.Fatalf("runnerFor: %v", err)
 	}
-	r2, err := s.runnerFor(store.ChatSession{Provider: "deepseek", Model: "deepseek-chat"})
+	r2, err := s.runnerFor(context.Background(), store.ChatSession{Provider: "deepseek", Model: "deepseek-chat"})
 	if err != nil {
 		t.Fatalf("runnerFor: %v", err)
 	}
@@ -114,7 +120,7 @@ func TestRunnerFor_UsesSessionModel(t *testing.T) {
 		t.Error("the same model choice should reuse a cached runner")
 	}
 
-	r3, err := s.runnerFor(store.ChatSession{Provider: "local", Model: "llama3.2"})
+	r3, err := s.runnerFor(context.Background(), store.ChatSession{Provider: "local", Model: "llama3.2"})
 	if err != nil {
 		t.Fatalf("runnerFor: %v", err)
 	}
@@ -123,7 +129,7 @@ func TestRunnerFor_UsesSessionModel(t *testing.T) {
 	}
 
 	// An unknown provider surfaces as an error the handler can report.
-	if _, err := s.runnerFor(store.ChatSession{Provider: "nope"}); err == nil {
+	if _, err := s.runnerFor(context.Background(), store.ChatSession{Provider: "nope"}); err == nil {
 		t.Error("want an error for an unknown provider")
 	}
 }
@@ -132,7 +138,7 @@ func TestRunnerFor_NoBuilderUsesDefaultRunner(t *testing.T) {
 	base, _ := chat.New(chat.Config{Model: &scriptedModel{}, Logger: zap.NewNop()})
 	s := &Server{cfg: Config{}, logger: zap.NewNop(), chat: ChatDeps{Runner: base}, tracer: nopTracer{}}
 
-	got, err := s.runnerFor(store.ChatSession{})
+	got, err := s.runnerFor(context.Background(), store.ChatSession{})
 	if err != nil {
 		t.Fatalf("runnerFor: %v", err)
 	}
@@ -143,7 +149,7 @@ func TestRunnerFor_NoBuilderUsesDefaultRunner(t *testing.T) {
 
 func TestRunnerFor_ChatDisabled(t *testing.T) {
 	s := &Server{cfg: Config{}, logger: zap.NewNop(), tracer: nopTracer{}}
-	if _, err := s.runnerFor(store.ChatSession{}); err == nil {
+	if _, err := s.runnerFor(context.Background(), store.ChatSession{}); err == nil {
 		t.Error("want an error when chat is not enabled")
 	}
 }

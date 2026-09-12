@@ -419,11 +419,14 @@ defineExpose({ focus })
             :disabled="pickerDisabled"
             @change="onModelChange"
           >
-            <optgroup v-for="group in groups" :key="group.provider" :label="group.provider">
+            <!-- Grouped and labelled by the shared catalog helper, so this list
+                 is the same data, in the same order, as 设置 → 模型管理. -->
+            <optgroup v-for="group in groups" :key="group.provider" :label="group.label">
               <option
                 v-for="option in group.options"
                 :key="option.key"
                 :value="option.key"
+                :title="option.hint"
                 :disabled="option.disabled"
               >
                 {{ option.label }}

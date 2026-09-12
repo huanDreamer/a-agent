@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	einomodel "github.com/cloudwego/eino/components/model"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"golang.org/x/term"
@@ -30,19 +31,24 @@ import (
 	"github.com/huan/huan-agent/internal/workspace"
 )
 
-// buildChatDeps assembles the web-chat wiring: a model registry, the built-in
-// tools and a runner bound to the default model. Per-session model choices are
-// resolved later by the server through the model builder.
+// buildChatDeps assembles the web-chat wiring: the tool set, a runner bound to
+// the default model, and the model builder that resolves a per-session choice.
+//
+// The builder is backed by the store catalog, with the config registry as its
+// fallback, so a provider added in 设置 → 模型管理 is usable in a conversation and
+// a config-only deployment keeps working unchanged. The runner itself is only the
+// fallback for a server whose per-session builder is absent; every session still
+// resolves its model through the builder.
+//
+// It also returns the resolved default (provider, model) so /api/meta reports the
+// target the chat actually uses — which is not necessarily the one named in the
+// config file, because the default may come from the database.
 func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
-	rec *usage.Recorder, logger *zap.Logger) server.ChatDeps {
+	rec *usage.Recorder, logger *zap.Logger) (server.ChatDeps, string, string) {
 
 	if !cfg.Chat.Enable {
 		logger.Info("web chat disabled (chat.enable = false)")
-		return server.ChatDeps{}
-	}
-	if cfg.LLM.DefaultProvider == "" {
-		logger.Warn("web chat disabled: no llm.default_provider configured")
-		return server.ChatDeps{}
+		return server.ChatDeps{}, "", ""
 	}
 
 	providers := make(map[string]llm.Provider, len(cfg.LLM.Providers))
@@ -53,10 +59,33 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 		}
 	}
 	reg := llm.NewRegistry(providers, cfg.LLM.DefaultProvider)
-	cm, err := reg.Get(cfg.LLM.DefaultProvider)
+	builder := server.NewCatalogModelBuilder(st, reg, server.ModelBuilderOptions{
+		TTL:    cfg.LLM.ModelsCacheTTL(),
+		Logger: logger,
+	})
+
+	// The default model is resolved through the builder, not the registry: with
+	// an empty config a provider added in the console is the only one there is,
+	// and refusing to start the chat would leave it unusable exactly as before.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defProvider, defModel := builder.DefaultTarget(ctx)
+	cancel()
+	if defProvider == "" {
+		// The catalog names nothing usable. The config may still declare a
+		// default the registry can serve — a provider present in the config file
+		// but with no catalog row, which is exactly the config-only install this
+		// change must keep working — so it is tried before giving up.
+		defProvider, defModel = cfg.LLM.DefaultProvider, adminDisplayModel(cfg)
+	}
+	if defProvider == "" {
+		logger.Warn("web chat disabled: no usable model provider " +
+			"(set llm.default_provider, or add a provider in 设置 → 模型管理)")
+		return server.ChatDeps{}, "", ""
+	}
+	cm, err := builder.Build(context.Background(), defProvider, defModel)
 	if err != nil {
 		logger.Warn("web chat disabled: cannot build the default model", zap.Error(err))
-		return server.ChatDeps{}
+		return server.ChatDeps{}, "", ""
 	}
 
 	// Tools are shared with the chat REPL so the web UI can do what the CLI can.
@@ -69,8 +98,13 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 	if maxSteps <= 0 {
 		maxSteps = chat.DefaultMaxSteps
 	}
+	chatModel, ok := cm.(einomodel.BaseChatModel)
+	if !ok {
+		logger.Warn("web chat disabled: the default model is not a chat model")
+		return server.ChatDeps{}, "", ""
+	}
 	runner, err := chat.New(chat.Config{
-		Model:    cm,
+		Model:    chatModel,
 		Tools:    registry,
 		Tracer:   tracer,
 		MaxSteps: maxSteps,
@@ -78,17 +112,18 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 	})
 	if err != nil {
 		logger.Warn("web chat disabled: cannot build the runner", zap.Error(err))
-		return server.ChatDeps{}
+		return server.ChatDeps{}, "", ""
 	}
 
 	logger.Info("web chat enabled",
-		zap.String("provider", cfg.LLM.DefaultProvider),
+		zap.String("provider", defProvider),
+		zap.String("model", defModel),
 		zap.Int("tools", len(registry.Names())),
 		zap.Int("max_steps", maxSteps),
 	)
 	return server.ChatDeps{
 		Runner:       runner,
-		Builder:      server.NewModelBuilder(reg),
+		Builder:      builder,
 		Tools:        registry,
 		SystemPrompt: cfg.Chat.SystemPrompt,
 		// The same confinement the file tools use, so an uploaded attachment
@@ -96,7 +131,7 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 		// read-only mode and write limit apply to uploads too.
 		Workspace: chatWorkspace(cfg, logger),
 		Usage:     usageSink{rec: rec},
-	}
+	}, defProvider, defModel
 }
 
 // chatWorkspace opens the workspace the web chat stores attachments in.
@@ -263,8 +298,16 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 		_ = recorder.Close(closeCtx)
 	}()
 
-	// The chat feature needs a model registry and a tool set.
-	chatDeps := buildChatDeps(cfg, tracer, st, recorder, logger)
+	// The chat feature needs a model builder and a tool set.
+	chatDeps, chatProvider, chatModel := buildChatDeps(cfg, tracer, st, recorder, logger)
+
+	// /api/meta reports where a conversation actually runs. The config file is
+	// the answer when it names a provider; otherwise it is the model the catalog
+	// resolved, so 服务信息 and the composer's picker agree.
+	metaProvider, metaModel := cfg.LLM.DefaultProvider, adminDisplayModel(cfg)
+	if metaProvider == "" {
+		metaProvider, metaModel = chatProvider, chatModel
+	}
 
 	srv, err := server.New(server.Config{
 		Host:             cfg.Server.Host,
@@ -274,8 +317,8 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 		MetricsEnable:    cfg.Server.MetricsEnable,
 		Metrics:          m,
 		Version:          version.String(),
-		Provider:         cfg.LLM.DefaultProvider,
-		Model:            adminDisplayModel(cfg),
+		Provider:         metaProvider,
+		Model:            metaModel,
 		FeishuEnabled:    cfg.Feishu.Enabled(),
 		SkillsDir:        cfg.Skills.Dir,
 		StatePath:        server.StatePathFor(cfg.Database.Path),
@@ -293,6 +336,36 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 
 	ctx, stop := signalContext()
 	defer stop()
+
+	// Refresh stale model lists in the background: a provider's /models call can
+	// take seconds or time out, and startup must not wait for it. The pass is
+	// bounded, bounded in concurrency, and records each failure on the provider,
+	// so a slow or broken provider delays nothing and stops nothing.
+	//
+	// It runs before the server starts listening on purpose — the goroutine is
+	// launched, not awaited — so the first console render already sees a
+	// refreshing provider rather than an empty list.
+	if cfg.LLM.AutoRefreshModels {
+		ttl := cfg.LLM.ModelsCacheTTL()
+		go func() {
+			results := server.RefreshStaleModels(ctx, st, logger, ttl)
+			if len(results) == 0 {
+				return
+			}
+			failed := 0
+			for _, r := range results {
+				if !r.OK {
+					failed++
+				}
+			}
+			logger.Info("model auto-refresh finished",
+				zap.Int("providers", len(results)),
+				zap.Int("failed", failed),
+			)
+		}()
+	} else {
+		logger.Info("model auto-refresh disabled (llm.auto_refresh_models = false)")
+	}
 
 	logger.Info("admin server starting",
 		zap.String("addr", srv.Addr()),

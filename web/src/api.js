@@ -388,6 +388,11 @@ export const api = {
       method: 'DELETE',
       body: { provider_id: providerId, model_id: modelId },
     }),
+  // 刷新全部: every enabled provider that has a key, in one request. It answers
+  // 200 with a per-provider report (`{results: [{provider_id, ok, models_count,
+  // error}]}`) even when providers failed, because a broken key is a result the
+  // caller asked for rather than an error in the request.
+  refreshAllLlmModels: () => request('/api/llm/models/refresh-all', { method: 'POST' }),
 
   llmBindings: () => request('/api/llm/bindings'),
   saveLlmBinding: (body) => request('/api/llm/bindings', { method: 'PUT', body }),

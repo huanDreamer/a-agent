@@ -684,3 +684,55 @@ func TestAdminConfig_LoginDefaults(t *testing.T) {
 		t.Error("allow_insecure_bind should default to false")
 	}
 }
+
+func TestLLMConfig_ModelRefreshDefaults(t *testing.T) {
+	// The defaults come from Default() and from Viper's SetDefaults; both paths
+	// are what a fresh install without a config file goes through.
+	if c := Default(); !c.LLM.AutoRefreshModels {
+		t.Error("auto_refresh_models should default to true: without it a provider added in the console keeps an empty model list")
+	}
+	if got := Default().LLM.ModelsCacheTTL(); got != DefaultModelsCacheTTLHours*time.Hour {
+		t.Errorf("default TTL = %v, want %dh", got, DefaultModelsCacheTTLHours)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("llm:\n  default_provider: \"x\"\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.LLM.AutoRefreshModels {
+		t.Error("auto_refresh_models must default to true even when the file does not mention it")
+	}
+	if got := cfg.LLM.ModelsCacheTTL(); got != 24*time.Hour {
+		t.Errorf("TTL = %v, want 24h", got)
+	}
+}
+
+func TestLLMConfig_ModelRefreshOverrides(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	body := "llm:\n  auto_refresh_models: false\n  models_cache_ttl_hours: 6\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LLM.AutoRefreshModels {
+		t.Error("auto_refresh_models: false must turn the startup pass off")
+	}
+	if got := cfg.LLM.ModelsCacheTTL(); got != 6*time.Hour {
+		t.Errorf("TTL = %v, want 6h", got)
+	}
+
+	// A zero or missing value falls back to the default rather than meaning
+	// "always stale", which would refetch on every start.
+	if got := (LLMConfig{}).ModelsCacheTTL(); got != DefaultModelsCacheTTLHours*time.Hour {
+		t.Errorf("unset TTL = %v, want the default", got)
+	}
+}

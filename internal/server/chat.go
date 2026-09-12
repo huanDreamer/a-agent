@@ -110,21 +110,95 @@ type UsageEvent struct {
 	DurationMs       int64
 }
 
-// ModelBuilder resolves a per-session model choice.
+// ModelBuilder resolves a per-session model choice and describes what is
+// selectable.
+//
+// Both methods take a context because the catalog lives in the database: the
+// console reads it on every 设置 and 对话 render, and a shut-down or timed-out
+// request must not leave a query running.
 type ModelBuilder interface {
 	// Build returns a chat model for a provider and model name. An empty
-	// provider selects the default.
-	Build(provider, modelName string) (any, error)
-	// Catalog lists the selectable providers.
-	Catalog() []ModelChoice
+	// provider selects the default (see CatalogModelBuilder.defaultTarget).
+	Build(ctx context.Context, provider, modelName string) (any, error)
+	// Catalog lists the selectable models and providers in one snapshot, so the
+	// chat picker and 设置 cannot disagree about what exists.
+	Catalog(ctx context.Context) ModelCatalog
 }
 
 // ModelChoice is one selectable provider/model pair.
+//
+// It carries the display name and the model's declared capabilities so a UI can
+// group and label without a second request, and so the same entry renders
+// identically in the composer and in 设置.
 type ModelChoice struct {
-	Provider  string `json:"provider"`
-	Model     string `json:"model"`
-	Default   bool   `json:"default"`
-	HasAPIKey bool   `json:"has_api_key"`
+	// Provider is the provider id (the store's primary key / the config key).
+	Provider string `json:"provider"`
+	// ProviderName is the human-readable name, falling back to the id. Two
+	// providers may share a display name, so the id stays authoritative.
+	ProviderName string `json:"provider_name"`
+	// Model is the model id sent to the provider.
+	Model string `json:"model"`
+	// DisplayName is what the operator sees; the model id when unnamed.
+	DisplayName string `json:"display_name"`
+	// Capabilities are the model's stored capabilities. They are inferred from
+	// the model name on a fetch and corrected by the operator, so they are a
+	// hint rather than a guarantee.
+	Capabilities []string `json:"capabilities"`
+	// ChatCapable reports whether the model declares the chat capability.
+	//
+	// ChatCapable=false is possible and meaningful: when a provider has no
+	// chat-capable model at all its models are still offered, marked, rather
+	// than hidden — a wrong inference must not make a provider vanish from the
+	// chat. The UI uses this flag to say so.
+	ChatCapable bool `json:"chat_capable"`
+	// Default marks the model a new conversation starts on. It is set on at most
+	// one entry, and on none when nothing is usable.
+	Default bool `json:"default"`
+	// HasAPIKey reports whether the provider has usable credentials, so the UI
+	// can warn before a call fails with 401. A provider without a key is still
+	// listed: the operator may be about to add one.
+	HasAPIKey bool `json:"has_api_key"`
+}
+
+// ProviderChoice describes one provider as the model surfaces show it: how many
+// models it has, when its list was last fetched, and whether that list is stale.
+//
+// It exists so 模型管理 can display counts and freshness from the same catalog
+// endpoint the chat selector reads, instead of each surface deriving its own.
+type ProviderChoice struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Source string `json:"source"`
+	// Enabled is false for a provider the operator switched off: it contributes
+	// no models to the catalog.
+	Enabled   bool `json:"enabled"`
+	HasAPIKey bool `json:"has_api_key"`
+	// ModelCount is how many models are stored for this provider (all of them,
+	// enabled or not) — what 模型管理 lists.
+	ModelCount int `json:"model_count"`
+	// EnabledModelCount is how many of them are enabled.
+	EnabledModelCount int `json:"enabled_model_count"`
+	// ChatModelCount is how many enabled models declare the chat capability —
+	// how many the composer offers.
+	ChatModelCount int `json:"chat_model_count"`
+	// LastFetchedAt is when the provider's model list was last read from
+	// {base_url}/models, or nil when it never was.
+	LastFetchedAt *time.Time `json:"last_fetched_at"`
+	// Stale reports that the list is missing or older than the configured TTL,
+	// i.e. that it is worth refetching.
+	Stale bool `json:"stale"`
+	// LastError is the most recent connection failure, empty when the last
+	// attempt worked.
+	LastError string `json:"last_error"`
+}
+
+// ModelCatalog is one snapshot of what is selectable.
+type ModelCatalog struct {
+	// Models is every offered model, ordered by provider name then model name.
+	Models []ModelChoice
+	// Providers describes every known provider, enabled or not, in the same
+	// order. Only an enabled provider contributes models.
+	Providers []ProviderChoice
 }
 
 // Setting up the chat routes is separate from the usage API so the feature can
@@ -168,19 +242,45 @@ func (s *Server) maxInlineImageBytes() int64 {
 	return MaxInlineImageBytes
 }
 
-// handleChatModels lists the selectable providers and the available tools.
-func (s *Server) handleChatModels(_ context.Context, c *app.RequestContext) {
+// handleChatModels lists the selectable models, the providers behind them and
+// the available tools.
+//
+// It is the single model contract of the console: 对话's composer builds its
+// grouped selector from `models`, and 设置's catalog table and 模型管理 read the
+// same arrays. Anything a model surface displays therefore comes from here
+// rather than from a second derivation that could disagree.
+func (s *Server) handleChatModels(ctx context.Context, c *app.RequestContext) {
 	out := map[string]any{
 		"system_prompt": s.chatPrompt(),
 		"max_steps":     s.chatMaxSteps(),
 	}
 	if s.chat.Builder != nil {
-		out["models"] = s.chat.Builder.Catalog()
+		cat := s.chat.Builder.Catalog(ctx)
+		out["models"] = orEmptyChoices(cat.Models)
+		out["providers"] = orEmptyProviders(cat.Providers)
 	} else {
 		out["models"] = []ModelChoice{}
+		out["providers"] = []ProviderChoice{}
 	}
 	out["tools"] = s.toolNames()
 	c.JSON(http.StatusOK, out)
+}
+
+// orEmptyChoices guarantees a JSON array rather than null, so a client can
+// iterate the field without a null check.
+func orEmptyChoices(in []ModelChoice) []ModelChoice {
+	if in == nil {
+		return []ModelChoice{}
+	}
+	return in
+}
+
+// orEmptyProviders is orEmptyChoices for the provider summaries.
+func orEmptyProviders(in []ProviderChoice) []ProviderChoice {
+	if in == nil {
+		return []ProviderChoice{}
+	}
+	return in
 }
 
 // toolNames lists the tools the agent may call.
@@ -234,7 +334,7 @@ func (s *Server) handleCreateSession(ctx context.Context, c *app.RequestContext)
 		}
 	}
 
-	provider, model := s.resolveModelChoice(body.Provider, body.Model)
+	provider, model := s.resolveModelChoice(ctx, body.Provider, body.Model)
 	sess := store.ChatSession{
 		ID:       uuid.NewString(),
 		Title:    strings.TrimSpace(body.Title),
@@ -259,13 +359,13 @@ func (s *Server) handleCreateSession(ctx context.Context, c *app.RequestContext)
 }
 
 // resolveModelChoice fills an unset provider/model from the defaults.
-func (s *Server) resolveModelChoice(provider, model string) (string, string) {
+func (s *Server) resolveModelChoice(ctx context.Context, provider, model string) (string, string) {
 	provider = strings.TrimSpace(provider)
 	model = strings.TrimSpace(model)
 	if s.chat.Builder == nil {
 		return provider, model
 	}
-	catalog := s.chat.Builder.Catalog()
+	catalog := s.chat.Builder.Catalog(ctx).Models
 	for _, m := range catalog {
 		if m.Provider == provider && provider != "" {
 			if model == "" {
@@ -340,7 +440,7 @@ func (s *Server) handlePatchSession(ctx context.Context, c *app.RequestContext) 
 		if body.Model != nil {
 			model = *body.Model
 		}
-		provider, model = s.resolveModelChoice(provider, model)
+		provider, model = s.resolveModelChoice(ctx, provider, model)
 		patch.Provider, patch.Model = &provider, &model
 	}
 
@@ -458,7 +558,7 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 	// Build the model for this session's choice before opening the stream, so a
 	// misconfiguration is reported as a normal JSON error instead of a broken
 	// stream.
-	runner, err := s.runnerFor(sess)
+	runner, err := s.runnerFor(ctx, sess)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return

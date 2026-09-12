@@ -13,7 +13,6 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/route"
-	"go.uber.org/zap"
 
 	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/store"
@@ -46,6 +45,9 @@ func (s *Server) registerProviderRoutes(authed *route.RouterGroup) {
 	authed.GET("/llm/models", s.handleListModels)
 	authed.PUT("/llm/models", s.handleUpsertModel)
 	authed.DELETE("/llm/models", s.handleDeleteModel)
+	// The whole-catalog refresh: every enabled provider that has a key, in one
+	// request, answering a per-provider report. 设置's 刷新全部 button uses it.
+	authed.POST("/llm/models/refresh-all", s.handleRefreshAllModels)
 
 	authed.GET("/llm/bindings", s.handleListBindings)
 	authed.PUT("/llm/bindings", s.handleSetBinding)
@@ -347,6 +349,10 @@ func (s *Server) handleTestProvider(ctx context.Context, c *app.RequestContext) 
 // handleRefreshProviderModels fetches the provider's model list, infers each
 // model's capabilities and stores the result.
 //
+// The work itself lives in refreshProviderModels, which 刷新全部 and the startup
+// pass share, so a manual refresh and an automatic one cannot store different
+// things.
+//
 // A failed fetch returns 502 and leaves the stored models untouched: empty is a
 // worse answer than stale, because a stale list still lets a user bind a
 // capability and a network blip must not wipe their configuration.
@@ -355,7 +361,7 @@ func (s *Server) handleRefreshProviderModels(ctx context.Context, c *app.Request
 	if !ok {
 		return
 	}
-	models, err := s.fetchProviderModels(ctx, p)
+	saved, err := refreshProviderModels(ctx, s.store, s.logger, p)
 	if err != nil {
 		msg := err.Error()
 		s.recordProviderError(ctx, p.ID, msg)
@@ -363,52 +369,11 @@ func (s *Server) handleRefreshProviderModels(ctx context.Context, c *app.Request
 		c.JSON(http.StatusBadGateway, map[string]string{"error": msg})
 		return
 	}
-
-	// A refresh learns ids, not names and not capabilities. The stored
-	// capabilities are preserved by the store (it never overwrites them on a
-	// fetch), and the display name is carried over here so a name a user typed
-	// survives the refresh.
-	existing, err := s.store.ListModels(ctx, p.ID)
-	if err != nil {
-		s.fail(c, "list provider models", err)
-		return
-	}
-	prev := make(map[string]store.Model, len(existing))
-	for _, m := range existing {
-		prev[m.ModelID] = m
-	}
-
-	rows := make([]store.Model, 0, len(models))
-	for _, info := range models {
-		row := store.Model{
-			ProviderID:   p.ID,
-			ModelID:      info.ID,
-			DisplayName:  info.ID,
-			Capabilities: llm.InferCapabilities(info.ID),
-			Enabled:      true,
-		}
-		if old, ok := prev[info.ID]; ok {
-			row.DisplayName = old.DisplayName
-			row.Enabled = old.Enabled
-		}
-		rows = append(rows, row)
-	}
-	if err := s.store.ReplaceFetchedModels(ctx, p.ID, rows); err != nil {
-		s.fail(c, "replace fetched models", err)
-		return
-	}
 	s.recordProviderError(ctx, p.ID, "")
 
-	saved, err := s.store.ListModels(ctx, p.ID)
-	if err != nil {
-		s.fail(c, "list provider models", err)
-		return
-	}
 	if saved == nil {
 		saved = []store.Model{}
 	}
-	s.logger.Info("provider models refreshed",
-		zapString("provider", p.ID), zap.Int("models", len(saved)))
 	c.JSON(http.StatusOK, map[string]any{
 		"models": saved,
 		"count":  len(saved),
@@ -431,9 +396,7 @@ func (s *Server) fetchProviderModels(ctx context.Context, p store.Provider) ([]l
 // Failing to record it is logged, not returned: it must not turn a usable
 // response into an error.
 func (s *Server) recordProviderError(ctx context.Context, id, msg string) {
-	if err := s.store.SetProviderError(ctx, id, msg); err != nil {
-		s.logger.Warn("record provider error failed", zapString("provider", id), zapError(err))
-	}
+	setProviderError(ctx, s.store, s.logger, id, msg)
 }
 
 // providerFromPath loads the provider named by the :id path parameter. It

@@ -108,11 +108,21 @@ type staticBuilder struct {
 }
 
 // Build implements ModelBuilder.
-func (b *staticBuilder) Build(string, string) (any, error) { return b.cm, nil }
+func (b *staticBuilder) Build(context.Context, string, string) (any, error) { return b.cm, nil }
 
 // Catalog implements ModelBuilder.
-func (b *staticBuilder) Catalog() []ModelChoice {
-	return []ModelChoice{{Provider: b.provider, Model: b.model, Default: true, HasAPIKey: true}}
+func (b *staticBuilder) Catalog(context.Context) ModelCatalog {
+	return ModelCatalog{
+		Models: []ModelChoice{{
+			Provider: b.provider, ProviderName: b.provider, Model: b.model, DisplayName: b.model,
+			Capabilities: []string{string(store.CapChat)}, ChatCapable: true,
+			Default: true, HasAPIKey: true,
+		}},
+		Providers: []ProviderChoice{{
+			ID: b.provider, Name: b.provider, Enabled: true, HasAPIKey: true,
+			ModelCount: 1, EnabledModelCount: 1, ChatModelCount: 1,
+		}},
+	}
 }
 
 // seedModel records a provider and one of its models, with the given

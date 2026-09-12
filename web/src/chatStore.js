@@ -8,6 +8,13 @@
 import { computed, reactive } from 'vue'
 import { api, streamChatTurn } from './api.js'
 import { normalize as normalizeAttachments } from './attachments.js'
+import {
+  catalogView,
+  modelOptionHint,
+  modelOptionLabel,
+  providerStatsById,
+  staleProviders,
+} from './llm.js'
 
 const SESSION_LIMIT = 100
 const NOTICE_MS = 2600
@@ -251,30 +258,30 @@ export function buildItems(messages) {
 
 // ------------------------------------------------------------- derivations --
 
-export const chatModels = computed(() => {
-  const models = chat.catalog && chat.catalog.models
-  return Array.isArray(models) ? models : []
-})
+/**
+ * The model catalog, normalised once.
+ *
+ * chatStore holds whatever GET /api/chat/models answered; every view reads the
+ * shaped form from here so 对话 and 设置 cannot disagree about grouping, naming or
+ * the "no API key" marking (the shaping itself lives in llm.js, shared with the
+ * 设置 panels).
+ */
+export const catalog = computed(() => catalogView(chat.catalog))
+
+/** Per-provider summaries (counts, freshness, last error) from the same response. */
+export const catalogProviders = computed(() => catalog.value.providers)
 
 /** Catalog entries grouped by provider, for the <optgroup> select. */
-export const modelGroups = computed(() => {
-  const groups = new Map()
-  for (const entry of chatModels.value) {
-    const item = entry && typeof entry === 'object' ? entry : {}
-    const provider = item.provider || '默认'
-    if (!groups.has(provider)) groups.set(provider, [])
-    groups.get(provider).push({
-      provider: item.provider || '',
-      model: item.model || '',
-      isDefault: Boolean(item.default),
-      hasKey: item.has_api_key !== false,
-    })
-  }
-  return [...groups].map(([provider, models]) => ({ provider, models }))
-})
+export const modelGroups = computed(() =>
+  catalog.value.groups.map((group) => ({
+    provider: group.provider,
+    providerName: group.providerName,
+    models: group.models,
+  })),
+)
 
 export const defaultModel = computed(
-  () => chatModels.value.find((m) => m && m.default) || chatModels.value[0] || null,
+  () => catalog.value.models.find((entry) => entry.isDefault) || catalog.value.models[0] || null,
 )
 
 export const maxSteps = computed(() => {
@@ -290,9 +297,19 @@ export const maxSteps = computed(() => {
  *
  * The value is the option's own key rather than a "provider/model" string,
  * because neither part is guaranteed to be free of the separator.
+ *
+ * A model whose provider has no API key is listed but disabled, with the reason
+ * in its label: it cannot work yet, and 设置 is where the key is added. Every
+ * model the catalog offers is listed — including the ones a provider keeps even
+ * though none of its models declares 对话 — because that list already reflects
+ * the server's filtering (enabled providers, enabled models).
  */
 export const modelOptionGroups = computed(() => {
-  const groups = modelGroups.value.map((group) => ({ provider: group.provider, options: [] }))
+  const groups = modelGroups.value.map((group) => ({
+    provider: group.provider,
+    label: group.providerName,
+    options: [],
+  }))
   const byProvider = new Map(groups.map((group) => [group.provider, group]))
   const flat = []
 
@@ -303,10 +320,9 @@ export const modelOptionGroups = computed(() => {
         key: `catalog-${flat.length}`,
         provider: entry.provider,
         model: entry.model,
-        label:
-          `${entry.provider || '—'} / ${entry.model || '—'}` +
-          (entry.isDefault ? '（默认）' : '') +
-          (entry.hasKey ? '' : '（未配置 API Key）'),
+        providerName: entry.providerName,
+        label: modelOptionLabel(entry),
+        hint: modelOptionHint(entry),
         disabled: !entry.hasKey,
       }
       bucket.options.push(option)
@@ -322,10 +338,12 @@ export const modelOptionGroups = computed(() => {
       key: 'current',
       provider: current.provider || '',
       model: current.model || '',
-      label: `${current.provider || '—'} / ${current.model || '—'}（不在目录中）`,
+      providerName: current.provider || '—',
+      label: `${current.model || '—'}（不在目录中）`,
+      hint: '该会话使用的模型不在当前模型目录里：可能已被停用或删除',
       disabled: false,
     }
-    groups.unshift({ provider: '当前会话', options: [option] })
+    groups.unshift({ provider: '当前会话', label: '当前会话', options: [option] })
     flat.unshift(option)
   }
   return groups
@@ -365,13 +383,52 @@ export function changeModel(key) {
   setModel(option.provider, option.model)
 }
 
+/**
+ * Providers whose model list is stale, from the catalog the server sent.
+ *
+ * Exported so 设置 can decide whether opening it should trigger a refresh
+ * without re-deriving staleness from a second source.
+ */
+export const staleCatalogProviders = computed(() => staleProviders(chat.catalog))
+
+/** Per-provider catalog stats, keyed by provider id (counts, freshness, error). */
+export const catalogProviderStats = computed(() => providerStatsById(chat.catalog))
+
+/**
+ * Providers this page load has already tried to refresh automatically.
+ *
+ * It lives here rather than in the panel so it survives leaving and re-entering
+ * 设置: the automatic pass fires once per provider per page load, however many
+ * times the panel is mounted. A reload starts fresh, which is what a user
+ * reopening the console expects.
+ */
+const autoRefreshClaimed = new Set()
+
+/**
+ * Claim the stale providers an automatic refresh should cover, or an empty array
+ * when there is nothing new to do.
+ *
+ * Claiming is what makes the automatic pass idempotent: the callers mark the
+ * providers as handled *before* the request, so a provider that fails (and stays
+ * stale) is never retried in a loop.
+ */
+export function claimAutoRefresh() {
+  const pending = []
+  for (const provider of staleProviders(chat.catalog)) {
+    if (autoRefreshClaimed.has(provider.id)) continue
+    autoRefreshClaimed.add(provider.id)
+    pending.push(provider)
+  }
+  return pending
+}
+
 // ------------------------------------------------------------------ loading --
 
 export async function loadCatalog({ quiet = false } = {}) {
   if (!quiet && !chat.catalog) chat.catalogStatus = 'loading'
   try {
     const res = await api.chatModels()
-    chat.catalog = res && typeof res === 'object' ? res : { models: [], tools: [] }
+    chat.catalog = res && typeof res === 'object' ? res : { models: [], providers: [], tools: [] }
     chat.catalogError = ''
     chat.catalogStatus = 'ready'
   } catch (err) {
@@ -379,6 +436,26 @@ export async function loadCatalog({ quiet = false } = {}) {
     chat.catalogError = errorText(err, '无法读取模型目录')
     if (!chat.catalog) chat.catalogStatus = 'error'
   }
+}
+
+/**
+ * Refresh every enabled provider's model list (POST /api/llm/models/refresh-all)
+ * and reload the catalog it changes.
+ *
+ * The reload is what makes a refresh visible in 对话 as well as in 设置: the two
+ * surfaces read the same endpoint, so refetching the list once updates both.
+ *
+ * Returns the per-provider results — `{provider_id, ok, models_count, error}` —
+ * so the caller can report successes and failures; a provider that failed is
+ * part of the report, not an exception, so a partial pass still resolves.
+ */
+export async function refreshAllModels() {
+  chat.actionError = ''
+  const res = await api.refreshAllLlmModels()
+  const results = res && Array.isArray(res.results) ? res.results : []
+  // Both surfaces read the catalog, so one reload updates both.
+  await loadCatalog({ quiet: true })
+  return results
 }
 
 export async function loadSessions({ quiet = false, select = true } = {}) {

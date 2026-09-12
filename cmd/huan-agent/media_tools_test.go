@@ -218,7 +218,7 @@ func TestBuildChatDeps_ExposesMediaToolsToTheChatModelsEndpoint(t *testing.T) {
 	}
 	cfg.Tools.Workspace = t.TempDir()
 
-	deps := buildChatDeps(cfg, nil, st, nil, zap.NewNop())
+	deps, _, _ := buildChatDeps(cfg, nil, st, nil, zap.NewNop())
 	if deps.Tools == nil {
 		t.Fatal("web chat has no tool registry")
 	}
@@ -232,7 +232,7 @@ func TestBuildChatDeps_NoProvidersStillBuildsWithoutMediaTools(t *testing.T) {
 	// disabled and nothing panics on the way there.
 	cfg := &config.Config{}
 	cfg.Chat.Enable = true
-	deps := buildChatDeps(cfg, nil, newMediaTestStore(t), nil, zap.NewNop())
+	deps, _, _ := buildChatDeps(cfg, nil, newMediaTestStore(t), nil, zap.NewNop())
 	if deps.Tools != nil {
 		t.Errorf("expected no chat deps, got tools %v", deps.Tools.Names())
 	}
