@@ -56,6 +56,33 @@ function statusTone(tool) {
   return 'ok'
 }
 
+/** Longest argument preview kept in the DOM; the title keeps it whole. */
+const PREVIEW_MAX = 400
+
+/**
+ * One-line argument preview.
+ *
+ * The raw model-produced arguments are JSON text, so newlines and runs of spaces
+ * are collapsed: the row is `white-space: nowrap` and a preview that wrapped
+ * would make the card grow with the argument. CSS ellipsis does the visual
+ * truncation; the cap only keeps a multi-kilobyte argument out of the DOM.
+ */
+function argsPreview(tool) {
+  const text = oneLine(tool.args)
+  return text.length > PREVIEW_MAX ? `${text.slice(0, PREVIEW_MAX)}…` : text
+}
+
+/** Hover text: the *full* arguments, not the trimmed preview. */
+function argsTitle(tool) {
+  return oneLine(tool.args)
+}
+
+function oneLine(text) {
+  return String(text === null || text === undefined ? '' : text)
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 async function copy() {
   const text = props.item.text || ''
   if (text === '') return
@@ -126,26 +153,38 @@ async function copy() {
       <!-- tool calls, in the order the model requested them -->
       <div v-if="item.tools && item.tools.length" class="tools">
         <div v-for="tool in item.tools" :key="tool.key" class="tool-card">
+          <!-- One row: what was called, how it went, and what it was called
+               with. The arguments are visible without a click — that is what a
+               reader usually wants — and a long argument ellipsizes instead of
+               wrapping, so the row never grows. -->
           <div class="tool-head">
+            <button
+              type="button"
+              class="tool-toggle"
+              :aria-expanded="Boolean(tool.open)"
+              :title="tool.open ? '收起参数与结果' : '展开参数与结果'"
+              :aria-label="tool.open ? '收起参数与结果' : '展开参数与结果'"
+              @click="tool.open = !tool.open"
+            >
+              <Icon :name="tool.open ? 'chevron-down' : 'chevron-right'" :size="13" />
+            </button>
             <span class="tag purple mono">{{ tool.name }}</span>
-            <span class="tag" :class="statusTone(tool)">
-              {{ statusLabel(tool) }}
-              <template v-if="tool.status === 'failed' && tool.error">· 已报错</template>
-            </span>
-            <span v-if="tool.durationMs !== null && tool.durationMs !== undefined" class="dimmer">
+            <span class="tag" :class="statusTone(tool)">{{ statusLabel(tool) }}</span>
+            <span v-if="tool.durationMs !== null && tool.durationMs !== undefined" class="dimmer nowrap">
               {{ formatDuration(tool.durationMs) }}
             </span>
-            <span class="spacer" />
-            <button type="button" class="btn sm ghost" @click="tool.open = !tool.open">
-              {{ tool.open ? '收起' : '参数/结果' }}
-            </button>
+            <span v-if="tool.args" class="tool-args" :title="argsTitle(tool)">{{ argsPreview(tool) }}</span>
+            <span v-if="tool.status === 'running'" class="spin" aria-hidden="true" />
           </div>
 
           <div v-if="tool.error" class="cell-err tool-err">{{ tool.error }}</div>
 
           <div v-if="tool.open" class="tool-body">
-            <JsonBlock :value="tool.args" label="参数" />
-            <JsonBlock :value="tool.result" :label="tool.error ? '结果（失败）' : '结果'" />
+            <!-- Expanded, both payloads are shown straight away: the chevron is
+                 the only affordance, and asking for a second click to see the
+                 arguments it just promised would be worse than the preview. -->
+            <JsonBlock :value="tool.args" label="参数" open />
+            <JsonBlock :value="tool.result" :label="tool.error ? '结果（失败）' : '结果'" open />
           </div>
         </div>
       </div>

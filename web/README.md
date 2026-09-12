@@ -12,7 +12,7 @@ Vue 3 + Vite 单页应用，构建产物由 Go 服务端通过 `//go:embed` 嵌�
 ```bash
 cd web
 
-# 安装依赖（只有 vue / vite / @vitejs/plugin-vue）
+# 安装依赖（运行时只有 vue / marked / dompurify）
 npm install
 
 # 开发模式（默认 http://127.0.0.1:5173，/api 会代理到 :8080）
@@ -105,9 +105,10 @@ trace 由服务端代理读取，浏览器不会拿到 Langfuse 的 secret key�
 
 ## 设计约束
 
-- **依赖极简**：运行时只有 `vue`，不引入图表库 / CSS 框架 / router / pinia / axios。
-  图表全部是手写内联 SVG（`src/components/DailyTrendChart.vue`），状态用 reactive store
-  （`src/state.js`），请求用 `fetch`（`src/api.js`）。
+- **依赖极简**：运行时只有 `vue` + `marked`（GFM 解析）+ `dompurify`（净化），不引入图表库 /
+  CSS 框架 / router / pinia / axios，也没有语法高亮库（后续单独做）。图表全部是手写内联 SVG
+  （`src/components/DailyTrendChart.vue`），状态用 reactive store（`src/state.js`），请求用
+  `fetch`（`src/api.js`）。
 - **主题与设计令牌**：抄自 DeepSeek harness 的 shadcn 风格中性色板，全部用 `oklch`
   定义在 `src/styles.css` 的 `:root` 里（`--background` / `--foreground` / `--card` /
   `--muted` / `--muted-foreground` / `--border` / `--ring` / `--destructive` …），
@@ -135,9 +136,23 @@ trace 由服务端代理读取，浏览器不会拿到 Langfuse 的 secret key�
   圆形 `--primary` 发送按钮（流式期间换成「停止」）。容器 `:focus-within` 时出现焦点环。
   输入框回车发送、Shift+Enter 换行，中文输入法组字期间回车不发送。
 - **对话里不展示工具清单**：可用工具只在 设置 → 工作区与工具 里作为只读信息列出。
-- **手写渲染**：助手回答的 markdown 子集（``` 代码块、行内 `code`、**加粗**、换行）由
-  `src/markdown.js` 解析成 token，再用文本节点渲染（不使用 `v-html`，模型输出无法注入标记）；
-  trace 瀑布流由 `src/components/TraceWaterfall.vue` 用普通 DOM + 百分比定位手写，
+- **助手回答的 Markdown**：`src/markdown.js` 的 `renderMarkdown()` 用 `marked`（GFM）解析、
+  用 `DOMPurify` 净化，**同一个函数**里完成「解析 + 净化」并返回安全的 HTML 字符串；只有
+  `src/components/MarkdownText.vue` 通过 `v-html` 渲染它，全仓库没有第二条通往 `v-html` 的
+  路径（这是文件开头写明的不变式）。净化配置显式禁用 `script` / `style` / `iframe` /
+  `object` / `embed` / `form` / `input` / `button` / `link` / `meta` / `base` / `img`（模型的
+  `<img src="http://…">` 是追踪信标）与所有 `on*` 事件属性，URL 只允许 `http` / `https` /
+  `mailto` 及无 scheme 的相对写法，因此 `javascript:` / `data:` / `vbscript:` 会被剥掉；
+  每个 `<a>` 由 `afterSanitizeAttributes` 钩子强制加上 `target="_blank"`、
+  `rel="noopener noreferrer"` 与 `md-link` class。代码块的「语言标签 + 复制」、表格的滚动
+  容器、任务列表的复选框都是**净化之后**在 DOM 上生成的（`createElement` / `textContent`），
+  所以 `button` / `input` 可以一直留在禁用列表里。用户自己的消息仍是纯文本（`{{ }}` 插值，
+  不走 markdown）；思考过程同样按 markdown 渲染，只是字号更小。
+  **流式**：代码围栏未闭合时 `marked` 本来就按代码块渲染，不会漏出反引号；只在仍处于流式
+  时补齐「表格分隔行」的列数（`:?-+:?`），避免表格在几个 delta 里退回成管道符段落。结果按
+  输入串记忆化（`Map`，LRU 上限 80）。实测 5.6 KB 消息：冷渲染中位 0.9ms、p95 1.2ms，
+  命中缓存 0.013ms（约 70 倍）。
+- trace 瀑布流由 `src/components/TraceWaterfall.vue` 用普通 DOM + 百分比定位手写，
   缺失时间戳 / 时长为 0 / 父节点成环都退化为满宽或根节点，不会出现 NaN 宽度。
 - **不留白面板**：每个数据视图都有骨架屏、错误重试条和「暂无数据」空状态
   （`src/components/AsyncBlock.vue`）。
@@ -159,7 +174,8 @@ web/
     ├── format.js                  # 数字 / 费用 / 时长 / 时间 / JSON 格式化
     ├── metrics.js                 # 指标定义（调用数 / token / 费用）
     ├── sse.js                     # SSE 分帧解析（纯函数，可单独测试）
-    ├── markdown.js                # markdown 子集解析（代码块 / 行内 code / 加粗）
+    ├── markdown.js                # 唯一的 markdown → 安全 HTML 入口（marked + DOMPurify）
+    ├── icons.js                   # 图标几何数据（Icon.vue 与代码块复制按钮共用）
     ├── chatStore.js               # 对话状态：会话列表、消息、流式一轮的生命周期
     ├── theme.js                   # 跟随系统 / 亮色 / 暗色（localStorage + <html> 开关）
     ├── ui.js                      # 壳层 UI 状态（移动端抽屉）
@@ -186,8 +202,7 @@ web/
         ├── ChatView.vue           # 对话（细头部 + 满高消息区 + 固定输入框）
         ├── ChatMessage.vue        # 消息气泡：思考过程 / 工具卡片 / 用量 / 复制
         ├── ChatComposer.vue       # 一体化输入区（textarea + 模型下拉 + 发送/停止）
-        ├── MarkdownText.vue       # markdown 块级渲染（纯文本节点）
-        ├── MarkdownInline.vue     # markdown 行内渲染
+        ├── MarkdownText.vue       # markdown 渲染（v-html 唯一出口 + 代码块复制委托）
         ├── JsonBlock.vue          # 可折叠 JSON（null 安全 + 截断）
         ├── TraceWaterfall.vue     # 手写 observation 瀑布流
         └── TraceView.vue          # 链路追踪（子页：状态条 + 列表 + 详情）

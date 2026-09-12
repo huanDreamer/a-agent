@@ -8,7 +8,7 @@
 //
 // All state and the SSE turn machinery live in chatStore.js, so a running
 // stream survives leaving and re-entering this view.
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AsyncBlock from './AsyncBlock.vue'
 import ChatComposer from './ChatComposer.vue'
 import ChatMessage from './ChatMessage.vue'
@@ -35,7 +35,7 @@ const titleInput = ref(null)
 const confirmClear = ref(false)
 const scroller = ref(null)
 const composer = ref(null)
-/** Auto-scroll is suspended as soon as the user scrolls up. */
+/** Auto-scroll is suspended as soon as the *user* scrolls up (see below). */
 const pinned = ref(true)
 
 const session = computed(() => chat.session)
@@ -90,18 +90,146 @@ async function runClear() {
 }
 
 // -------------------------------------------------------------- scrolling --
+//
+// `pinned` means "keep the newest message in view". The template reads it twice
+// — it gates the streaming auto-scroll and shows the 回到最新 affordance while
+// it is false — and only the reader is allowed to clear it.
+//
+// A programmatic scroll fires the very same `scroll` event a reader's gesture
+// does, so `selfScrollTop` remembers the offset this component scrolled to and
+// swallows exactly that one event; everything else is the reader. Without that,
+// a jump-to-bottom during a session switch (or during streaming) reads as "the
+// reader scrolled away" and silently disables all further following.
+//
+// Opening a conversation is also not a single `scrollTo`: Markdown, tables,
+// code blocks and webfonts change the scroll height *after* the messages are
+// already in the DOM. `startSettling()` therefore keeps re-anchoring the bottom
+// for a bounded window and stops the moment the reader scrolls away.
+const NEAR_BOTTOM_PX = 64
+/** How long a freshly opened conversation keeps following the bottom. */
+const SETTLE_MS = 1200
+/** Unchanged content height for this many frames ends the settle early. */
+const SETTLE_STABLE_FRAMES = 4
+/** 回到最新 animates; its own scroll events are ignored for this long. */
+const SMOOTH_MS = 900
+
+/** Offset of our own last programmatic scroll — never the reader's. */
+let selfScrollTop = -1
+/** While set, scroll events belong to the 回到最新 animation. */
+let smoothUntil = 0
+let settleRaf = 0
+let settleTimer = 0
+let settleUntil = 0
+let settleHeight = -1
+let settleStable = 0
+
+/** Largest meaningful scrollTop for this element. */
+function bottomOffset(el) {
+  return Math.max(0, el.scrollHeight - el.clientHeight)
+}
+
+function nearBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX
+}
+
+/**
+ * Land on the newest message right now.
+ *
+ * Never smooth: opening a conversation (or following a stream) must appear at
+ * the end, not animate a long scroll down from the top. Smooth belongs to the
+ * explicit 回到最新 button only — see `scrollToBottom`.
+ */
+function stickToBottom() {
+  const el = scroller.value
+  if (!el) return
+  const target = bottomOffset(el)
+  if (Math.abs(el.scrollTop - target) > 1) {
+    el.scrollTo({ top: target, behavior: 'auto' })
+    selfScrollTop = el.scrollTop
+  }
+  pinned.value = true
+}
 
 function onScroll() {
   const el = scroller.value
   if (!el) return
-  pinned.value = el.scrollHeight - el.scrollTop - el.clientHeight < 64
+  const top = el.scrollTop
+  // Consume the one event our own jump produces; anything else is the reader.
+  const own = top === selfScrollTop
+  selfScrollTop = -1
+  if (own) return
+  if (performance.now() < smoothUntil) {
+    // Inside the 回到最新 animation: it is still ours until it arrives.
+    if (bottomOffset(el) - top <= 1) smoothUntil = 0
+    return
+  }
+  pinned.value = nearBottom(el)
+  // Scrolling away from the end is the reader taking over: stop following.
+  if (!pinned.value) stopSettling()
 }
 
-function scrollToBottom(smooth = false) {
+/** A real gesture outranks a 回到最新 animation that is still running. */
+function onUserScroll() {
+  smoothUntil = 0
+}
+
+/** Re-anchor the bottom while the content is still changing height. */
+function settleFrame() {
+  settleRaf = 0
+  if (!settleUntil || performance.now() > settleUntil) return
+  const el = scroller.value
+  if (el) {
+    const height = el.scrollHeight
+    if (height !== settleHeight) {
+      settleHeight = height
+      settleStable = 0
+      stickToBottom()
+    } else {
+      settleStable += 1
+    }
+    if (settleStable >= SETTLE_STABLE_FRAMES) return
+  }
+  settleRaf = requestAnimationFrame(settleFrame)
+}
+
+function stopSettling() {
+  settleUntil = 0
+  if (settleRaf) {
+    cancelAnimationFrame(settleRaf)
+    settleRaf = 0
+  }
+  if (settleTimer) {
+    window.clearTimeout(settleTimer)
+    settleTimer = 0
+  }
+}
+
+/** Open a conversation at its newest message and stay there while it settles. */
+function startSettling() {
+  stopSettling()
+  settleUntil = performance.now() + SETTLE_MS
+  settleHeight = -1
+  settleStable = 0
+  stickToBottom()
+  settleRaf = requestAnimationFrame(settleFrame)
+  // requestAnimationFrame does not run in a hidden tab, so one bounded timeout
+  // guarantees a final anchor even if the settle loop never got a frame.
+  settleTimer = window.setTimeout(() => {
+    settleTimer = 0
+    if (pinned.value) stickToBottom()
+    stopSettling()
+  }, SETTLE_MS)
+}
+
+/** 回到最新 — the only smooth scroll in the pane. */
+function scrollToBottom() {
   const el = scroller.value
   if (!el) return
-  el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+  const target = bottomOffset(el)
   pinned.value = true
+  smoothUntil = Math.abs(el.scrollTop - target) > 1 ? performance.now() + SMOOTH_MS : 0
+  if (!smoothUntil) return
+  el.scrollTo({ top: target, behavior: 'smooth' })
 }
 
 let lastSessionId = chat.activeId
@@ -111,8 +239,10 @@ watch(
     if (lastSessionId !== chat.activeId) {
       lastSessionId = chat.activeId
       pinned.value = true // a freshly opened conversation starts at the end
+      nextTick(startSettling)
+      return
     }
-    if (pinned.value) nextTick(() => scrollToBottom())
+    if (pinned.value) nextTick(stickToBottom)
   },
   { flush: 'post' },
 )
@@ -145,7 +275,14 @@ function previousUserText(index) {
 
 onMounted(() => {
   ensureLoaded()
+  // The pane is remounted whenever the tab changes (App.vue keys the view by
+  // tab), and that leaves a brand-new scroller at offset 0 with no store change
+  // to react to — e.g. leaving 统计监控 by clicking the conversation you were
+  // already in. Opening a conversation has to anchor from here too.
+  if (chat.activeId) nextTick(startSettling)
 })
+
+onBeforeUnmount(stopSettling)
 </script>
 
 <template>
@@ -229,7 +366,13 @@ onMounted(() => {
       </header>
 
       <!-- messages take every remaining pixel; the composer is pinned below -->
-      <div ref="scroller" class="chat-scroll" @scroll="onScroll">
+      <div
+        ref="scroller"
+        class="chat-scroll"
+        @scroll="onScroll"
+        @wheel="onUserScroll"
+        @touchmove="onUserScroll"
+      >
         <AsyncBlock
           :state="chat.messagesStatus"
           :error="chat.messagesError"
@@ -258,7 +401,7 @@ onMounted(() => {
           type="button"
           class="btn sm chat-jump"
           title="滚动到最新内容"
-          @click="scrollToBottom(true)"
+          @click="scrollToBottom()"
         >
           <Icon name="chevron-down" :size="14" />
           回到最新

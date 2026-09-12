@@ -190,7 +190,7 @@ async function doConfirm(session) {
               <div v-else class="session-actions">
                 <button
                   type="button"
-                  class="icon-btn sm"
+                  class="session-btn"
                   title="重命名"
                   aria-label="重命名该对话"
                   @click="startRename(session)"
@@ -199,7 +199,7 @@ async function doConfirm(session) {
                 </button>
                 <button
                   type="button"
-                  class="icon-btn sm"
+                  class="session-btn"
                   title="清空该对话的消息"
                   aria-label="清空该对话的消息"
                   @click="ask(session, 'clear')"
@@ -208,7 +208,7 @@ async function doConfirm(session) {
                 </button>
                 <button
                   type="button"
-                  class="icon-btn sm danger-text"
+                  class="session-btn danger-text"
                   title="删除该对话"
                   aria-label="删除该对话"
                   @click="ask(session, 'delete')"

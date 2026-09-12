@@ -425,18 +425,23 @@ samp {
   position: relative;
 }
 
+/* The group is centred on the row and has no surface of its own: each button
+   carries a rounded hover fill instead. A solid background patch floating over
+   the row's second line is what read as a block pasted on top of the row.
+
+   `bottom` is deliberately absent: centring with a transform keeps the group
+   inside the row whatever its height, and the absolute position means the row
+   itself never changes size when they appear. */
 .session-actions,
 .session-confirm {
   position: absolute;
   right: 4px;
-  bottom: 2px;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 4px;
-  padding: 1px 2px;
-  border-radius: var(--radius-sm);
-  background: var(--muted);
+  gap: 2px;
   font-size: 12px;
 }
 
@@ -452,10 +457,53 @@ samp {
   opacity: 1;
 }
 
+/* These are bare <button> elements, which would otherwise render with the
+   browser's own button chrome (a grey outset block) — the reason the row looked
+   wrong. One quiet icon button: transparent until hovered, then a soft rounded
+   fill of its own, sized for a comfortable target rather than for the 14px
+   glyph. */
+.session-btn {
+  appearance: none;
+  border: none;
+  background: none;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  color: var(--muted-foreground);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.session-btn:hover {
+  background: var(--border-strong);
+  color: var(--foreground);
+}
+
+.session-btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.session-btn.danger-text:hover {
+  background: var(--border-strong);
+  color: var(--destructive);
+}
+
 /* The two-step confirmation replaces them once an action was chosen, and stays
-   visible until it is answered. */
+   visible until it is answered. It is a transient question, so it sits on its
+   own hairline surface rather than over the row text — same metrics as the
+   actions group so the position does not shift when it swaps in. */
 .session-confirm {
-  box-shadow: inset 0 0 0 1px var(--border);
+  gap: 4px;
+  padding: 2px 3px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
 }
 
 .session-edit {
@@ -1488,12 +1536,17 @@ table.data tbody tr.selected {
 .tools {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
   margin: 4px 0 8px;
 }
 
+/* A tool call is one compact row: a quiet expand chevron, the tool name, its
+   status, how long it took, and the argument preview. The card is deliberately
+   short — padding and gaps are tuned so the common case (no error, collapsed)
+   is a single text-height line — and the preview absorbs the remaining width
+   instead of wrapping, so a 4 KB argument cannot make the card taller. */
 .tool-card {
-  padding: 9px 11px;
+  padding: 4px 8px;
   background: var(--muted);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -1502,19 +1555,62 @@ table.data tbody tr.selected {
 .tool-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 22px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tool-toggle {
+  appearance: none;
+  border: none;
+  background: none;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-left: -2px;
+  padding: 0;
+  border-radius: var(--radius-xs);
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.tool-toggle:hover {
+  background: var(--border-strong);
+  color: var(--foreground);
+}
+
+.tool-toggle:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+/* The always-visible argument preview: one line, monospace, ellipsized. */
+.tool-args {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--muted-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .tool-body {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-top: 7px;
+  margin-top: 6px;
 }
 
 .tool-err {
-  margin-top: 5px;
+  margin-top: 4px;
 }
 
 .turn-usage {

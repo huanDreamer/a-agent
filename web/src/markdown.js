@@ -230,7 +230,13 @@ function copyButtonElement() {
   return button
 }
 
-/** Add the code-block header (language + copy) and scrollable table wrappers. */
+/**
+ * Add the code-block header (language + copy) and the scrollable table wrapper
+ * to already-sanitized markup. Everything here is built with createElement and
+ * textContent from nodes that survived the sanitizer — no untrusted string is
+ * ever concatenated into markup. Idempotent: an element that already has its
+ * wrapper is left alone.
+ */
 function decorate(root) {
   for (const code of [...root.querySelectorAll('pre > code')]) {
     const pre = code.parentElement
