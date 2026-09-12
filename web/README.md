@@ -1,7 +1,11 @@
 # huan-agent admin（Web UI）
 
-huan-agent 的 Web 控制台：对话、用量统计、调用记录、审计日志、技能开关与链路追踪。
+huan-agent 的 Web 控制台：对话、统计监控（总览 / 按模型 / 按用户 / 调用记录 / 审计日志 /
+链路追踪）与设置（主题、服务信息、模型目录、工作区与工具、技能开关）。
 Vue 3 + Vite 单页应用，构建产物由 Go 服务端通过 `//go:embed` 嵌入到二进制里。
+
+**没有登录页**：`admin.require_login` 默认为 `false`，控制台打开即用。`GET /api/me` 只是
+启动探针（关闭登录校验时返回 `200 {authenticated:false}`），不构成任何跳转理由。
 
 ## 快速开始
 
@@ -46,15 +50,13 @@ internal/server/webui/dist/assets/index-<hash>.css
 
 ## 与后端的接口
 
-所有请求都带 `credentials: 'same-origin'`，登录态由 `POST /api/login` 下发的 Cookie 维持。
-任何接口返回 401 时，前端会立即回到登录页。
+所有请求都带 `credentials: 'same-origin'`（默认部署不需要 Cookie）。任何接口返回 401 时，
+前端只在主区顶部显示一条说明（该部署把 `admin.require_login` 打开了，而本控制台不提供
+登录流程），不会跳转、也没有登录表单。
 
 | 方法   | 路径                            | 说明                                   |
 | ------ | ------------------------------- | -------------------------------------- |
-| POST   | `/api/login`                    | `{password}` → `{ok, username}`        |
-| POST   | `/api/logout`                   | 退出登录                               |
-| GET    | `/api/me`                       | 当前会话状态                           |
-| GET    | `/api/health`                   | 版本与运行时长                         |
+| GET    | `/api/me`                       | 启动探针；关闭登录校验时返回 200       |
 | GET    | `/api/usage/summary`            | 汇总（调用数 / token / 费用 / 延迟）   |
 | GET    | `/api/usage/by-model`           | 按模型聚合，`limit`                    |
 | GET    | `/api/usage/by-provider`        | 按 provider 聚合，`limit`              |
@@ -77,8 +79,10 @@ internal/server/webui/dist/assets/index-<hash>.css
 | GET    | `/api/traces`                   | trace 列表，`limit` / `page` / `session` / `user` / `name` |
 | GET    | `/api/traces/{id}`              | trace 详情 + observation 树            |
 
-用量类接口都支持 `since` / `until`（RFC3339）、`user`、`provider`、`model` 查询参数；
-页面顶部的时间范围选择器（24小时 / 7天 / 30天 / 全部）会把这些查询统一换算成 `since`。
+用量类接口都支持 `since` / `until`（RFC3339）、`user`、`provider`、`model` 查询参数。
+时间范围选择器（24小时 / 7天 / 30天 / 全部）与「刷新」是 **统计监控** 的工具条，只挂在
+总览 / 按模型 / 按用户 / 调用记录 四个用量子页上（它们把范围换算成 `since`，趋势图换算成
+`days`）；审计日志的接口没有时间过滤，只给「刷新」；链路追踪用自己的过滤条件。
 
 如果 API 不在站点根路径下，可以在 `index.html` 里于打包脚本之前设置
 `window.__ADMIN_API_BASE__ = '/some/prefix'`。
@@ -112,16 +116,25 @@ trace 由服务端代理读取，浏览器不会拿到 Langfuse 的 secret key�
 - **亮色为默认**：`src/theme.js` 按「localStorage 里的显式选择 → `prefers-color-scheme`
   → 亮色」解析，并把 `class="dark"` 与 `data-theme` 写到 `<html>`；`styles.css` 同时保留
   `@media (prefers-color-scheme: dark)` 分支（首屏 / 无 JS 时不闪错主题），显式选择优先。
-  侧边栏右上角提供 跟随系统 / 亮色 / 暗色 三态切换，选择持久化。
+  主题切换在 **设置 → 外观**（跟随系统 / 亮色 / 暗色，当前项带对勾），选择持久化。
 - **图标**：`src/components/Icon.vue` 手写内联 SVG，几何与属性约定（`viewBox="0 0 24 24"`、
   `fill="none"`、`stroke="currentColor"`、`stroke-width="2"`、圆角端点/连接）跟随
   Lucide —— 也就是 harness 使用的那套图标；不引入任何图标库。
 - **中文界面**，响应式支持到约 380px 宽度。
 - **布局：对话优先、满屏高**：整壳高 `100svh`（回退 `100vh`），只有内部面板滚动。
-  左侧 264px 侧边栏承载品牌、provider/model、主题切换、会话列表、管理页导航与账号操作；
-  900px 以下侧边栏变成抽屉，由主区上下文头部的按钮打开。时间范围选择器与「刷新」不再是
-  全局控件，而是只出现在用量类视图（总览 / 按模型 / 按用户 / 调用记录 / 审计日志）各自的
-  工具条里；对话与技能没有，链路追踪用自己的过滤条件。
+  左侧 264px 侧边栏只有三块：顶部「新建对话」按钮、占满剩余高度并可滚动的会话列表、底部
+  两个入口「设置」与「统计监控」。没有品牌、没有 provider/model 行、没有账号行、没有退出。
+  900px 以下侧边栏变成抽屉，由主区上下文头部的按钮打开。
+- **会话行操作只在悬停 / 键盘聚焦时出现**：`.session-actions` 常驻 DOM 但
+  `visibility: hidden`（不是只把 opacity 调 0——那样点击仍会落在看不见的按钮上，且会参与
+  命中测试），行 `:hover` 或 `:focus-within` 时显现；操作是行的绝对定位浮层，出现时不改变
+  列表高度。键盘用户 Tab 进某一行时 `:focus-within` 已生效，因此下一次 Tab 就能落到按钮上。
+  ≤900px 没有 hover，媒体查询里直接把它们显示出来。
+- **输入框与模型选择器合为一体**：一个圆角容器里，上面是自动增高的 textarea（静止约 4 行，
+  96px 起，长到 260px 后内部滚动），下面一行左侧是 `provider / model` 下拉 chip、右侧是
+  圆形 `--primary` 发送按钮（流式期间换成「停止」）。容器 `:focus-within` 时出现焦点环。
+  输入框回车发送、Shift+Enter 换行，中文输入法组字期间回车不发送。
+- **对话里不展示工具清单**：可用工具只在 设置 → 工作区与工具 里作为只读信息列出。
 - **手写渲染**：助手回答的 markdown 子集（``` 代码块、行内 `code`、**加粗**、换行）由
   `src/markdown.js` 解析成 token，再用文本节点渲染（不使用 `v-html`，模型输出无法注入标记）；
   trace 瀑布流由 `src/components/TraceWaterfall.vue` 用普通 DOM + 百分比定位手写，
@@ -139,9 +152,9 @@ web/
 ├── package.json
 └── src/
     ├── main.js                    # createApp
-    ├── App.vue                    # 登录态切换 + 标签页路由
+    ├── App.vue                    # 两栏外壳 + 三个顶层面板路由
     ├── api.js                     # fetch 封装 + ApiError + 401 回调
-    ├── state.js                   # reactive store（登录、时间范围、刷新令牌）
+    ├── state.js                   # reactive store（导航、子页、时间范围、刷新令牌、meta）
     ├── useResource.js             # 数据加载原语（loading/error/empty/ready）
     ├── format.js                  # 数字 / 费用 / 时长 / 时间 / JSON 格式化
     ├── metrics.js                 # 指标定义（调用数 / token / 费用）
@@ -152,30 +165,30 @@ web/
     ├── ui.js                      # 壳层 UI 状态（移动端抽屉）
     ├── styles.css                 # 全站设计令牌 + 样式（亮/暗两套，无字面色值）
     └── components/
-        ├── AppSidebar.vue         # 侧边栏：品牌、主题、新建对话、会话列表、导航、账号
+        ├── AppSidebar.vue         # 侧边栏：新建对话 / 会话列表（悬停操作）/ 设置 / 统计监控
         ├── ViewHead.vue           # 主区上下文头部（标题 + 该视图的工具条插槽）
-        ├── ViewToolbar.vue        # 用量视图的时间范围 + 刷新
+        ├── ViewToolbar.vue        # 用量子页的时间范围 + 刷新（:range="false" 只留刷新）
         ├── DrawerButton.vue       # ≤900px 的抽屉开关（只在窄屏显示）
-        ├── ThemeToggle.vue        # 跟随系统 / 亮色 / 暗色
         ├── Icon.vue               # 内联图标（Lucide 几何 + 属性约定）
         ├── AsyncBlock.vue         # 骨架屏 / 错误重试 / 空状态
         ├── StatCard.vue           # 汇总卡片
         ├── DailyTrendChart.vue    # 手写 SVG 折线+面积图
         ├── BarList.vue            # 横向条形对比
         ├── TotalsTable.vue        # 聚合明细表（含费用列）
-        ├── LoginView.vue          # 登录
-        ├── DashboardView.vue      # 总览
-        ├── ByModelView.vue        # 按模型
-        ├── ByUserView.vue         # 按用户
-        ├── RecentView.vue         # 调用记录
-        ├── AuditView.vue          # 审计日志
-        ├── SkillsView.vue         # 技能开关
-        ├── ChatView.vue           # 对话（上下文头部 + 满高消息区 + 固定输入框）
+        ├── SettingsView.vue       # 设置（外观 / 服务信息 / 模型目录 / 工作区与工具）
+        ├── SkillsPanel.vue        # 技能开关（设置的一个区块）
+        ├── MonitorView.vue        # 统计监控（六个子页 + 用量工具条）
+        ├── DashboardView.vue      # 总览（子页，只渲染内容）
+        ├── ByModelView.vue        # 按模型（子页）
+        ├── ByUserView.vue         # 按用户（子页）
+        ├── RecentView.vue         # 调用记录（子页）
+        ├── AuditView.vue          # 审计日志（子页）
+        ├── ChatView.vue           # 对话（细头部 + 满高消息区 + 固定输入框）
         ├── ChatMessage.vue        # 消息气泡：思考过程 / 工具卡片 / 用量 / 复制
-        ├── ChatComposer.vue       # 输入框（Enter 发送、Shift+Enter 换行、停止）
+        ├── ChatComposer.vue       # 一体化输入区（textarea + 模型下拉 + 发送/停止）
         ├── MarkdownText.vue       # markdown 块级渲染（纯文本节点）
         ├── MarkdownInline.vue     # markdown 行内渲染
         ├── JsonBlock.vue          # 可折叠 JSON（null 安全 + 截断）
         ├── TraceWaterfall.vue     # 手写 observation 瀑布流
-        └── TraceView.vue          # 链路追踪（状态条 + 列表 + 详情）
+        └── TraceView.vue          # 链路追踪（子页：状态条 + 列表 + 详情）
 ```

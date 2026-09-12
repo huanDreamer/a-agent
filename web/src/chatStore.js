@@ -250,11 +250,6 @@ export const chatModels = computed(() => {
   return Array.isArray(models) ? models : []
 })
 
-export const chatTools = computed(() => {
-  const tools = chat.catalog && chat.catalog.tools
-  return Array.isArray(tools) ? tools : []
-})
-
 /** Catalog entries grouped by provider, for the <optgroup> select. */
 export const modelGroups = computed(() => {
   const groups = new Map()
@@ -281,8 +276,6 @@ export const maxSteps = computed(() => {
   const n = numberOrNull(value)
   return n && n > 0 ? n : null
 })
-
-export const activeSession = computed(() => chat.session)
 
 // ------------------------------------------------------ model selector --
 
