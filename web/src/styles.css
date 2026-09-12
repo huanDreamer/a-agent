@@ -1468,6 +1468,9 @@ table.data tbody tr.selected {
   color: var(--foreground);
 }
 
+/* 思考过程 panel body: rendered markdown (MarkdownText, .md.reason-body), so it
+   is a block of HTML — no white-space: pre-wrap here, the renderer's breaks:true
+   already turns single newlines into <br>. */
 .reason-body {
   margin-top: 5px;
   padding: 9px 11px;
@@ -1477,7 +1480,6 @@ table.data tbody tr.selected {
   color: var(--muted-strong);
   font-size: 12.5px;
   line-height: 1.6;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
   max-height: 260px;
   overflow-y: auto;
@@ -1694,32 +1696,320 @@ table.data tbody tr.selected {
   background: var(--card);
 }
 
-/* ------------------------------------------- markdown subset + JSON view -- */
+/* --------------------------------------- rendered markdown + JSON view -- */
+/* Everything marked/GFM can emit out of renderMarkdown(): headings,
+   paragraphs, lists (incl. task lists), blockquotes, rules, tables, links,
+   emphasis and code. Tokens only — no literal colour — so both themes come
+   from theme.js switching the palette.
+
+   Layout rule for the whole block: the container is a flex column, so every
+   child is a flex item, and a flex item's default `min-width: auto` refuses to
+   shrink below its content. `min-width: 0` on the children is therefore what
+   keeps a wide table or a long code line scrolling *inside itself* instead of
+   widening the page. */
 
 .md {
   display: flex;
   flex-direction: column;
   gap: 6px;
-}
-
-.md-p {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  min-width: 0;
   font-size: 13.5px;
   line-height: 1.62;
+  overflow-wrap: anywhere;
 }
 
-.md-pre {
+.md > * {
+  min-width: 0;
+}
+
+/* --- headings: em-based, so an h1 stays a heading inside a bubble (and a
+   smaller one inside the 思考过程 panel) instead of dwarfing the message list. */
+
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  margin: 4px 0 0;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--foreground);
+}
+
+.md h1 {
+  font-size: 1.3em;
+}
+
+.md h2 {
+  font-size: 1.22em;
+}
+
+.md h3 {
+  font-size: 1.12em;
+}
+
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 1em;
+}
+
+.md h1,
+.md h2 {
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* -------------------------------------------------- text + inline marks -- */
+
+.md p,
+.md-p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.md strong {
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.md em {
+  font-style: italic;
+}
+
+.md del {
+  color: var(--muted-foreground);
+  text-decoration: line-through;
+}
+
+.md a,
+.md-link {
+  color: var(--info);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+}
+
+.md :not(pre) > code {
+  padding: 1px 5px;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  font-family: var(--mono);
+  font-size: 0.92em;
+  color: var(--muted-strong);
+  overflow-wrap: anywhere;
+}
+
+/* ----------------------------------------------------------------- lists -- */
+
+.md ul,
+.md ol {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.md ul {
+  list-style: disc;
+}
+
+.md ul ul {
+  list-style: circle;
+}
+
+.md ul ul ul {
+  list-style: square;
+}
+
+.md ol {
+  list-style: decimal;
+}
+
+.md ol ol {
+  list-style: lower-alpha;
+}
+
+.md li {
+  margin: 0;
+}
+
+.md li + li {
+  margin-top: 2px;
+}
+
+.md li > ul,
+.md li > ol {
+  margin-top: 2px;
+}
+
+/* Task list: no bullet, a checkbox the renderer rebuilt after sanitizing. */
+.md li:has(> .md-task-box) {
+  list-style: none;
+}
+
+.md-task-box {
+  margin: 0 6px 0 -18px;
+  vertical-align: -1px;
+  accent-color: var(--primary);
+  cursor: default;
+}
+
+/* --------------------------------------------------- quotes and rules -- */
+
+.md blockquote {
+  margin: 0;
+  padding: 2px 0 2px 10px;
+  border-left: 3px solid var(--muted-foreground);
+  color: var(--muted-foreground);
+}
+
+.md blockquote > :first-child {
+  margin-top: 0;
+}
+
+.md hr {
+  width: 100%;
+  height: 0;
+  margin: 6px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+/* ---------------------------------------------------------------- tables -- */
+
+.md-table-wrap {
   max-width: 100%;
   overflow-x: auto;
-  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.md-table-wrap:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.md table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.md th,
+.md td {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  /* break-word (not anywhere): a long token is allowed to overflow its cell
+     and make the wrapper scroll, instead of being broken to shreds to fit. */
+  overflow-wrap: break-word;
+}
+
+.md th {
+  background: var(--muted);
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+/* Column alignment from the delimiter row (:--- / :---: / ---:). marked emits
+   the presentational `align` attribute; these make it explicit for the
+   computed style. */
+.md th[align='center'],
+.md td[align='center'] {
+  text-align: center;
+}
+
+.md th[align='right'],
+.md td[align='right'] {
+  text-align: right;
+}
+
+/* ------------------------------------------------------- code blocks -- */
+
+.md-code-block {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
   background: var(--muted);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.md-code-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.md-lang {
+  margin-right: auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+
+.md-code-block pre {
+  margin: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 10px 12px;
   font-family: var(--mono);
   font-size: 12.5px;
   line-height: 1.55;
   white-space: pre;
+}
+
+.md-code-block pre > code {
+  padding: 0;
+  background: none;
+  border: 0;
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--foreground);
+}
+
+/* Copy button inside a code-block header. Both glyphs and all three labels are
+   in the markup; `data-copied` picks which one shows, so the click handler only
+   flips that attribute — same 复制 / 已复制 feedback as the message button. */
+.md-copy {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+
+.md-copy > .md-i-done,
+.md-copy > .md-t-ok,
+.md-copy > .md-t-fail {
+  display: none;
+}
+
+.md-copy[data-copied='ok'] > .md-i-copy,
+.md-copy[data-copied='ok'] > .md-t-idle,
+.md-copy[data-copied='fail'] > .md-i-copy,
+.md-copy[data-copied='fail'] > .md-t-idle {
+  display: none;
+}
+
+.md-copy[data-copied='ok'] > .md-i-done {
+  display: block;
+}
+
+.md-copy[data-copied='ok'] > .md-t-ok,
+.md-copy[data-copied='fail'] > .md-t-fail {
+  display: inline;
+}
+
+/* Reasoning panel reuses the markdown renderer at a smaller size. */
+.md.reason-body {
+  font-size: 12.5px;
+  line-height: 1.6;
 }
 
 .md-code {

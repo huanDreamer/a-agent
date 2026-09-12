@@ -2,8 +2,9 @@
 // One conversation bubble (user or assistant).
 //
 // The assistant bubble carries everything a turn produces: the collapsible
-// 思考过程 panel, one card per tool call, the answer itself (rendered by the
-// hand-written markdown subset) and the turn footer with token usage.
+// 思考过程 panel, one card per tool call, the answer itself (rendered as
+// Markdown by MarkdownText) and the turn footer with token usage. The user's
+// own message stays plain text — it is never rendered as Markdown.
 import { computed, ref } from 'vue'
 import Icon from './Icon.vue'
 import JsonBlock from './JsonBlock.vue'
@@ -113,7 +114,13 @@ async function copy() {
             {{ item.streaming && item.reasoningOpen ? '推理中…' : `${reasoningSize} 字符` }}
           </span>
         </button>
-        <pre v-if="item.reasoningOpen" class="reason-body">{{ item.reasoning }}</pre>
+        <!-- Reasoning is model-written prose too, so it renders as Markdown. -->
+        <MarkdownText
+          v-if="item.reasoningOpen"
+          class="reason-body"
+          :text="item.reasoning"
+          :streaming="item.streaming"
+        />
       </div>
 
       <!-- tool calls, in the order the model requested them -->
@@ -143,7 +150,7 @@ async function copy() {
         </div>
       </div>
 
-      <MarkdownText v-if="item.text" :text="item.text" />
+      <MarkdownText v-if="item.text" :text="item.text" :streaming="item.streaming" />
       <div v-else-if="item.streaming" class="empty-inline">
         <span class="spin" aria-hidden="true" />
         <span>正在生成…</span>
