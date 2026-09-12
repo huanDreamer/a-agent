@@ -72,6 +72,30 @@ type ChatDeps struct {
 	Tools *tool.Registry
 	// SystemPrompt overrides the default.
 	SystemPrompt string
+	// Usage records token usage for the admin analytics. Optional: when nil the
+	// conversation still works and simply is not counted.
+	//
+	// The web chat is the surface most turns go through, so leaving this unset
+	// makes 统计监控 show nothing for the conversations a user actually has.
+	Usage UsageRecorder
+}
+
+// UsageRecorder records one model call's token usage. It mirrors
+// usage.Recorder without importing it, so the server keeps depending on a
+// narrow interface rather than the whole package.
+type UsageRecorder interface {
+	Record(UsageEvent) error
+}
+
+// UsageEvent is one recorded model call.
+type UsageEvent struct {
+	SessionID        string
+	Provider         string
+	Model            string
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	DurationMs       int64
 }
 
 // ModelBuilder resolves a per-session model choice.
@@ -597,6 +621,12 @@ func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, answer
 		}
 	}
 
+	// Record the turn's token usage, so the analytics count the conversations a
+	// user actually has. Without this the web chat — the surface nearly every
+	// turn goes through — is invisible in 统计监控, and the dashboard reads as
+	// broken rather than empty.
+	s.recordTurnUsage(sess, usage)
+
 	// Record each tool invocation in the audit log as well, so the audit view
 	// and the conversation agree.
 	for _, t := range tools {
@@ -634,6 +664,44 @@ func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, answer
 	// Auto-title a session from its first user message, so the sidebar is
 	// useful without requiring a manual rename.
 	s.maybeTitle(saveCtx, sess)
+}
+
+// recordTurnUsage reports one turn's totals to the usage recorder.
+//
+// A turn can span several model calls (one per tool round trip) and the runner
+// has already summed them; recording each step separately is not possible from
+// here, and a single summed row per turn is what the analytics want.
+//
+// Failures are logged, never returned: usage accounting must not be able to
+// fail a conversation that already succeeded.
+func (s *Server) recordTurnUsage(sess store.ChatSession, usage chat.Usage) {
+	if s.chat.Usage == nil {
+		return
+	}
+	if usage.TotalTokens == 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+		// A provider that reported nothing. Recording a zero row would inflate
+		// the call count without adding any information.
+		return
+	}
+	// Attribute to the session's model when it has one, else the server default.
+	provider, model := sess.Provider, sess.Model
+	if provider == "" {
+		provider = s.cfg.Provider
+	}
+	if model == "" {
+		model = s.cfg.Model
+	}
+	if err := s.chat.Usage.Record(UsageEvent{
+		SessionID:        sess.ID,
+		Provider:         provider,
+		Model:            model,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+		DurationMs:       usage.DurationMs,
+	}); err != nil {
+		s.logger.Warn("record chat usage failed", zapError(err))
+	}
 }
 
 // maybeTitle names an untitled session from its first exchange.

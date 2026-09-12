@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -762,5 +763,107 @@ func TestChatSession_UntitledIsEmptyAndAutoNamed(t *testing.T) {
 	h.getJSON(t, "/api/chat/sessions/"+id, http.StatusOK, &created)
 	if !strings.Contains(created.Session.Title, "帮我排查") {
 		t.Errorf("title = %q, want it derived from the first message", created.Session.Title)
+	}
+}
+
+// recordingUsage captures what the chat reports to the usage recorder.
+type recordingUsage struct {
+	mu     sync.Mutex
+	events []UsageEvent
+	err    error
+}
+
+func (r *recordingUsage) Record(e UsageEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+	return r.err
+}
+
+func (r *recordingUsage) snapshot() []UsageEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]UsageEvent, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
+func TestChatTurn_RecordsUsage(t *testing.T) {
+	// The web chat is the surface almost every turn goes through, so a turn that
+	// is not recorded leaves 统计监控 empty for the conversations users actually
+	// have — and an empty dashboard reads as broken, not as unused.
+	rec := &recordingUsage{}
+	mdl := &scriptedModel{turns: [][]*schema.Message{{
+		{Role: schema.Assistant, Content: "hi", ResponseMeta: &schema.ResponseMeta{
+			Usage: &schema.TokenUsage{PromptTokens: 30, CompletionTokens: 12, TotalTokens: 42},
+		}},
+	}}}
+	runner, err := chat.New(chat.Config{Model: mdl, MaxSteps: 3, Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("chat.New: %v", err)
+	}
+	srv, _ := buildServerWith(t, buildOpts{chat: ChatDeps{Runner: runner, Usage: rec}})
+	startHarness(t, srv)
+	h := &harness{base: "http://" + srv.Addr(), client: newJar(t), srv: srv}
+	h.login(t)
+
+	id := createSession(t, h)
+	readSSE(t, h.client, h.base+"/api/chat/sessions/"+id+"/messages", map[string]string{"content": "hi"})
+
+	waitForCondition(t, 2*time.Second, "a recorded usage event", func() bool {
+		return len(rec.snapshot()) > 0
+	})
+	got := rec.snapshot()[0]
+	if got.PromptTokens != 30 || got.CompletionTokens != 12 || got.TotalTokens != 42 {
+		t.Errorf("usage = %+v, want 30/12/42", got)
+	}
+	if got.SessionID != id {
+		t.Errorf("session = %q, want %q", got.SessionID, id)
+	}
+	// Attribution matters: a row with no model cannot be priced or grouped.
+	if got.Model == "" {
+		t.Error("the recorded usage has no model, so it cannot be attributed or priced")
+	}
+}
+
+func TestChatTurn_NoUsageReportedRecordsNothing(t *testing.T) {
+	// A provider that reports no tokens must not produce a zero row: it would
+	// inflate the call count while adding no information.
+	rec := &recordingUsage{}
+	mdl := &scriptedModel{turns: [][]*schema.Message{{{Role: schema.Assistant, Content: "hi"}}}}
+	runner, err := chat.New(chat.Config{Model: mdl, MaxSteps: 3, Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("chat.New: %v", err)
+	}
+	srv, _ := buildServerWith(t, buildOpts{chat: ChatDeps{Runner: runner, Usage: rec}})
+	startHarness(t, srv)
+	h := &harness{base: "http://" + srv.Addr(), client: newJar(t), srv: srv}
+	h.login(t)
+
+	id := createSession(t, h)
+	readSSE(t, h.client, h.base+"/api/chat/sessions/"+id+"/messages", map[string]string{"content": "hi"})
+	time.Sleep(200 * time.Millisecond)
+	if n := len(rec.snapshot()); n != 0 {
+		t.Errorf("recorded %d events, want 0 when the provider reported no usage", n)
+	}
+}
+
+func TestChatTurn_NilRecorderIsSafe(t *testing.T) {
+	// A deployment without a recorder must still chat.
+	mdl := &scriptedModel{turns: [][]*schema.Message{{{Role: schema.Assistant, Content: "hi"}}}}
+	runner, err := chat.New(chat.Config{Model: mdl, MaxSteps: 3, Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("chat.New: %v", err)
+	}
+	srv, _ := buildServerWith(t, buildOpts{chat: ChatDeps{Runner: runner}})
+	startHarness(t, srv)
+	h := &harness{base: "http://" + srv.Addr(), client: newJar(t), srv: srv}
+	h.login(t)
+
+	id := createSession(t, h)
+	events := readSSE(t, h.client, h.base+"/api/chat/sessions/"+id+"/messages",
+		map[string]string{"content": "hi"})
+	if _, ok := findEvent(events, "done"); !ok {
+		t.Error("the turn should still complete without a recorder")
 	}
 }

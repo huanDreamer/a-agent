@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/huan/huan-agent/internal/usage"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,7 +33,7 @@ import (
 // tools and a runner bound to the default model. Per-session model choices are
 // resolved later by the server through the model builder.
 func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
-	logger *zap.Logger) server.ChatDeps {
+	rec *usage.Recorder, logger *zap.Logger) server.ChatDeps {
 
 	if !cfg.Chat.Enable {
 		logger.Info("web chat disabled (chat.enable = false)")
@@ -89,7 +90,29 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 		Builder:      server.NewModelBuilder(reg),
 		Tools:        registry,
 		SystemPrompt: cfg.Chat.SystemPrompt,
+		Usage:        usageSink{rec: rec},
 	}
+}
+
+// usageSink adapts the server's narrow recorder interface onto usage.Recorder,
+// so internal/server does not have to depend on internal/usage.
+type usageSink struct{ rec *usage.Recorder }
+
+// Record forwards one turn's usage, ignoring a nil recorder so the chat works
+// in a deployment that never started one.
+func (u usageSink) Record(e server.UsageEvent) error {
+	if u.rec == nil {
+		return nil
+	}
+	return u.rec.Record(usage.Event{
+		SessionID:        e.SessionID,
+		Provider:         e.Provider,
+		Model:            e.Model,
+		PromptTokens:     e.PromptTokens,
+		CompletionTokens: e.CompletionTokens,
+		TotalTokens:      e.TotalTokens,
+		DurationMs:       e.DurationMs,
+	})
 }
 
 var (
@@ -186,8 +209,18 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	}
 	tracer := langfuse.NewTracer(lf)
 
+	// Usage accounting for web-chat turns. Without it the analytics count only
+	// CLI and Feishu traffic, and 统计监控 looks empty to a user who works in the
+	// browser.
+	recorder := usage.NewRecorder(st, logger, 256)
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = recorder.Close(closeCtx)
+	}()
+
 	// The chat feature needs a model registry and a tool set.
-	chatDeps := buildChatDeps(cfg, tracer, st, logger)
+	chatDeps := buildChatDeps(cfg, tracer, st, recorder, logger)
 
 	srv, err := server.New(server.Config{
 		Host:             cfg.Server.Host,

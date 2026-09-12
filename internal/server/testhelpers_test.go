@@ -256,3 +256,17 @@ func decode(t *testing.T, resp *http.Response, v any) {
 		t.Fatalf("decode response: %v", err)
 	}
 }
+
+// waitForCondition polls until cond is true or the timeout expires. It keeps a
+// test from asserting on a value an asynchronous worker has not written yet.
+func waitForCondition(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+}
