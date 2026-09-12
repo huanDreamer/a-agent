@@ -11,6 +11,7 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	"github.com/eino-contrib/jsonschema"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -417,4 +418,176 @@ func TestStream_UsageRequestCanBeDisabled(t *testing.T) {
 	if sawStreamOptions {
 		t.Error("stream_options was sent despite the provider disabling it")
 	}
+}
+
+// TestRequest_ToolCallProtocolIsWellFormed drives a full tool round trip and
+// validates the request against the contract providers actually enforce:
+//
+//   - every `role: "tool"` message carries a non-empty tool_call_id
+//   - every tool_call_id answers an id declared by a preceding assistant
+//     tool_calls entry
+//   - an assistant message with tool_calls keeps them on the wire
+//
+// A lenient mock that merely reads `role` accepts a broken request, which is
+// exactly how "missing field `tool_call_id`" reached a real provider.
+func TestRequest_ToolCallProtocolIsWellFormed(t *testing.T) {
+	var second []map[string]any
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("request is not valid JSON: %v", err)
+		}
+		calls++
+		if calls == 1 {
+			// First turn: ask for a tool.
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			_, _ = w.Write([]byte(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"echo","arguments":"{\"text\":\"hi\"}"}}]}}]}` + "\n\n"))
+			flusher.Flush()
+			_, _ = w.Write([]byte(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n"))
+			flusher.Flush()
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		second = req.Messages
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte(`data: {"choices":[{"index":0,"delta":{"content":"done"}}]}` + "\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	m, err := New(Provider{Name: "mock", BaseURL: srv.URL, APIKey: "x", Model: "m"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	bound, err := m.(model.ToolCallingChatModel).WithTools([]*schema.ToolInfo{{
+		Name: "echo", Desc: "echoes",
+		ParamsOneOf: mustParams(t, `{"type":"object","properties":{"text":{"type":"string"}}}`),
+	}})
+	if err != nil {
+		t.Fatalf("WithTools: %v", err)
+	}
+
+	// Turn 1: the model asks for a tool.
+	stream, err := bound.Stream(context.Background(), []*schema.Message{{Role: schema.User, Content: "echo hi"}})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	var assistant *schema.Message
+	for {
+		chunk, rerr := stream.Recv()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			t.Fatalf("Recv: %v", rerr)
+		}
+		if chunk == nil {
+			continue
+		}
+		if assistant == nil {
+			cp := *chunk
+			assistant = &cp
+		} else {
+			merged, cerr := schema.ConcatMessages([]*schema.Message{assistant, chunk})
+			if cerr != nil {
+				t.Fatalf("concat: %v", cerr)
+			}
+			assistant = merged
+		}
+	}
+	stream.Close()
+	if assistant == nil || len(assistant.ToolCalls) == 0 {
+		t.Fatal("no tool call came back")
+	}
+
+	// Turn 2: send the tool result back, which is where a dropped id shows up.
+	history := []*schema.Message{
+		{Role: schema.User, Content: "echo hi"},
+		assistant,
+		{Role: schema.Tool, Content: `{"text":"hi"}`, ToolCallID: assistant.ToolCalls[0].ID},
+	}
+	stream2, err := bound.Stream(context.Background(), history)
+	if err != nil {
+		t.Fatalf("Stream 2: %v", err)
+	}
+	for {
+		_, rerr := stream2.Recv()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			t.Fatalf("Recv 2: %v", rerr)
+		}
+	}
+	stream2.Close()
+
+	if second == nil {
+		t.Fatal("the second request never reached the server")
+	}
+
+	// Validate the contract.
+	declared := map[string]bool{}
+	sawAssistantCalls := false
+	sawTool := false
+	for i, msg := range second {
+		role, _ := msg["role"].(string)
+		if callsRaw, ok := msg["tool_calls"]; ok && role == string(schema.Assistant) {
+			arr, _ := callsRaw.([]any)
+			if len(arr) > 0 {
+				sawAssistantCalls = true
+			}
+			for _, c := range arr {
+				cm, _ := c.(map[string]any)
+				if id, _ := cm["id"].(string); id != "" {
+					declared[id] = true
+				}
+				fn, _ := cm["function"].(map[string]any)
+				if fn == nil {
+					t.Errorf("messages[%d]: tool_call has no function", i)
+					continue
+				}
+				if name, _ := fn["name"].(string); name == "" {
+					t.Errorf("messages[%d]: tool_call function has no name", i)
+				}
+			}
+		}
+		if role == string(schema.Tool) {
+			sawTool = true
+			id, _ := msg["tool_call_id"].(string)
+			if id == "" {
+				t.Errorf("messages[%d]: a tool message has no tool_call_id — this is the "+
+					"exact request a provider rejects with \"missing field `tool_call_id`\"", i)
+				continue
+			}
+			if !declared[id] {
+				t.Errorf("messages[%d]: tool_call_id %q answers no assistant tool call", i, id)
+			}
+		}
+	}
+	if !sawAssistantCalls {
+		t.Error("the assistant message lost its tool_calls on the wire")
+	}
+	if !sawTool {
+		t.Error("no tool message was sent")
+	}
+}
+
+// mustParams builds a ParamsOneOf from a JSON schema literal.
+func mustParams(t *testing.T, raw string) *schema.ParamsOneOf {
+	t.Helper()
+	var js jsonschema.Schema
+	if err := json.Unmarshal([]byte(raw), &js); err != nil {
+		t.Fatalf("unmarshal schema: %v", err)
+	}
+	return schema.NewParamsOneOfByJSONSchema(&js)
 }

@@ -118,14 +118,49 @@ func toOpenAITools(specs []*schema.ToolInfo) []openai.Tool {
 	return out
 }
 
+// toOpenAIMessages converts eino messages into the openai SDK shape.
+//
+// ToolCallID and ToolCalls MUST be carried across. A tool result is only
+// meaningful as the answer to a specific call, and providers enforce it: a
+// `role: "tool"` message without `tool_call_id` is rejected outright
+// ("missing field `tool_call_id`"), and an assistant message whose tool_calls
+// were dropped leaves the following results answering nothing.
+//
+// ReasoningContent is deliberately NOT sent back. Providers that emit it reject
+// it on input, and the stored reasoning is for display only.
 func (m *openAIModel) toOpenAIMessages(msgs []*schema.Message) []openai.ChatCompletionMessage {
 	out := make([]openai.ChatCompletionMessage, 0, len(msgs))
 	for _, msg := range msgs {
-		out = append(out, openai.ChatCompletionMessage{
-			Role:    string(msg.Role),
-			Content: msg.Content,
-			Name:    msg.Name,
-		})
+		converted := openai.ChatCompletionMessage{
+			Role:       string(msg.Role),
+			Content:    msg.Content,
+			Name:       msg.Name,
+			ToolCallID: msg.ToolCallID,
+		}
+		if len(msg.ToolCalls) > 0 {
+			converted.ToolCalls = make([]openai.ToolCall, 0, len(msg.ToolCalls))
+			for _, tc := range msg.ToolCalls {
+				call := openai.ToolCall{
+					ID:   tc.ID,
+					Type: openai.ToolType(tc.Type),
+					Function: openai.FunctionCall{
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					},
+				}
+				// The SDK omits Index when nil, which is what the request
+				// format wants; only carry it when the caller set it.
+				if tc.Index != nil {
+					idx := *tc.Index
+					call.Index = &idx
+				}
+				if call.Type == "" {
+					call.Type = openai.ToolTypeFunction
+				}
+				converted.ToolCalls = append(converted.ToolCalls, call)
+			}
+		}
+		out = append(out, converted)
 	}
 	return out
 }
