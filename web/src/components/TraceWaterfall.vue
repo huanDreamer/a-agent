@@ -288,8 +288,23 @@ function usageTitle(usage) {
           <div v-if="!hasJson(node.obs.input) && !hasJson(node.obs.output)" class="muted-note">
             该 observation 没有 input / output 数据。
           </div>
-          <JsonBlock :value="node.obs.input" label="input" :open="true" :toggle="false" />
-          <JsonBlock :value="node.obs.output" label="output" :open="true" :toggle="false" />
+          <!-- Uncapped on purpose: an observation's input is the prompt that was
+               actually sent, and its output is what came back. Truncating either
+               one hides exactly what the trace exists to show. -->
+          <JsonBlock
+            :value="node.obs.input"
+            label="input"
+            :open="true"
+            :toggle="false"
+            :max-length="null"
+          />
+          <JsonBlock
+            :value="node.obs.output"
+            label="output"
+            :open="true"
+            :toggle="false"
+            :max-length="null"
+          />
           <div class="muted-note mono">
             id {{ node.id }}
             <template v-if="node.obs.parent_id"> · parent {{ node.obs.parent_id }}</template>

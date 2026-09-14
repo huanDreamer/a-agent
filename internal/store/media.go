@@ -35,6 +35,15 @@ type MediaAsset struct {
 	Kind string `json:"kind"`
 	// Path is the file's path relative to the workspace root.
 	Path string `json:"path"`
+	// Workspace is the name of the workspace Path is relative to.
+	//
+	// It is required for correctness, not for display: Path alone is ambiguous
+	// once a scope can change workspaces, because the same relative path may
+	// exist in every workspace. Reading an asset back through the workspace it
+	// was stored in is what stops a switch from resolving an attachment to a
+	// different file (or to nothing). Empty means "the workspace this deployment
+	// had before named workspaces existed", i.e. the built-in default.
+	Workspace string `json:"workspace,omitempty"`
 	// MIME is the canonical content type this build accepted, which is what the
 	// download endpoint serves back.
 	MIME string `json:"mime"`
@@ -47,7 +56,7 @@ type MediaAsset struct {
 }
 
 // mediaAssetCols is the column list every query shares.
-const mediaAssetCols = `id, session_id, kind, path, mime, bytes, sha256, created_at`
+const mediaAssetCols = `id, session_id, kind, path, workspace, mime, bytes, sha256, created_at`
 
 // CreateMediaAsset records an uploaded file. The bytes are already on disk by
 // the time this is called, so a failure here leaves an orphan file the caller is
@@ -63,9 +72,9 @@ func (s *sqliteStore) CreateMediaAsset(ctx context.Context, a MediaAsset) error 
 		a.CreatedAt = time.Now().UTC()
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO media_assets (id, session_id, kind, path, mime, bytes, sha256, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.SessionID, a.Kind, a.Path, a.MIME, a.Bytes, a.SHA256, a.CreatedAt)
+		INSERT INTO media_assets (id, session_id, kind, path, workspace, mime, bytes, sha256, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.SessionID, a.Kind, a.Path, a.Workspace, a.MIME, a.Bytes, a.SHA256, a.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("insert media asset: %w", err)
 	}
@@ -126,7 +135,7 @@ func (s *sqliteStore) FindMediaAssetBySHA256(ctx context.Context, sessionID, dig
 func scanMediaAsset(sc rowScanner) (MediaAsset, error) {
 	var a MediaAsset
 	var created sql.NullTime
-	if err := sc.Scan(&a.ID, &a.SessionID, &a.Kind, &a.Path, &a.MIME, &a.Bytes, &a.SHA256, &created); err != nil {
+	if err := sc.Scan(&a.ID, &a.SessionID, &a.Kind, &a.Path, &a.Workspace, &a.MIME, &a.Bytes, &a.SHA256, &created); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return MediaAsset{}, ErrNotFound
 		}

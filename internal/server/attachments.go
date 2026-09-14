@@ -26,6 +26,7 @@ import (
 
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/workspace"
+	"github.com/huan/huan-agent/internal/workspaces"
 )
 
 // Attachment limits.
@@ -243,7 +244,11 @@ func (s *Server) handleUploadAttachment(ctx context.Context, c *app.RequestConte
 		return
 	}
 
-	ws := s.chat.Workspace
+	ws, wsName, err := s.uploadWorkspace(ctx, sess)
+	if err != nil {
+		s.answerStatusError(c, "resolve workspace for upload", err)
+		return
+	}
 	if ws == nil {
 		// Refusing beats inventing a directory: an upload that landed outside
 		// the workspace would be invisible to every tool the agent has.
@@ -254,7 +259,7 @@ func (s *Server) handleUploadAttachment(ctx context.Context, c *app.RequestConte
 	}
 	if ws.ReadOnly() {
 		c.JSON(http.StatusForbidden, map[string]string{
-			"error": "工作区为只读（tools.read_only），无法保存附件",
+			"error": fmt.Sprintf("工作区 %q 为只读，无法保存附件", wsName),
 		})
 		return
 	}
@@ -266,7 +271,7 @@ func (s *Server) handleUploadAttachment(ctx context.Context, c *app.RequestConte
 	}
 	defer func() { _ = part.Close() }()
 
-	asset, err := s.storeUpload(ctx, ws, sess.ID, part)
+	asset, err := s.storeUpload(ctx, ws, wsName, sess.ID, part)
 	if err != nil {
 		s.answerStatusError(c, "store chat attachment", err)
 		return
@@ -278,6 +283,7 @@ func (s *Server) handleUploadAttachment(ctx context.Context, c *app.RequestConte
 		zapString("kind", asset.Kind),
 		zapString("mime", asset.MIME),
 		zapString("path", asset.Path),
+		zapString("workspace", asset.Workspace),
 	)
 	c.JSON(http.StatusOK, map[string]any{"attachment": attachmentInfo{
 		ID:    asset.ID,
@@ -357,7 +363,8 @@ func multipartBoundary(c *app.RequestContext) (string, error) {
 const multipartEnvelopeBytes int64 = 1 << 20
 
 // storeUpload streams part into the workspace and records the asset.
-func (s *Server) storeUpload(ctx context.Context, ws *workspace.Workspace, sessionID string, part *multipart.Part) (store.MediaAsset, error) {
+func (s *Server) storeUpload(ctx context.Context, ws *workspace.Workspace, wsName, sessionID string,
+	part *multipart.Part) (store.MediaAsset, error) {
 	head := make([]byte, sniffBytes)
 	headLen, err := io.ReadFull(part, head)
 	switch {
@@ -448,7 +455,7 @@ func (s *Server) storeUpload(ctx context.Context, ws *workspace.Workspace, sessi
 	// An identical file re-uploaded into the same conversation is the same
 	// attachment: reusing the row keeps the ids a client already holds valid and
 	// avoids a second copy of the bytes.
-	if existing, ok := s.reuseIdenticalAsset(ctx, ws, sessionID, sum); ok {
+	if existing, ok := s.reuseIdenticalAsset(ctx, ws, wsName, sessionID, sum); ok {
 		return existing, nil
 	}
 
@@ -460,6 +467,10 @@ func (s *Server) storeUpload(ctx context.Context, ws *workspace.Workspace, sessi
 		SessionID: sessionID,
 		Kind:      string(typ.kind),
 		Path:      rel,
+		// The workspace the path is relative to. Without it a later read would
+		// have to guess, and after a switch it would guess the new workspace —
+		// resolving the same relative path to a different file.
+		Workspace: wsName,
 		MIME:      typ.mime,
 		Bytes:     size,
 		SHA256:    sum,
@@ -474,14 +485,21 @@ func (s *Server) storeUpload(ctx context.Context, ws *workspace.Workspace, sessi
 }
 
 // reuseIdenticalAsset returns an already-stored asset with the same bytes, when
-// its file is still there. A missing file means the previous row is stale, and a
-// new file is written instead.
-func (s *Server) reuseIdenticalAsset(ctx context.Context, ws *workspace.Workspace, sessionID, digest string) (store.MediaAsset, bool) {
+// its file is still there and it belongs to the same workspace. A missing file
+// means the previous row is stale, and a new file is written instead.
+//
+// The workspace check is what keeps a switch from making an old row answer for a
+// file the conversation cannot see: the same bytes live at a workspace-relative
+// path, which means a different file in every other workspace.
+func (s *Server) reuseIdenticalAsset(ctx context.Context, ws *workspace.Workspace, wsName, sessionID, digest string) (store.MediaAsset, bool) {
 	existing, err := s.store.FindMediaAssetBySHA256(ctx, sessionID, digest)
 	if err != nil {
 		if !errors.Is(err, store.ErrNotFound) {
 			s.logger.Warn("look up identical attachment failed", zapError(err))
 		}
+		return store.MediaAsset{}, false
+	}
+	if existing.Workspace != wsName {
 		return store.MediaAsset{}, false
 	}
 	abs, err := ws.Resolve(existing.Path)
@@ -520,11 +538,19 @@ func (s *Server) handleGetAttachment(ctx context.Context, c *app.RequestContext)
 		s.fail(c, "get media asset", err)
 		return
 	}
-	if s.chat.Workspace == nil {
+	ws, err := s.workspaceForAsset(ctx, asset)
+	if err != nil {
+		s.fail(c, "resolve attachment workspace", err)
+		return
+	}
+	if ws == nil {
 		c.JSON(http.StatusNotFound, map[string]string{"error": "attachment file is not available"})
 		return
 	}
-	abs, err := s.chat.Workspace.Resolve(asset.Path)
+	// Resolved through the workspace the file was stored in, not the one the
+	// conversation is in now: the path is relative, so the current workspace
+	// could hold a different file at the same path.
+	abs, err := ws.Resolve(asset.Path)
 	if err != nil {
 		// A path that escapes the workspace is a corrupted row, not a client
 		// error; log it so it is visible, and answer 404 so nothing is leaked.
@@ -694,6 +720,15 @@ type attachmentNoteEntry struct {
 	asset store.MediaAsset
 	// reason says, in the user's language, why this file is not inlined.
 	reason string
+	// elsewhere names another workspace when this file is NOT reachable from the
+	// conversation's current one, because the conversation was switched after the
+	// file was uploaded.
+	//
+	// Such an entry is rendered without a usable path on purpose: the path is
+	// workspace-relative, so handing it to the model would make it read (or
+	// overwrite) whatever sits at the same relative path in the new workspace —
+	// a different project's file, silently.
+	elsewhere string
 }
 
 // attachmentNote renders the machine-readable note appended to a message whose
@@ -711,6 +746,12 @@ func attachmentNote(entries []attachmentNoteEntry) string {
 	b.WriteString("[系统提示：本条消息由用户附带了文件，文件已保存在工作区（workspace）以下路径，")
 	fmt.Fprintf(&b, "可用 %s 查看图片、%s 转写音频，路径可原样作为工具参数：]", describeImageTool, transcribeToolName)
 	for _, e := range entries {
+		if e.elsewhere != "" {
+			// No path at all: see the field comment.
+			fmt.Fprintf(&b, "\n- 附件 %s（%s）保存在工作区 %q，当前工作区不是它所在的工作区，因此这里没有可用路径；如需读取请先切回该工作区。",
+				e.asset.ID, e.asset.MIME, e.elsewhere)
+			continue
+		}
 		fmt.Fprintf(&b, "\n- %s（%s，%s，%d 字节）", e.asset.Path, e.asset.MIME, e.reason, e.asset.Bytes)
 	}
 	return b.String()
@@ -743,7 +784,13 @@ func (s *Server) loadTurnAttachments(ctx context.Context, sess store.ChatSession
 	if len(ids) == 0 {
 		return nil, nil, nil, nil
 	}
-	ws := s.chat.Workspace
+	// The conversation's current workspace, for the common case where an
+	// attachment was uploaded into it. Per asset the file's own workspace wins,
+	// because a conversation can be switched after a file was uploaded.
+	currentWS, currentName, err := s.uploadWorkspace(ctx, sess)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	vision := s.sessionSupportsVision(ctx, sess)
 	inlineCap := s.maxInlineImageBytes()
 
@@ -768,7 +815,21 @@ func (s *Server) loadTurnAttachments(ctx context.Context, sess store.ChatSession
 		}
 		all = append(all, asset.ID)
 
-		abs, size, err := s.attachmentFile(ws, asset)
+		// A file that belongs to a workspace this conversation is no longer in is
+		// reported without a path: the path is workspace-relative, so it would
+		// resolve to a different file (or to none) in the current workspace.
+		//
+		// A nil currentWS is a different case — a deployment with no workspace
+		// layer at all — and falls through to attachmentFile, which refuses the
+		// send with a message saying exactly that.
+		if currentWS != nil && asset.Workspace != "" && asset.Workspace != currentName {
+			notes = append(notes, attachmentNoteEntry{asset: asset,
+				reason:    "该文件所在的工作区与当前工作区不同",
+				elsewhere: asset.Workspace})
+			continue
+		}
+
+		abs, size, err := s.attachmentFile(currentWS, asset)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -800,6 +861,46 @@ func notInlinedReason(asset store.MediaAsset, vision bool) string {
 	default:
 		return "未内联"
 	}
+}
+
+// uploadWorkspace returns the sandbox a session's uploads belong in, and its
+// name (empty when the deployment has no workspace layer).
+//
+// With a workspace layer the conversation's own workspace is the answer, so an
+// attachment always lands somewhere that conversation's tools can read it. The
+// single configured workspace remains the fallback for a deployment without the
+// layer, which is what keeps this endpoint behaving as it did before.
+func (s *Server) uploadWorkspace(ctx context.Context, sess store.ChatSession) (*workspace.Workspace, string, error) {
+	if s.chat.Workspaces == nil {
+		return s.chat.Workspace, "", nil
+	}
+	ws, spec, err := s.chat.Workspaces.Resolve(ctx, workspaces.WebScope(sess.ID))
+	if err != nil {
+		return nil, "", err
+	}
+	return ws, spec.Name, nil
+}
+
+// workspaceForAsset returns the sandbox an asset's relative path is relative to.
+//
+// An asset with no recorded workspace is a row written before named workspaces
+// existed, and belongs to the single workspace this deployment started with —
+// which is exactly the fallback.
+func (s *Server) workspaceForAsset(ctx context.Context, asset store.MediaAsset) (*workspace.Workspace, error) {
+	if s.chat.Workspaces == nil || asset.Workspace == "" {
+		return s.chat.Workspace, nil
+	}
+	ws, err := s.chat.Workspaces.Open(ctx, asset.Workspace)
+	if err != nil {
+		// The workspace was deleted since the upload. Its directory is still on
+		// disk — deleting a registration never removes files — so opening it by
+		// the recorded name is the only way to serve the bytes, and a missing
+		// one is reported as "not available" by the caller.
+		s.logger.Warn("attachment workspace is gone",
+			zapString("asset", asset.ID), zapString("workspace", asset.Workspace), zapError(err))
+		return nil, nil
+	}
+	return ws, nil
 }
 
 // attachmentFile resolves a stored asset to a readable path, verifying that it

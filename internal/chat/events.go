@@ -11,6 +11,8 @@ package chat
 
 import (
 	"time"
+
+	"github.com/huan/huan-agent/internal/tool"
 )
 
 // EventType identifies a streamed event.
@@ -29,13 +31,33 @@ const (
 	EventToolCall EventType = "tool_call"
 	// EventToolResult carries a finished tool's output (or its error).
 	EventToolResult EventType = "tool_result"
+	// EventAsk is one update about a question the model put to the person at the
+	// other end (the ask_user tool). Two shapes share it, and a consumer tells
+	// them apart by which fields are set: Ask is present when a question is
+	// announced (AskStatus is AskPending), and AskID is present when it settles.
+	// Both carry the status, so a client that missed the announcement can still
+	// tell that a question it does not know about has ended.
+	EventAsk EventType = "ask_user"
 	// EventUsage reports token usage for one model call.
 	EventUsage EventType = "usage"
+	// EventContextCompressed reports that the in-loop history was condensed to
+	// stay inside the token budget. It is a notice, not a failure: the turn
+	// carries on with a bounded window.
+	EventContextCompressed EventType = "context_compressed"
+	// EventBudgetStop reports that the turn ended on a budget rather than on an
+	// answer. It is emitted before EventDone, and Result.StopReason carries the
+	// same reason for callers that never see events.
+	EventBudgetStop EventType = "budget_stop"
 	// EventDone ends the run successfully.
 	EventDone EventType = "done"
 	// EventError ends the run with a failure.
 	EventError EventType = "error"
 )
+
+// AskPending is the AskStatus of a question that has been put to the user and is
+// waiting for an answer. The other statuses are tool.AnswerStatus values, so the
+// vocabulary of "how a question ended" has exactly one definition.
+const AskPending = "pending"
 
 // Event is one streamed update. Fields are populated according to Type; a
 // consumer must switch on Type rather than assume an event carries everything.
@@ -65,8 +87,29 @@ type Event struct {
 
 	// Usage is set on usage events.
 	Usage *Usage `json:"usage,omitempty"`
+	// Ask is the question being put to the user, set on the ask_user event that
+	// announces it. Its ID is what the client submits an answer with.
+	Ask *tool.Question `json:"ask,omitempty"`
+	// AskID identifies the question an ask_user event settles.
+	AskID string `json:"ask_id,omitempty"`
+	// AskStatus is a question's state on an ask_user event: AskPending while it
+	// waits for an answer, then one of tool.AnswerAnswered, tool.AnswerTimeout or
+	// tool.AnswerCancelled.
+	AskStatus string `json:"ask_status,omitempty"`
+	// AskAnswer is what the person submitted, set when AskStatus is answered. A
+	// timeout or a cancellation carries the status alone: there is no answer to
+	// report, and inventing an empty one would be indistinguishable from "the
+	// user submitted nothing".
+	AskAnswer *tool.Answer `json:"ask_answer,omitempty"`
 	// Error is set on error events.
 	Error string `json:"error,omitempty"`
+	// Reason is set on budget_stop: "steps", "tokens" or "deadline".
+	Reason string `json:"reason,omitempty"`
+	// Tokens is what the turn has spent so far, set on budget_stop and
+	// context_compressed.
+	Tokens int `json:"tokens,omitempty"`
+	// ElapsedMs is how long the turn has been running, set on budget_stop.
+	ElapsedMs int64 `json:"elapsed_ms,omitempty"`
 	// MessageID is the persisted assistant message id, set on done.
 	MessageID string `json:"message_id,omitempty"`
 }
@@ -105,6 +148,22 @@ type Result struct {
 	Usage Usage
 	// Tools lists the tool invocations that ran, in order.
 	Tools []ToolRun
+	// TraceID identifies the trace recorded for this turn; empty when tracing
+	// is off. The caller persists it with the answer, because it is what lets a
+	// conversation link to the trace that explains it — and the runner is the
+	// only place that ever knows it.
+	TraceID string
+	// StopReason is why the loop ended when the model did not answer: StopSteps,
+	// StopTokens or StopDeadline. Empty means the model produced its own answer,
+	// which is the only case where Text is complete by construction.
+	StopReason string
+}
+
+// BudgetExhausted reports whether the turn ended on a budget rather than on the
+// model's own answer. Callers use it to render a notice, and to decide whether
+// offering "continue" makes sense.
+func (r *Result) BudgetExhausted() bool {
+	return r != nil && r.StopReason != ""
 }
 
 // Emitter receives events as the run progresses. It must not block for long:

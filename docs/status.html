@@ -218,7 +218,7 @@
     <h2><span class="ico">📊</span>关键指标</h2>
     <p class="sec-note">数据来自当前仓库实测（<code>go test -cover</code>）。</p>
     <div class="stats">
-      <div class="stat g"><div class="n">7.5</div><div class="k">已完成阶段</div></div>
+      <div class="stat g"><div class="n">8.5</div><div class="k">已完成阶段</div></div>
       <div class="stat b"><div class="n">86.7%</div><div class="k">平均测试覆盖率</div></div>
       <div class="stat c"><div class="n">13</div><div class="k">internal 包</div></div>
       <div class="stat p"><div class="n">6,662</div><div class="k">业务代码行数</div></div>
@@ -369,6 +369,44 @@
         </div>
       </div>
 
+      <div class="phase done">
+        <div class="phase-head">
+          <span class="phase-title">Phase 9 · 工作区</span>
+          <span class="phase-tag tag-done">完成</span>
+        </div>
+        <div class="phase-desc">
+          工作区 = 一个本机目录（控制台选目录创建），每个会话都属于一个，侧边栏按工作区
+          分组并可直接重命名 / 删除；飞书可用命令或自然语言切换；附件按工作区归属，审计记录
+          工作区。<code>openspec/changes/phase-9-workspaces</code>。
+        </div>
+        <div class="phase-meta">
+          <span class="mini ok">workspaces 81%</span>
+          <span class="mini ok">store 84%</span>
+          <span class="mini ok">端到端已验证</span>
+          <span class="mini">未归档</span>
+        </div>
+      </div>
+
+      <div class="phase done">
+        <div class="phase-head">
+          <span class="phase-title">Phase 10 · 后台进程</span>
+          <span class="phase-tag tag-done">完成</span>
+        </div>
+        <div class="phase-desc">
+          <code>bash</code> 仍然「调用结束不留残留」；常驻进程改成显式的四个工具：
+          <code>bash_background</code> / <code>bash_jobs</code> / <code>bash_output</code> /
+          <code>bash_stop</code>。dev server、<code>--watch</code>、常驻 API / 数据库都能跑，
+          输出按字节偏移跟读、日志落盘封顶，进程组跟随 agent 退出统一收敛。
+          <code>openspec/changes/phase-10-background-jobs</code>。
+        </div>
+        <div class="phase-meta">
+          <span class="mini ok">jobs 84%</span>
+          <span class="mini ok">builtin 覆盖新增工具</span>
+          <span class="mini ok">控制台 /api/jobs</span>
+          <span class="mini">未归档</span>
+        </div>
+      </div>
+
     </div>
   </section>
 
@@ -431,6 +469,32 @@
           <li>多飞书应用 + <code>active</code> 选择</li>
           <li>回调 token 鉴权 + <code>/healthz</code></li>
           <li>斜杠命令 /help /reset /remember …</li>
+        </ul>
+      </div>
+
+      <div class="cap">
+        <h3><span class="dot a"></span>工作区</h3>
+        <ul>
+          <li>工作区 = 一个已存在的本机目录，控制台里浏览并选中</li>
+          <li>每个会话都属于一个；侧边栏按工作区分组（文件夹）</li>
+          <li>文件夹头可直接新建会话 / 重命名 / 删除</li>
+          <li>删除不删文件，会话自动迁移到另一个工作区</li>
+          <li>按会话切换（网页会话 / 飞书 <code>open_id</code> 各自独立）</li>
+          <li>附件按工作区归属读取；审计记录工作区</li>
+          <li>飞书支持 <code>/workspace</code> 与自然语言切换</li>
+        </ul>
+      </div>
+
+      <div class="cap">
+        <h3><span class="dot g"></span>后台进程</h3>
+        <ul>
+          <li><code>bash_background</code>：起常驻进程（dev server / watch / 常驻服务）</li>
+          <li>独立会话 + 独立进程组，agent 的信号不会误杀它</li>
+          <li>「运行中」以进程组探活为准（fork 出去的 server 也算在跑）</li>
+          <li>输出一个有界内存窗口 + 封顶日志文件，按字节偏移续读</li>
+          <li><code>bash_stop</code> 杀整个进程组：SIGTERM → 宽限 → SIGKILL</li>
+          <li>agent 退出时统一收敛，不留孤儿进程</li>
+          <li>设置 → 后台进程：看状态、跟日志、停止、删记录</li>
         </ul>
       </div>
 

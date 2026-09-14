@@ -64,6 +64,20 @@ feishu:
   # Legacy single-app alternative to `apps` + `active`:
   # app_id: "cli_xxxxxxxx"
   # app_secret: "xxxxxxxx"
+
+  # Give the bot the file, search and command tools, confined to the workspace
+  # the sender has selected. On by default.
+  #
+  # Anyone who can message the bot can then read, write and execute inside a
+  # workspace — and `bash` can still reach absolute paths elsewhere on the
+  # machine. Turn it off to keep the bot conversational, or set
+  # tools.read_only to make every workspace read-only.
+  #
+  # With tools.enable_background (also the default) that includes starting
+  # long-lived processes: a dev server, a watcher, a resident service. They live
+  # until the bot process exits, and tools.enable_background: false withholds
+  # those four tools without taking `bash` away.
+  enable_tools: true
 ```
 
 Secrets can also come from environment (Viper prefix `HUAN`, path separator
@@ -150,6 +164,54 @@ Supported in-chat commands (plain text only):
 - `/remember <key>: <value>` → persist a fact (memory).
 - `/recall <query>` → search stored facts.
 - `/provider` → show the active model.
+- `/workspace` → which workspace this chat is working in.
+- `/workspaces` → list the workspaces that can be switched to.
+- `/workspace <name>` → work in that workspace from the next message on.
+
+### Workspaces
+
+With `feishu.enable_tools: true` the bot can read and write files and run
+commands — inside one workspace, chosen per sender. A **workspace** is a local
+directory (see `docs/tools.md` → Workspaces): you create them in the console's
+left sidebar by picking a directory, and on Feishu you list and switch between
+them.
+
+You can switch by asking, in plain language:
+
+```
+切换到 blog-site 工作区
+切到 blog
+用 电商项目 工作区
+有哪些工作区
+我现在在哪个工作区
+```
+
+The forms that work are deliberately narrow. A message is read as a switch only
+when it is a short, verb-first request that names a workspace (or after you say
+the word 工作区 explicitly); "在工作区里建个 hello.go" and "用 Python 写个脚本"
+are ordinary requests and are answered as such. `/workspace <name>` is always
+unambiguous, so it is the one to use when in doubt.
+
+Every switch is confirmed with the name it moved to and the directory it
+resolves to, and every answer that used tools ends with a small footer naming
+them and the workspace:
+
+```
+🛠 工具 2 次（read_file、bash） · 工作区 `blog-site`
+```
+
+Notes:
+
+- The choice is per **sender** (`open_id`), so in a group everyone keeps their
+  own workspace and one person switching does not move anybody else.
+- A name that matches several workspaces is never guessed; the bot asks which
+  one you meant. A name that matches nothing gets the list instead.
+- The workspace list and the switch confirmations include local directory paths.
+  Turn the feature off if the bot is reachable by people who should not see them.
+- Workspaces can only be *created* from the console (the directory has to be
+  picked); on Feishu you can list, switch and see the current one.
+- The bot starts in the workspace the server seeded from `tools.workspace`, and
+  each sender's own choice is remembered from then on.
 
 Replies with markdown (code blocks, lists) are sent as interactive cards so they
 render properly. While the model is generating you will see a

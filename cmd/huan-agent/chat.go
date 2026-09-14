@@ -22,6 +22,7 @@ import (
 
 	"github.com/huan/huan-agent/internal/agent"
 	"github.com/huan/huan-agent/internal/config"
+	"github.com/huan/huan-agent/internal/jobs"
 	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/mcp"
 	"github.com/huan/huan-agent/internal/media"
@@ -31,6 +32,7 @@ import (
 	"github.com/huan/huan-agent/internal/tool"
 	"github.com/huan/huan-agent/internal/tool/builtin"
 	"github.com/huan/huan-agent/internal/usage"
+	"github.com/huan/huan-agent/internal/viking"
 	"github.com/huan/huan-agent/internal/workspace"
 )
 
@@ -181,7 +183,28 @@ func runChat(cmd *cobra.Command, _ []string) error {
 	if chosenSkill != nil {
 		systemPrompt = chosenSkill.SystemPrompt()
 	}
-	mem, err := newSessionMemory(cfg, cm, systemPrompt, sessionID, logger)
+	// OpenViking (memory mirror + document sync), when configured.
+	vikingSvc, err := newVikingService(cfg, logger)
+	if err != nil {
+		return err
+	}
+	if vikingSvc != nil {
+		// Deferred after Close so it runs before it: the workspace is published
+		// first, then buffered memory is flushed.
+		defer vikingSvc.Close()
+		if cfg.OpenViking.Documents.SyncOnExit {
+			defer syncWorkspaceOnExit(vikingSvc, logger)
+		}
+	}
+	// Long-term memory is process-scoped: with OpenViking enabled it is the
+	// mirror, whose batching spans sessions.
+	memStore, closeMemory, err := buildMemoryStore(cfg, vikingSvc, logger)
+	if err != nil {
+		return err
+	}
+	defer closeMemory()
+
+	mem, err := newSessionMemory(cfg, cm, systemPrompt, sessionID, logger, memStore)
 	if err != nil {
 		return fmt.Errorf("init memory: %w", err)
 	}
@@ -191,6 +214,15 @@ func runChat(cmd *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Background processes. One supervisor per process, closed when the REPL
+	// exits: a dev server started in a session is meant to outlive the tool call
+	// that started it, not the agent that supervises it.
+	jobMgr, jobErr := newJobManager(cfg, logger)
+	if jobErr != nil {
+		logger.Warn("background jobs disabled", zap.Error(jobErr))
+	}
+	defer jobMgr.Close()
+
 	// Build the agent if tools are enabled. Tool registry + MCP clients live
 	// for the duration of the REPL.
 	var (
@@ -199,7 +231,7 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		mcpClients []*mcp.Client
 	)
 	if chatTools {
-		ag, toolReg, mcpClients, err = buildAgent(ctx, cm, cfg, chosenSkill, st, logger, sessionID)
+		ag, toolReg, mcpClients, err = buildAgent(ctx, cm, cfg, chosenSkill, st, logger, sessionID, vikingSvc, jobMgr)
 		if err != nil {
 			return fmt.Errorf("build agent: %w", err)
 		}
@@ -320,6 +352,8 @@ func buildAgent(
 	st store.Store,
 	logger *zap.Logger,
 	sessionID string,
+	svc *viking.Service,
+	jobMgr *jobs.Manager,
 ) (*agent.Agent, *tool.Registry, []*mcp.Client, error) {
 	tcm, ok := cm.(model.ToolCallingChatModel)
 	if !ok {
@@ -327,7 +361,8 @@ func buildAgent(
 	}
 
 	reg := tool.NewRegistry()
-	if err := registerBuiltinTools(reg, cfg, st, logger); err != nil {
+	if err := registerBuiltinTools(reg, cfg, st, logger, svc,
+		toolSetOptions{Jobs: jobMgr, Surface: "cli"}); err != nil {
 		return nil, nil, nil, fmt.Errorf("register builtin tools: %w", err)
 	}
 
@@ -399,7 +434,8 @@ func buildAgent(
 // dangerous: they read, write and execute against a real directory. They are
 // therefore confined by internal/workspace and tagged with a capability so a
 // caller can expose read-only access to a less trusted surface.
-func registerBuiltinTools(reg *tool.Registry, cfg *config.Config, st store.Store, logger *zap.Logger) error {
+func registerBuiltinTools(reg *tool.Registry, cfg *config.Config, st store.Store, logger *zap.Logger,
+	svc *viking.Service, opts toolSetOptions) error {
 	basics := []struct {
 		make func() (tool.Tool, error)
 	}{
@@ -416,92 +452,42 @@ func registerBuiltinTools(reg *tool.Registry, cfg *config.Config, st store.Store
 			return err
 		}
 	}
-	return registerWorkspaceTools(reg, cfg, st, logger)
+	// ask_user is the web console's interactive card: it parks the turn until the
+	// person answers. It is registered for the web surface only, because a surface
+	// with nowhere to render the card (Feishu, the CLI REPL) would otherwise be
+	// offered a tool whose every call can only fail — and a refused call is a
+	// worse answer than a tool that was never on the menu.
+	if opts.Surface == "web" {
+		t, err := builtin.NewAskUserTool()
+		if err != nil {
+			return fmt.Errorf("build ask_user tool: %w", err)
+		}
+		// CapRead: asking reads nothing and changes nothing.
+		if err := reg.Register(tool.WithCapability(t, tool.CapRead)); err != nil {
+			return err
+		}
+	}
+	if err := registerDocumentTool(reg, cfg, svc); err != nil {
+		return err
+	}
+	return registerWorkspaceTools(reg, cfg, st, logger, opts)
 }
 
-// registerWorkspaceTools adds the filesystem and command tools, confined to
-// the configured workspace. A missing workspace root only disables these
-// tools; the agent still chats.
-func registerWorkspaceTools(reg *tool.Registry, cfg *config.Config, st store.Store, logger *zap.Logger) error {
-	root, ok := cfg.Tools.WorkspaceOrDefault()
-	if !ok {
+// registerDocumentTool exposes save_document when the OpenViking document store
+// is configured. Without it the tool is not registered at all: a tool the model
+// can see but that cannot work is worse than no tool, because it will be called.
+func registerDocumentTool(reg *tool.Registry, cfg *config.Config, svc *viking.Service) error {
+	if svc == nil || !cfg.OpenViking.Documents.Enable || svc.Documents() == nil {
 		return nil
 	}
-	maxRead, maxWrite, maxList := cfg.Tools.Limits()
-	ws, err := workspace.New(root, workspace.Options{
-		ReadOnly: cfg.Tools.ReadOnly,
-		Limits: workspace.Limits{
-			MaxReadBytes:   maxRead,
-			MaxWriteBytes:  maxWrite,
-			MaxListEntries: maxList,
-		},
-	})
+	t, err := builtin.NewSaveDocumentTool(svc)
 	if err != nil {
-		return fmt.Errorf("init workspace: %w", err)
+		return fmt.Errorf("build save_document tool: %w", err)
 	}
-
-	// The media tools read files from and write images into the same
-	// workspace, and this is the one place it is built, so they are registered
-	// from here. A caller without a workspace gets no media tools at all: an
-	// unconfined media tool is worse than a missing one.
-	registerMediaTools(reg, cfg, st, ws, logger)
-
-	// Reads and searches.
-	readers := []struct {
-		name string
-		make func(*workspace.Workspace) (einotool.InvokableTool, error)
-	}{
-		{"read_file", builtin.NewReadFileTool},
-		{"list_dir", builtin.NewListDirTool},
-		{"glob", builtin.NewGlobTool},
-		{"grep", builtin.NewGrepTool},
-	}
-	for _, r := range readers {
-		t, merr := r.make(ws)
-		if merr != nil {
-			return fmt.Errorf("build %s tool: %w", r.name, merr)
-		}
-		if err := reg.Register(tool.WithCapability(t, tool.CapRead)); err != nil {
-			return fmt.Errorf("register %s: %w", r.name, err)
-		}
-	}
-
-	// Writes and execution are withheld entirely in a read-only workspace, so
-	// the model cannot even see tools it is not allowed to use.
-	if cfg.Tools.ReadOnly {
-		return nil
-	}
-
-	writers := []struct {
-		name string
-		make func(*workspace.Workspace) (einotool.InvokableTool, error)
-	}{
-		{"write_file", builtin.NewWriteFileTool},
-		{"edit_file", builtin.NewEditFileTool},
-	}
-	for _, w := range writers {
-		t, merr := w.make(ws)
-		if merr != nil {
-			return fmt.Errorf("build %s tool: %w", w.name, merr)
-		}
-		if err := reg.Register(tool.WithCapability(t, tool.CapWrite)); err != nil {
-			return fmt.Errorf("register %s: %w", w.name, err)
-		}
-	}
-
-	if !cfg.Tools.EnableBash {
-		return nil
-	}
-	bashTool, berr := builtin.NewBashTool(ws, builtin.BashPolicy{
-		Enabled:      true,
-		Timeout:      cfg.Tools.BashTimeout(),
-		DenyPatterns: cfg.Tools.DenyOrDefault(),
-	})
-	if berr != nil {
-		return fmt.Errorf("build bash tool: %w", berr)
-	}
-	if err := reg.Register(tool.WithCapability(bashTool, tool.CapExec)); err != nil {
-		return fmt.Errorf("register bash: %w", err)
+	// CapRead: saving a document reads nothing and runs nothing. It is a write
+	// to the agent's own document store, not to the workspace.
+	if err := reg.Register(tool.WithCapability(t, tool.CapRead)); err != nil {
+		return fmt.Errorf("register save_document: %w", err)
 	}
 	return nil
 }
@@ -525,85 +511,6 @@ var mediaToolCandidates = []mediaToolCandidate{
 	// generate_image writes a file, so it is a write tool and is withheld from
 	// a read-only workspace.
 	{name: "generate_image", capability: store.CapImageGen, access: tool.CapWrite, build: builtin.NewGenerateImageTool},
-}
-
-// registerMediaTools adds the image and audio tools whose capability is bound
-// to a model the operator configured.
-//
-// This is the whole of the "must not be registered at all" contract. A tool is
-// built only when media.Resolver finds an enabled provider and model for its
-// capability, so a deployment with no vision model bound never lets the chat
-// model learn that describe_image exists, and it cannot spend a turn calling
-// something that cannot work. When nothing is bound the tool is skipped with an
-// informational log naming the capability that is missing, and the agent still
-// chats: a fresh install with no providers registers nothing here and starts
-// normally.
-//
-// It reports nothing and returns nothing. Every failure is logged and skipped
-// rather than propagated, because a half-configured catalog must not stop the
-// server or the REPL from starting.
-//
-// Every surface that builds its tools through registerBuiltinTools gets these,
-// which today is the CLI and the web chat. The Feishu bot answers with a plain
-// chat model and builds no tool registry at all, so there is nothing for it to
-// register into; this function stays the single place a media tool is added.
-func registerMediaTools(reg *tool.Registry, cfg *config.Config, st store.Store, ws *workspace.Workspace, logger *zap.Logger) {
-	if reg == nil || logger == nil {
-		return
-	}
-	// The media tools read and write files, so they need the workspace the file
-	// tools were built with. Without one they are not registered at all rather
-	// than registered against an unconfined path.
-	if ws == nil {
-		logger.Info("media tools skipped: no workspace configured",
-			zap.Strings("tools", mediaToolNames()))
-		return
-	}
-	if st == nil {
-		logger.Info("media tools skipped: no model catalog configured",
-			zap.Strings("tools", mediaToolNames()))
-		return
-	}
-
-	// The resolver is the seam between the catalog and the tools: everything
-	// below depends on the interface, so a test (or another catalog) can
-	// substitute one.
-	var resolver media.Resolver = media.NewResolver(st, os.Getenv)
-	// Resolution reads local catalog rows at start-up; there is no request to
-	// carry a deadline from, and it must not be cancelled by one that ends.
-	ctx := context.Background()
-
-	for _, c := range mediaToolCandidates {
-		// generate_image writes into the workspace, so a read-only workspace
-		// withholds it entirely — the same rule the file tools follow.
-		if c.access == tool.CapWrite && cfg.Tools.ReadOnly {
-			logger.Info("media tool skipped: workspace is read-only",
-				zap.String("tool", c.name), zap.String("capability", string(c.capability)))
-			continue
-		}
-		target, ok := resolver.For(ctx, c.capability)
-		if !ok {
-			logger.Info("media tool skipped: capability is bound to no usable model",
-				zap.String("tool", c.name), zap.String("capability", string(c.capability)))
-			continue
-		}
-		t, err := c.build(ws, target)
-		if err != nil {
-			logger.Warn("media tool unavailable",
-				zap.String("tool", c.name), zap.String("capability", string(c.capability)), zap.Error(err))
-			continue
-		}
-		if err := reg.Register(tool.WithCapability(t, c.access)); err != nil {
-			logger.Warn("media tool not registered", zap.String("tool", c.name), zap.Error(err))
-			continue
-		}
-		logger.Info("media tool registered",
-			zap.String("tool", c.name),
-			zap.String("capability", string(c.capability)),
-			zap.String("provider", target.ProviderID),
-			zap.String("model", target.ModelID),
-		)
-	}
 }
 
 // mediaToolNames lists the media tools, for the log line that explains what was

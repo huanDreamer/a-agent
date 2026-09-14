@@ -260,3 +260,115 @@ func (s *schemaTool) Info(context.Context) (*schema.ToolInfo, error) {
 func (s *schemaTool) InvokableRun(context.Context, string, ...einotool.Option) (string, error) {
 	return "", nil
 }
+
+// TestRegistry_CloneIsIndependent: a clone is the seam a workspace-bound turn
+// uses, so mutating it must not be visible to anyone else, and it must carry
+// what was registered at runtime (an MCP server's tools) rather than a snapshot
+// taken at start-up.
+func TestRegistry_CloneIsIndependent(t *testing.T) {
+	base := NewRegistry()
+	if err := base.Register(newStub("read_file", "read", nil)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	clone := base.Clone()
+	// A clone must contain whatever the registry holds at the moment it is
+	// taken — an MCP server that registered after start-up included — which is
+	// why a workspace-bound clone is built per turn rather than cached.
+	if err := base.Register(newStub("mcp_find", "mcp", nil)); err != nil {
+		t.Fatalf("register mcp: %v", err)
+	}
+	later := base.Clone()
+	if _, ok := later.Get("mcp_find"); !ok {
+		t.Error("a clone taken after a runtime registration is missing it")
+	}
+	if _, ok := clone.Get("mcp_find"); ok {
+		t.Error("an earlier clone picked up a later registration")
+	}
+	if _, ok := clone.Get("read_file"); !ok {
+		t.Error("clone is missing read_file")
+	}
+
+	// Replacing in the clone must leave the base alone.
+	if err := clone.Replace(newStub("read_file", "replaced", nil)); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	if err := clone.Register(newStub("only_here", "x", nil)); err != nil {
+		t.Fatalf("register in clone: %v", err)
+	}
+	if got, _ := base.Get("read_file"); got == nil {
+		t.Fatal("base lost read_file")
+	} else if info, _ := got.Info(context.Background()); info.Desc != "read" {
+		t.Errorf("base read_file was modified through the clone: %q", info.Desc)
+	}
+	if _, ok := base.Get("only_here"); ok {
+		t.Error("a tool registered in the clone appeared in the base")
+	}
+
+	// Unregistering from the base must not affect an existing clone.
+	base.Unregister("read_file")
+	if _, ok := clone.Get("read_file"); !ok {
+		t.Error("unregistering from the base removed the tool from a clone")
+	}
+}
+
+// TestRegistry_CloneNil: a nil registry is a legitimate state (no tools), and
+// cloning it must yield an empty registry rather than a panic.
+func TestRegistry_CloneNil(t *testing.T) {
+	var r *Registry
+	c := r.Clone()
+	if c == nil {
+		t.Fatal("Clone of nil returned nil")
+	}
+	if len(c.Names()) != 0 {
+		t.Errorf("clone of nil is not empty: %v", c.Names())
+	}
+}
+
+// TestRegistry_ReplaceKeepsAllowList: replacing an implementation must never
+// widen what the model may call. A name the allow-list excluded stays excluded.
+func TestRegistry_ReplaceKeepsAllowList(t *testing.T) {
+	r := NewRegistry()
+	for _, n := range []string{"a", "b"} {
+		if err := r.Register(newStub(n, "x", nil)); err != nil {
+			t.Fatalf("register %s: %v", n, err)
+		}
+	}
+	if err := r.SetAllowList([]string{"a"}); err != nil {
+		t.Fatalf("SetAllowList: %v", err)
+	}
+
+	if err := r.Replace(newStub("a", "replaced", nil)); err != nil {
+		t.Fatalf("replace allowed: %v", err)
+	}
+	if err := r.Replace(newStub("b", "replaced", nil)); err != nil {
+		t.Fatalf("replace disallowed: %v", err)
+	}
+	if !r.IsAllowed("a") {
+		t.Error("replacing an allowed tool removed it from the allow-list")
+	}
+	if r.IsAllowed("b") {
+		t.Error("replacing a disallowed tool added it to the allow-list")
+	}
+
+	// A name that never existed joins "allow all" but not an explicit list.
+	fresh := NewRegistry()
+	if err := fresh.Replace(newStub("new", "x", nil)); err != nil {
+		t.Fatalf("replace into empty registry: %v", err)
+	}
+	if !fresh.IsAllowed("new") {
+		t.Error("a tool replaced into an allow-all registry is not permitted")
+	}
+}
+
+// TestRegistry_ReplaceValidates: the name comes from the tool itself, so a
+// factory cannot register under a different name than the tool it replaced.
+func TestRegistry_ReplaceValidates(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Replace(nil); err == nil {
+		t.Error("Replace(nil) should fail")
+	}
+	if err := r.Replace(newStub("", "no name", nil)); err == nil {
+		t.Error("Replace of a nameless tool should fail")
+	}
+}

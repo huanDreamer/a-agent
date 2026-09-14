@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/huan/huan-agent/internal/usage"
+	"github.com/huan/huan-agent/internal/viking"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/config"
+	"github.com/huan/huan-agent/internal/jobs"
 	"github.com/huan/huan-agent/internal/langfuse"
 	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/metrics"
@@ -27,9 +29,15 @@ import (
 	"github.com/huan/huan-agent/internal/server"
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/tool"
+	"github.com/huan/huan-agent/internal/tracing"
 	"github.com/huan/huan-agent/internal/version"
 	"github.com/huan/huan-agent/internal/workspace"
+	"github.com/huan/huan-agent/internal/workspaces"
 )
+
+// The built-in recorder is both halves of the seam: the conversation reports to
+// it, and the console reads traces back from it.
+var _ server.TraceReader = (*tracing.Recorder)(nil)
 
 // buildChatDeps assembles the web-chat wiring: the tool set, a runner bound to
 // the default model, and the model builder that resolves a per-session choice.
@@ -43,8 +51,9 @@ import (
 // It also returns the resolved default (provider, model) so /api/meta reports the
 // target the chat actually uses — which is not necessarily the one named in the
 // config file, because the default may come from the database.
-func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
-	rec *usage.Recorder, logger *zap.Logger) (server.ChatDeps, string, string) {
+func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
+	rec *usage.Recorder, logger *zap.Logger, vikingSvc *viking.Service,
+	jobMgr *jobs.Manager) (server.ChatDeps, string, string) {
 
 	if !cfg.Chat.Enable {
 		logger.Info("web chat disabled (chat.enable = false)")
@@ -90,8 +99,47 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 
 	// Tools are shared with the chat REPL so the web UI can do what the CLI can.
 	registry := tool.NewRegistry()
-	if err := registerBuiltinTools(registry, cfg, st, logger); err != nil {
+	if err := registerBuiltinTools(registry, cfg, st, logger, vikingSvc,
+		toolSetOptions{Jobs: jobMgr, Surface: "web"}); err != nil {
 		logger.Warn("web chat: builtin tools unavailable", zap.Error(err))
+	}
+
+	// The workspace layer: what turns "the one directory the agent may touch"
+	// into a set of named ones, each conversation remembering its own. Built
+	// after the registry because it derives a per-turn registry from it — the
+	// clone carries the MCP and skill tools that register into this one at
+	// runtime, which is why the base has to be the same object.
+	//
+	// A failure here disables 设置 → 工作区 and the per-conversation switcher but
+	// not the chat: a conversation then runs in whatever single workspace the
+	// config names, which is how the product behaved before this existed.
+	var bindings *workspaceBindings
+	var wsManager *workspaces.Manager
+	if mgr, err := newWorkspaceManager(cfg, st, logger); err != nil {
+		logger.Warn("web chat: workspace layer disabled", zap.Error(err))
+	} else {
+		wsManager = mgr
+		bindings = &workspaceBindings{
+			logger: logger,
+			mgr:    mgr,
+			set:    newWorkspaceToolSet(cfg, st, logger, toolSetOptions{Jobs: jobMgr, Surface: "web"}),
+			base:   registry,
+		}
+		// Seed before serving: it registers the configured directory when nothing
+		// is registered yet and binds any conversation that has no workspace, so
+		// "every conversation belongs to a workspace" holds from the first request.
+		seedCtx, cancelSeed := context.WithTimeout(context.Background(), 10*time.Second)
+		seed, seedErr := mgr.EnsureSeed(seedCtx)
+		cancelSeed()
+		if seedErr != nil {
+			logger.Warn("web chat: workspace seed failed", zap.Error(seedErr))
+		} else {
+			logger.Info("workspaces ready",
+				zap.String("default_workspace", seed.Name),
+				zap.String("root", seed.Root),
+				zap.Int("tools", len(registry.Names())),
+			)
+		}
 	}
 
 	maxSteps := cfg.Chat.MaxSteps
@@ -103,12 +151,21 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 		logger.Warn("web chat disabled: the default model is not a chat model")
 		return server.ChatDeps{}, "", ""
 	}
+	condenser, err := turnCondenser(cfg, chatModel, logger)
+	if err != nil {
+		// Not fatal: a turn with an unbounded window still works, it just costs
+		// more the longer it runs.
+		logger.Warn("web chat: in-turn context compression disabled", zap.Error(err))
+	}
 	runner, err := chat.New(chat.Config{
-		Model:    chatModel,
-		Tools:    registry,
-		Tracer:   tracer,
-		MaxSteps: maxSteps,
-		Logger:   logger,
+		Model:     chatModel,
+		Tools:     registry,
+		Tracer:    tracer,
+		MaxSteps:  maxSteps,
+		MaxTokens: cfg.Chat.TurnMaxTokens,
+		Deadline:  cfg.Chat.TurnDeadline(),
+		Condenser: condenser,
+		Logger:    logger,
 	})
 	if err != nil {
 		logger.Warn("web chat disabled: cannot build the runner", zap.Error(err))
@@ -120,17 +177,26 @@ func buildChatDeps(cfg *config.Config, tracer *langfuse.Tracer, st store.Store,
 		zap.String("model", defModel),
 		zap.Int("tools", len(registry.Names())),
 		zap.Int("max_steps", maxSteps),
+		zap.Int("turn_max_tokens", cfg.Chat.TurnMaxTokens),
+		zap.Duration("turn_deadline", cfg.Chat.TurnDeadline()),
+		zap.Bool("in_turn_compression", condenser != nil),
+		zap.Duration("ask_user_timeout", cfg.Chat.AskUserTimeout()),
 	)
 	return server.ChatDeps{
 		Runner:       runner,
 		Builder:      builder,
 		Tools:        registry,
+		ToolsFor:     func(ctx context.Context) (*tool.Registry, error) { return bindings.forScope(ctx) },
+		Workspaces:   wsManager,
+		Condenser:    condenser,
 		SystemPrompt: cfg.Chat.SystemPrompt,
 		// The same confinement the file tools use, so an uploaded attachment
 		// lands somewhere the agent can read it and the workspace's
 		// read-only mode and write limit apply to uploads too.
 		Workspace: chatWorkspace(cfg, logger),
 		Usage:     usageSink{rec: rec},
+		// How long an ask_user card waits for an answer.
+		AskTimeout: cfg.Chat.AskUserTimeout(),
 	}, defProvider, defModel
 }
 
@@ -278,7 +344,21 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	} else if cfg.Langfuse.Enable {
 		logger.Warn("langfuse.enable is set but the host or API keys are missing; tracing stays off")
 	}
-	tracer := langfuse.NewTracer(lf)
+	// Tracing is built into the product: turns are recorded in the same SQLite
+	// file as the conversations they belong to, so the 链路追踪 panel works on a
+	// fresh install with no external service, no network and no account.
+	//
+	// A configured Langfuse still receives the same turns, as a mirror rather
+	// than the source of truth. The local recorder is first in the fan-out so it
+	// mints the ids every backend then shares.
+	rec := tracing.NewRecorder(st, logger)
+	// A nil *langfuse.Client is inert, so an unconfigured mirror costs nothing.
+	mirror := langfuse.NewTracer(lf)
+	tracer := tracing.Multi{rec, mirror}
+	if rec.Enabled() {
+		logger.Info("trace store enabled", zap.String("database", cfg.Database.Path),
+			zap.Bool("langfuse_mirror", mirror.Enabled()))
+	}
 
 	// Seed the LLM catalog from the config file, so providers declared there
 	// appear in the console's model management alongside any added at runtime.
@@ -286,6 +366,16 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	// but chat still works from the config, and failing to start would be worse.
 	if err := llm.SyncConfigProviders(cmd.Context(), st, cfg.LLM.Providers, cfg.LLM.DefaultProvider); err != nil {
 		logger.Warn("sync config providers failed", zap.Error(err))
+	}
+
+	// Mirror mcp.servers into the store for the same reason: 设置 → MCP lists
+	// what the process will connect, and a config-declared server must be
+	// visible (and toggleable) there. A row is re-applied from the file at every
+	// start, which is why the API refuses to edit one beyond its enabled flag.
+	if n, err := server.SyncConfigServers(cmd.Context(), st, cfg.MCP.Servers, logger); err != nil {
+		logger.Warn("sync config mcp servers failed", zap.Error(err))
+	} else if n > 0 {
+		logger.Info("config mcp servers synced", zap.Int("servers", n))
 	}
 
 	// Usage accounting for web-chat turns. Without it the analytics count only
@@ -298,8 +388,34 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 		_ = recorder.Close(closeCtx)
 	}()
 
+	// OpenViking (context database). A failure to build it is fatal: an
+	// operator who configured it wants to hear about a bad URL at startup
+	// rather than discover later that memory only ever landed locally.
+	vikingSvc, err := newVikingService(cfg, logger)
+	if err != nil {
+		return err
+	}
+	if vikingSvc != nil {
+		defer vikingSvc.Close()
+		if !cfg.OpenViking.MCP.Register {
+			logger.Warn("openviking.mcp.register is false: the model will not get OpenViking's own tools " +
+				"(the memory mirror and document sync still run)")
+		}
+	}
+
+	// Background processes. A failure here is not fatal — the agent keeps working
+	// with the background tools withheld — because a deployment that cannot write
+	// a log directory should still be able to answer a question.
+	jobMgr, jobErr := newJobManager(cfg, logger)
+	if jobErr != nil {
+		logger.Warn("background jobs disabled", zap.Error(jobErr))
+	}
+	// Jobs are terminated when this process exits: nothing is left running with
+	// no one tracking it.
+	defer jobMgr.Close()
+
 	// The chat feature needs a model builder and a tool set.
-	chatDeps, chatProvider, chatModel := buildChatDeps(cfg, tracer, st, recorder, logger)
+	chatDeps, chatProvider, chatModel := buildChatDeps(cfg, tracer, st, recorder, logger, vikingSvc, jobMgr)
 
 	// /api/meta reports where a conversation actually runs. The config file is
 	// the answer when it names a provider; otherwise it is the model the catalog
@@ -323,11 +439,15 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 		SkillsDir:        cfg.Skills.Dir,
 		StatePath:        server.StatePathFor(cfg.Database.Path),
 		ChatMaxSteps:     cfg.Chat.MaxSteps,
+		ChatMaxTokens:    cfg.Chat.TurnMaxTokens,
+		ChatTurnDeadline: cfg.Chat.TurnDeadline(),
 		ChatHistoryLimit: cfg.Chat.HistoryLimitOr(),
 		ChatEnable:       cfg.Chat.Enable,
 		Chat:             chatDeps,
+		Jobs:             jobMgr,
+		OpenViking:       vikingConsole(vikingSvc),
 		Tracer:           tracer,
-		Traces:           tracer,
+		Traces:           rec,
 		Logger:           logger,
 	}, st, pricingTable(cfg), cfg.Admin)
 	if err != nil {
@@ -366,6 +486,26 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	} else {
 		logger.Info("model auto-refresh disabled (llm.auto_refresh_models = false)")
 	}
+
+	// Connect the configured MCP servers in the background. Spawning a stdio
+	// server or dialing a remote one takes as long as it takes, and startup must
+	// not wait for it; a server that is not ready when the console opens simply
+	// shows as 未连接 with its error, and 重连 retries it.
+	go func() {
+		status := srv.SyncMCP(ctx)
+		connected, failed := 0, 0
+		for _, st := range status {
+			if st.Connected {
+				connected++
+				continue
+			}
+			failed++
+		}
+		if len(status) > 0 {
+			logger.Info("mcp servers synced",
+				zap.Int("connected", connected), zap.Int("failed", failed))
+		}
+	}()
 
 	logger.Info("admin server starting",
 		zap.String("addr", srv.Addr()),

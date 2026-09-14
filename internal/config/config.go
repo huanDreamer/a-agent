@@ -34,6 +34,9 @@ type Config struct {
 	Langfuse LangfuseConfig `mapstructure:"langfuse" json:"langfuse"`
 	Chat     ChatConfig     `mapstructure:"chat" json:"chat"`
 	Tools    ToolsConfig    `mapstructure:"tools" json:"tools"`
+	// OpenViking is the context database (long-term memory + documents) the
+	// agent mirrors into. Off unless configured; see ApplyOpenVikingMCP.
+	OpenViking OpenVikingConfig `mapstructure:"openviking" json:"openviking"`
 }
 
 // ChatConfig configures the web chat feature.
@@ -41,16 +44,47 @@ type ChatConfig struct {
 	// Enable turns the web chat on. It is off by default because it lets the
 	// admin UI spend LLM tokens.
 	Enable bool `mapstructure:"enable" json:"enable"`
-	// MaxSteps caps tool-calling iterations per turn.
+	// MaxSteps caps tool-calling iterations per turn. 0 uses the runner default
+	// (12). A value above chat.MaxStepsCeiling is refused rather than clamped:
+	// a mistyped 1200 is a configuration error worth seeing once, at startup,
+	// instead of a turn that quietly ran hundreds of steps.
 	MaxSteps int `mapstructure:"max_steps" json:"max_steps"`
+	// TurnMaxTokens caps what one turn may spend, summed from the usage the
+	// provider reports. 0 (the default) means unlimited.
+	//
+	// It is the other half of the step cap: forty steps over long tool output
+	// cost far more than two hundred cheap ones, and a step count cannot tell
+	// them apart.
+	TurnMaxTokens int `mapstructure:"turn_max_tokens" json:"turn_max_tokens"`
+	// TurnDeadlineSeconds bounds one turn's wall-clock time. 0 (the default)
+	// means unlimited.
+	//
+	// It catches the failure neither of the other two can see: a loop that is
+	// neither many steps nor many tokens but slow — a build that never finishes,
+	// a tool waiting out a network timeout.
+	TurnDeadlineSeconds int `mapstructure:"turn_deadline_seconds" json:"turn_deadline_seconds"`
 	// HistoryLimit bounds how many stored messages are replayed to the model.
 	HistoryLimit int `mapstructure:"history_limit" json:"history_limit"`
 	// SystemPrompt overrides the default system prompt.
 	SystemPrompt string `mapstructure:"system_prompt" json:"system_prompt"`
+	// AskUserTimeoutSeconds bounds how long the model's ask_user question waits
+	// for an answer in the web console. 0 (the default) uses
+	// DefaultChatAskUserTimeoutSeconds.
+	//
+	// It has to stay well below turn_deadline_seconds: waiting happens *inside*
+	// the turn, so a limit larger than the deadline leaves the model with no
+	// budget left to act on the answer it just received.
+	AskUserTimeoutSeconds int `mapstructure:"ask_user_timeout_seconds" json:"ask_user_timeout_seconds"`
 }
 
 // DefaultChatHistoryLimit bounds the replayed conversation when unset.
 const DefaultChatHistoryLimit = 40
+
+// DefaultChatAskUserTimeoutSeconds is how long an ask_user card waits for an
+// answer when the config does not say. Ten minutes lets someone step away from
+// the desk without losing the turn; a longer default would only park a goroutine
+// for a conversation nobody is watching.
+const DefaultChatAskUserTimeoutSeconds = 600
 
 // HistoryLimitOr returns the configured history limit or the default.
 func (c ChatConfig) HistoryLimitOr() int {
@@ -58,6 +92,24 @@ func (c ChatConfig) HistoryLimitOr() int {
 		return DefaultChatHistoryLimit
 	}
 	return c.HistoryLimit
+}
+
+// TurnDeadline returns the configured per-turn wall-clock budget, or 0 for
+// unlimited.
+func (c ChatConfig) TurnDeadline() time.Duration {
+	if c.TurnDeadlineSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.TurnDeadlineSeconds) * time.Second
+}
+
+// AskUserTimeout returns how long one ask_user question waits for an answer.
+func (c ChatConfig) AskUserTimeout() time.Duration {
+	secs := c.AskUserTimeoutSeconds
+	if secs <= 0 {
+		secs = DefaultChatAskUserTimeoutSeconds
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // DatabaseConfig configures the SQLite database.
@@ -142,6 +194,22 @@ type AdminConfig struct {
 	// start with login disabled on a non-loopback host unless AllowInsecureBind
 	// says otherwise.
 	RequireLogin bool `mapstructure:"require_login" json:"require_login"`
+	// TrustLoopback treats a request that arrives over the loopback interface as
+	// already authenticated, so the password is asked of remote callers and of
+	// nobody on this machine. It does nothing while RequireLogin is false: there
+	// is no password to skip.
+	//
+	// It defaults to TRUE, which is the same judgement RequireLogin's default
+	// makes — the admin API is a single-user console, and a caller already on
+	// this machine is not what the password is for. What it gives up is
+	// protection against other users and processes on the same host.
+	//
+	// The caveat is that "127.0.0.1" is also what a reverse proxy, an SSH tunnel
+	// or a container port-forward looks like from the inside. Those clients are
+	// local as far as the socket is concerned, so they skip the password too; set
+	// this to false when the console is reached through one of them, or
+	// RequireLogin protects nothing but the direct network path.
+	TrustLoopback bool `mapstructure:"trust_loopback" json:"trust_loopback"`
 	// AllowInsecureBind permits a login-free admin on a non-loopback address.
 	// Only set it behind another authenticating layer (a reverse proxy, a VPN,
 	// or an SSH tunnel): on its own it exposes command execution.
@@ -235,14 +303,40 @@ type MCPConfig struct {
 	Servers []MCPServer `mapstructure:"servers" json:"servers"`
 }
 
-// MCPServer describes a single stdio MCP server. Env entries follow
-// the "KEY=value" shape and are merged onto os.Environ() at spawn.
+// MCPServer describes a single MCP server.
+//
+// A stdio server (the default, and what every entry written before the console
+// grew an MCP tab is) spawns Command with Args and Env. An sse or http server
+// dials URL with Headers instead. The entries declared here are mirrored into
+// the database at startup so the console can list them; they are re-synced on
+// every start, which is why their console rows are read-only apart from
+// enabled.
 type MCPServer struct {
-	Name    string   `mapstructure:"name" json:"name"`
-	Command string   `mapstructure:"command" json:"command"`
-	Args    []string `mapstructure:"args" json:"args"`
-	Env     []string `mapstructure:"env" json:"env"`
+	Name string `mapstructure:"name" json:"name"`
+	// Transport is "stdio" (default), "sse" or "http".
+	Transport string   `mapstructure:"transport" json:"transport"`
+	Command   string   `mapstructure:"command" json:"command"`
+	Args      []string `mapstructure:"args" json:"args"`
+	// Env entries follow the "KEY=value" shape and are merged onto
+	// os.Environ() at spawn.
+	Env []string `mapstructure:"env" json:"env"`
+	// URL is the base URL of an sse / http server.
+	URL string `mapstructure:"url" json:"url"`
+	// Headers are "Name: value" lines sent with every request to an sse / http
+	// server, which is where a bearer token goes.
+	Headers []string `mapstructure:"headers" json:"headers"`
+	// Enabled defaults to true when absent. A disabled entry is kept in the
+	// console's list (so it can be turned back on) but never connected.
+	Enabled *bool `mapstructure:"enabled" json:"enabled,omitempty"`
 }
+
+// IsEnabled reports whether the server should be connected, treating an absent
+// flag as enabled: a config entry that says nothing about being off is on,
+// which is what it meant before the flag existed.
+func (m MCPServer) IsEnabled() bool { return m.Enabled == nil || *m.Enabled }
+
+// EnabledValue returns the flag as a plain bool for storage.
+func (m MCPServer) EnabledValue() bool { return m.IsEnabled() }
 
 // ToolsConfig configures the filesystem and command tools that let the agent
 // actually work on a codebase.
@@ -255,7 +349,19 @@ type ToolsConfig struct {
 	// Workspace is the directory the file and command tools are confined to.
 	// Relative paths resolve against the process working directory. Empty
 	// still enables the tools, rooted at the process working directory.
+	//
+	// It is the root of the built-in "default" workspace: the one a scope that
+	// has selected nothing falls back to, which is why an untouched deployment
+	// behaves exactly as it did before named workspaces existed.
 	Workspace string `mapstructure:"workspace" json:"workspace"`
+	// WorkspacesDir is where named workspaces live: a workspace called "blog"
+	// is the directory <WorkspacesDir>/blog. Empty uses a "workspaces"
+	// directory beside the database file (see WorkspacesDirOrDefault).
+	//
+	// It is deliberately separate from Workspace: Workspace points the default
+	// at a project that already exists, while this one is a container the agent
+	// creates directories inside, by name.
+	WorkspacesDir string `mapstructure:"workspaces_dir" json:"workspaces_dir"`
 	// ReadOnly forbids writing files and running commands, leaving the agent
 	// able to read and search but not change anything.
 	ReadOnly bool `mapstructure:"read_only" json:"read_only"`
@@ -263,6 +369,29 @@ type ToolsConfig struct {
 	EnableBash bool `mapstructure:"enable_bash" json:"enable_bash"`
 	// BashTimeoutSeconds bounds one command. 0 uses the tool default (120s).
 	BashTimeoutSeconds int `mapstructure:"bash_timeout_seconds" json:"bash_timeout_seconds"`
+	// BashMaxTimeoutSeconds is the ceiling a single call may raise its own
+	// timeout to with timeout_ms: a long build or test run may ask for more
+	// time, but not for an unbounded amount. 0 uses the default (900s).
+	BashMaxTimeoutSeconds int `mapstructure:"bash_max_timeout_seconds" json:"bash_max_timeout_seconds"`
+	// EnableBackground turns on the background-process tools (bash_background,
+	// bash_jobs, bash_output, bash_stop): dev servers, watch builds, resident
+	// APIs and databases. It only matters with EnableBash on, because starting
+	// one is still running a command.
+	EnableBackground bool `mapstructure:"enable_background" json:"enable_background"`
+	// BackgroundDir is where background job logs are written. Empty puts a
+	// "jobs" directory beside the database file (see JobsDirOrDefault).
+	BackgroundDir string `mapstructure:"background_dir" json:"background_dir"`
+	// BackgroundMaxJobs caps how many background jobs may run at once. 0 uses
+	// the default (8).
+	BackgroundMaxJobs int `mapstructure:"background_max_jobs" json:"background_max_jobs"`
+	// BackgroundLogMaxMB caps one job's log file. 0 uses the default (8 MiB).
+	BackgroundLogMaxMB int `mapstructure:"background_log_max_mb" json:"background_log_max_mb"`
+	// BackgroundWindowKB caps the in-memory tail of one job's output that a
+	// reader is served from. 0 uses the default (256 KiB).
+	BackgroundWindowKB int `mapstructure:"background_window_kb" json:"background_window_kb"`
+	// BackgroundStopGraceSeconds is how long a stopping job gets between SIGTERM
+	// and SIGKILL. 0 uses the default (5s).
+	BackgroundStopGraceSeconds int `mapstructure:"background_stop_grace_seconds" json:"background_stop_grace_seconds"`
 	// MaxReadKB caps one file read. 0 uses the default (512 KiB).
 	MaxReadKB int `mapstructure:"max_read_kb" json:"max_read_kb"`
 	// MaxWriteMB caps one file write. 0 uses the default (4 MiB).
@@ -303,12 +432,99 @@ func (c ToolsConfig) WorkspaceOrDefault() (string, bool) {
 	return wd, true
 }
 
+// DefaultWorkspacesSubdir is the directory named workspaces are created under,
+// relative to the database file, when tools.workspaces_dir is empty.
+const DefaultWorkspacesSubdir = "workspaces"
+
+// DefaultJobsSubdir is the directory background job logs are written to,
+// relative to the database file, when tools.background_dir is empty.
+const DefaultJobsSubdir = "jobs"
+
+// dirBesideDatabase resolves a directory next to the database file.
+//
+// The rule is literally "beside the database file": for `database.path: huan.db`
+// that is the current directory, and only an empty path falls back to ./data,
+// which is where the default database path points anyway. Keeping data the agent
+// produces next to the data it belongs to is what stops a deployment's
+// directories from depending on wherever the process happened to be started.
+func dirBesideDatabase(databasePath, subdir string) string {
+	if strings.TrimSpace(databasePath) == "" {
+		databasePath = filepath.Join("data", "huan-agent.db")
+	}
+	base := filepath.Dir(databasePath)
+	if strings.TrimSpace(base) == "" {
+		base = "data"
+	}
+	return filepath.Join(base, subdir)
+}
+
+// JobsDirOrDefault resolves where background job logs are written.
+//
+// A job's log is the durable record of what a process printed, so it lives with
+// the deployment's data rather than in the workspace it happened to run in: a log
+// dropped into a repository would show up in the model's own greps and in the
+// user's git status.
+func (c ToolsConfig) JobsDirOrDefault(databasePath string) (string, bool) {
+	if dir := strings.TrimSpace(c.BackgroundDir); dir != "" {
+		return dir, true
+	}
+	return dirBesideDatabase(databasePath, DefaultJobsSubdir), true
+}
+
+// BackgroundStopGrace returns the SIGTERM-to-SIGKILL grace for a stopping job.
+func (c ToolsConfig) BackgroundStopGrace() time.Duration {
+	if c.BackgroundStopGraceSeconds <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(c.BackgroundStopGraceSeconds) * time.Second
+}
+
+// WorkspacesDirOrDefault resolves where named workspaces are created.
+//
+// A configured value is used as given, relative to the process working
+// directory; otherwise it is the DefaultWorkspacesSubdir beside the database
+// file (see dirBesideDatabase). A second return of false means no directory
+// could be determined.
+func (c ToolsConfig) WorkspacesDirOrDefault(databasePath string) (string, bool) {
+	if dir := strings.TrimSpace(c.WorkspacesDir); dir != "" {
+		return dir, true
+	}
+	return dirBesideDatabase(databasePath, DefaultWorkspacesSubdir), true
+}
+
 // BashTimeout returns the configured command timeout.
 func (c ToolsConfig) BashTimeout() time.Duration {
 	if c.BashTimeoutSeconds <= 0 {
 		return 120 * time.Second
 	}
 	return time.Duration(c.BashTimeoutSeconds) * time.Second
+}
+
+// DefaultBashMaxTimeoutSeconds is the ceiling for a per-call bash timeout when
+// the configuration does not set one. It mirrors builtin.DefaultBashMaxTimeout —
+// fifteen minutes, which covers a cold dependency install or a full test suite
+// without leaving a wedged command holding a turn open for an hour.
+const DefaultBashMaxTimeoutSeconds = 900
+
+// BashMaxTimeout returns the ceiling a single command may ask for with
+// timeout_ms.
+//
+// A ceiling below the configured default is raised to it rather than honoured:
+// capping the default would make the ordinary case unreachable, and an operator
+// who wants a shorter default can lower bash_timeout_seconds itself.
+func (c ToolsConfig) BashMaxTimeout() time.Duration {
+	def := c.BashTimeout()
+	if c.BashMaxTimeoutSeconds <= 0 {
+		max := time.Duration(DefaultBashMaxTimeoutSeconds) * time.Second
+		if max < def {
+			return def
+		}
+		return max
+	}
+	if max := time.Duration(c.BashMaxTimeoutSeconds) * time.Second; max > def {
+		return max
+	}
+	return def
 }
 
 // Limits converts the size settings into limits, applying defaults for
@@ -400,6 +616,15 @@ type FeishuConfig struct {
 	DownloadDir string `mapstructure:"download_dir" json:"download_dir"`
 	// MaxDownloadMB caps a single downloaded attachment.
 	MaxDownloadMB int `mapstructure:"max_download_mb" json:"max_download_mb"`
+	// EnableTools gives the bot the file, search and command tools, confined to
+	// the workspace the sender has selected (see 设置 → 工作区).
+	//
+	// SECURITY: with this on, anyone who can send the bot a message can read,
+	// write and execute inside a workspace, and a command can still reach
+	// absolute paths elsewhere on the machine. That is the same exposure the web
+	// console has; the difference is who can reach it. Turn it off to keep the
+	// bot conversational.
+	EnableTools bool `mapstructure:"enable_tools" json:"enable_tools"`
 
 	// Legacy single-app fields (still honoured when Active is empty).
 	AppID             string `mapstructure:"app_id" json:"app_id"`
@@ -547,6 +772,30 @@ func Default() *Config {
 		Feishu: FeishuConfig{
 			Apps: make(map[string]FeishuApp), // empty = bot disabled until configured
 		},
+		OpenViking: OpenVikingConfig{
+			// Off, and pointed at the address a local `ov` listens on, so
+			// turning it on needs one flag rather than a host to look up.
+			Enable:         false,
+			BaseURL:        DefaultOpenVikingBaseURL,
+			TimeoutSeconds: DefaultOpenVikingTimeoutSeconds,
+			Memory: OpenVikingMemoryConfig{
+				Enable:        true,
+				Commit:        true,
+				FlushEvery:    DefaultOpenVikingFlushEvery,
+				RecallEnable:  true,
+				RecallLimit:   DefaultOpenVikingRecallLimit,
+				JournalEnable: true,
+			},
+			Documents: OpenVikingDocumentsConfig{
+				Enable:        true,
+				SyncWorkspace: true,
+				SyncOnExit:    true,
+				MaxFileKB:     DefaultOpenVikingMaxFileKB,
+				BinaryMode:    DefaultOpenVikingBinaryMode,
+				StatePath:     DefaultOpenVikingStatePath,
+			},
+			MCP: OpenVikingMCPConfig{Register: true, Name: DefaultOpenVikingMCPName},
+		},
 	}
 }
 
@@ -596,6 +845,7 @@ func Load(explicitPath string) (*Config, error) {
 			if err := v.Unmarshal(cfg); err != nil {
 				return nil, fmt.Errorf("unmarshal config: %w", err)
 			}
+			cfg.ApplyOpenVikingMCP()
 			return cfg, nil
 		}
 		return nil, fmt.Errorf("read config: %w", err)
@@ -627,6 +877,10 @@ func Load(explicitPath string) (*Config, error) {
 		cfg.LLM.Providers[name] = p
 	}
 
+	// Register OpenViking's own MCP server so the model gets its tools in the
+	// CLI, the Feishu bot and the console alike.
+	cfg.ApplyOpenVikingMCP()
+
 	return cfg, nil
 }
 
@@ -649,6 +903,8 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("llm.models_cache_ttl_hours", DefaultModelsCacheTTLHours)
 	v.SetDefault("chat.enable", true)
 	v.SetDefault("chat.max_steps", 12)
+	v.SetDefault("chat.turn_max_tokens", 0)
+	v.SetDefault("chat.turn_deadline_seconds", 0)
 	v.SetDefault("chat.history_limit", DefaultChatHistoryLimit)
 	v.SetDefault("chat.system_prompt", "")
 	v.SetDefault("langfuse.enable", false)
@@ -658,14 +914,25 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("langfuse.environment", "production")
 	v.SetDefault("langfuse.release", "")
 	v.SetDefault("tools.workspace", "")
+	v.SetDefault("tools.workspaces_dir", "")
 	v.SetDefault("tools.read_only", false)
 	v.SetDefault("tools.enable_bash", true)
 	v.SetDefault("tools.bash_timeout_seconds", 120)
+	v.SetDefault("tools.bash_max_timeout_seconds", DefaultBashMaxTimeoutSeconds)
+	v.SetDefault("tools.enable_background", true)
+	v.SetDefault("tools.background_dir", "")
+	v.SetDefault("tools.background_max_jobs", 8)
+	v.SetDefault("tools.background_log_max_mb", 8)
+	v.SetDefault("tools.background_window_kb", 256)
+	v.SetDefault("tools.background_stop_grace_seconds", 5)
 	v.SetDefault("tools.max_read_kb", 512)
 	v.SetDefault("tools.max_write_mb", 4)
 	v.SetDefault("tools.max_list_entries", 500)
 	v.SetDefault("admin.require_login", false)
 	v.SetDefault("admin.allow_insecure_bind", false)
+	// Loopback callers are not asked for the password, so a deployment that
+	// turns require_login on still opens for whoever is at the machine.
+	v.SetDefault("admin.trust_loopback", true)
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "console")
 	v.SetDefault("database.path", "./data/huan-agent.db")
@@ -683,4 +950,33 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("feishu.rate_limit_burst", 10)
 	v.SetDefault("feishu.download_dir", "")
 	v.SetDefault("feishu.max_download_mb", DefaultFeishuMaxDownloadMB)
+	v.SetDefault("feishu.enable_tools", true)
+	// OpenViking (context database). enable stays false: a machine without the
+	// server running must behave exactly as it did before this section existed.
+	v.SetDefault("openviking.enable", false)
+	v.SetDefault("openviking.base_url", DefaultOpenVikingBaseURL)
+	v.SetDefault("openviking.api_key", "")
+	v.SetDefault("openviking.account", "default")
+	v.SetDefault("openviking.user", "default")
+	v.SetDefault("openviking.timeout_seconds", DefaultOpenVikingTimeoutSeconds)
+	v.SetDefault("openviking.memory.enable", true)
+	v.SetDefault("openviking.memory.commit", true)
+	v.SetDefault("openviking.memory.flush_every", DefaultOpenVikingFlushEvery)
+	v.SetDefault("openviking.memory.recall_enable", true)
+	v.SetDefault("openviking.memory.recall_limit", DefaultOpenVikingRecallLimit)
+	v.SetDefault("openviking.memory.recall_target", "")
+	v.SetDefault("openviking.memory.journal_enable", true)
+	v.SetDefault("openviking.memory.session_prefix", DefaultOpenVikingSessionPrefix)
+	v.SetDefault("openviking.documents.enable", true)
+	v.SetDefault("openviking.documents.root_uri", "")
+	v.SetDefault("openviking.documents.sync_workspace", true)
+	v.SetDefault("openviking.documents.workspace_dir", "")
+	v.SetDefault("openviking.documents.max_file_kb", DefaultOpenVikingMaxFileKB)
+	v.SetDefault("openviking.documents.wait_index", false)
+	v.SetDefault("openviking.documents.binary_mode", DefaultOpenVikingBinaryMode)
+	v.SetDefault("openviking.documents.sync_interval_seconds", 0)
+	v.SetDefault("openviking.documents.sync_on_exit", true)
+	v.SetDefault("openviking.documents.state_path", DefaultOpenVikingStatePath)
+	v.SetDefault("openviking.mcp.register", true)
+	v.SetDefault("openviking.mcp.name", DefaultOpenVikingMCPName)
 }

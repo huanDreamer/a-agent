@@ -13,3 +13,6 @@ dist/
 
 # Local verification harness (mock API + headless Chrome driver)
 .verify/
+
+# Render-probe build output (npm run check:ui)
+ssr-probe/out/

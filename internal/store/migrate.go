@@ -153,6 +153,213 @@ var migrations = []migration{
 		// the file itself lives in media_assets.
 		up: `ALTER TABLE chat_messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '';`,
 	},
+	{
+		version: 7,
+		name:    "create_traces",
+		// The trace store is what makes 链路追踪 work without a Langfuse server.
+		//
+		//   - `traces` is one agent turn: its name, who ran it, which session it
+		//     belongs to, its input/output, and the window it ran in. `ended_at`
+		//     is NULL while the turn is still going, which is what lets a reader
+		//     tell "in progress" from "finished instantly" — a distinction the
+		//     waterfall needs and a zero duration cannot express.
+		//   - `observations` is one node of that turn: a GENERATION (a model call)
+		//     or a SPAN (a tool call). It nests through `parent_id`, and its own
+		//     start/end are the only inputs the waterfall geometry uses.
+		//   - `chat_messages.trace_id` links an assistant answer to the trace that
+		//     produced it, so a conversation can offer a way into its own trace.
+		//     Rows written before this migration default to '' = "no trace
+		//     recorded", which the UI renders as "no link" rather than a broken
+		//     one.
+		//
+		// `observations.trace_id` cascades, so pruning or clearing a trace cannot
+		// leave orphaned nodes behind. Timestamps are always supplied by the
+		// caller in UTC rather than defaulted here, so every row in these tables
+		// carries the same format and `ORDER BY started_at` sorts correctly.
+		//
+		// ALTER TABLE ... ADD COLUMN is not idempotent in SQLite, but Migrate
+		// guards on schema_migrations and applies each version at most once
+		// (see migration 3).
+		up: `CREATE TABLE IF NOT EXISTS traces (
+			id         TEXT PRIMARY KEY,
+			name       TEXT NOT NULL DEFAULT '',
+			session_id TEXT NOT NULL DEFAULT '',
+			user_id    TEXT NOT NULL DEFAULT '',
+			input      TEXT NOT NULL DEFAULT '',
+			output     TEXT NOT NULL DEFAULT '',
+			started_at TIMESTAMP NOT NULL,
+			ended_at   TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_traces_started ON traces(started_at);
+		CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_id);
+		CREATE INDEX IF NOT EXISTS idx_traces_user    ON traces(user_id);
+
+		CREATE TABLE IF NOT EXISTS observations (
+			id                TEXT PRIMARY KEY,
+			trace_id          TEXT NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+			parent_id         TEXT NOT NULL DEFAULT '',
+			type              TEXT NOT NULL DEFAULT '',
+			name              TEXT NOT NULL DEFAULT '',
+			model             TEXT NOT NULL DEFAULT '',
+			step              INTEGER NOT NULL DEFAULT 0,
+			input             TEXT NOT NULL DEFAULT '',
+			output            TEXT NOT NULL DEFAULT '',
+			level             TEXT NOT NULL DEFAULT '',
+			status_message    TEXT NOT NULL DEFAULT '',
+			prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+			completion_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens      INTEGER NOT NULL DEFAULT 0,
+			started_at        TIMESTAMP NOT NULL,
+			ended_at          TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_obs_trace   ON observations(trace_id, started_at);
+		CREATE INDEX IF NOT EXISTS idx_obs_started ON observations(started_at);
+
+		ALTER TABLE chat_messages ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';`,
+	},
+	{
+		version: 8,
+		name:    "create_mcp_servers",
+		// MCP servers were config-file only until the console grew an MCP tab:
+		// the agent read `mcp.servers` at process start, so adding one meant
+		// editing YAML and restarting, and the web console could neither show
+		// what was configured nor test whether it worked.
+		//
+		//   - `transport` is which client to build: stdio spawns `command` with
+		//     `args` (the original and still the common case), sse and http dial
+		//     `url`. The two HTTP transports answer different protocols (legacy
+		//     SSE vs streamable HTTP), so they are separate values rather than a
+		//     single "remote".
+		//   - `args`, `env` and `headers` are JSON arrays of strings. A TEXT
+		//     column rather than child tables: they are short, only ever read
+		//     and written whole, and a join would buy nothing.
+		//   - `source` mirrors llm_providers: a `config` row is re-synced from
+		//     the config file at every start, so the UI shows it as read-only
+		//     instead of offering an edit the next restart would undo.
+		//   - `last_error` is written by the runtime manager on a failed connect,
+		//     so a broken server is visible without re-testing it.
+		//
+		// Secret-looking env values are stored as given: unlike an LLM API key
+		// they are an arbitrary KEY=value list the operator wrote, and the
+		// connection needs them verbatim.
+		up: `CREATE TABLE IF NOT EXISTS mcp_servers (
+			id         TEXT PRIMARY KEY,
+			name       TEXT NOT NULL DEFAULT '',
+			transport  TEXT NOT NULL DEFAULT 'stdio',
+			command    TEXT NOT NULL DEFAULT '',
+			args       TEXT NOT NULL DEFAULT '',
+			env        TEXT NOT NULL DEFAULT '',
+			url        TEXT NOT NULL DEFAULT '',
+			headers    TEXT NOT NULL DEFAULT '',
+			source     TEXT NOT NULL DEFAULT 'user',
+			enabled    INTEGER NOT NULL DEFAULT 1,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
+	},
+	{
+		version: 9,
+		name:    "create_workspaces",
+		// Named workspaces, and which one each scope is in.
+		//
+		// Until this migration the agent had exactly one root, taken from
+		// `tools.workspace`: switching project meant editing the config and
+		// restarting. These two tables make the set of roots, and the selection,
+		// runtime state.
+		//
+		//   - `workspaces.root` is the absolute directory the sandbox confines a
+		//     turn to. It is stored rather than derived from the name so a row
+		//     stays meaningful if `tools.workspaces_dir` is later changed; the
+		//     name is the identity, the root is where it points today.
+		//   - `read_only` / `enable_bash` are per workspace on purpose: "look at
+		//     this repo" and "build me a prototype" want different permissions
+		//     and should not share one global switch.
+		//   - The built-in "default" workspace is NOT a row: it is synthesised
+		//     from `tools.workspace`, so an existing deployment keeps pointing at
+		//     its configured root without anything having to be migrated, and it
+		//     cannot be deleted out from under the operator.
+		//   - `workspace_bindings` keys a choice by scope (`web:<session>` /
+		//     `feishu:<open_id>`), never globally: two conversations may work in
+		//     two projects at the same time and must not fight over one pointer.
+		//     A missing row means "the default workspace", so no scope needs a
+		//     row to work.
+		//
+		// The two ALTERs put the workspace on the records that would otherwise
+		// be ambiguous after a switch:
+		//
+		//   - `tool_invocations.workspace` is what lets the audit answer "which
+		//     project did this edit touch" without inferring it from the
+		//     arguments (which are workspace-relative and identical across
+		//     workspaces).
+		//   - `media_assets.workspace` is a correctness requirement, not
+		//     metadata: `path` is workspace-relative, so an attachment must be
+		//     read back through the workspace it was stored in — otherwise the
+		//     same relative path in a newly selected workspace resolves to a
+		//     different file, or to none.
+		up: `CREATE TABLE IF NOT EXISTS workspaces (
+			name        TEXT PRIMARY KEY,
+			root        TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			read_only   INTEGER NOT NULL DEFAULT 0,
+			enable_bash INTEGER NOT NULL DEFAULT 1,
+			created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS workspace_bindings (
+			scope      TEXT PRIMARY KEY,
+			workspace  TEXT NOT NULL,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_ws_bindings_workspace ON workspace_bindings(workspace);
+		-- Names are resolved case-insensitively (a person typing "Blog" at the
+		-- console means the workspace called "blog"), so uniqueness has to be
+		-- case-insensitive too — otherwise two rows would both answer to one
+		-- name and which one wins would depend on the query.
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_lower_name ON workspaces(lower(name));
+
+		ALTER TABLE tool_invocations ADD COLUMN workspace TEXT NOT NULL DEFAULT '';
+		ALTER TABLE media_assets     ADD COLUMN workspace TEXT NOT NULL DEFAULT '';`,
+	},
+	{
+		version: 10,
+		name:    "workspaces_become_directories",
+		// A workspace stopped being "a directory this process creates under a base
+		// dir, with a policy" and became "a directory the operator picked", with no
+		// policy at all: read_only / enable_bash / limits are process-wide again
+		// (`tools.*`), because a workspace answers *where* the agent works and not
+		// *what it may do*.
+		//
+		// So the three policy columns go, and `name` is demoted from "the directory
+		// name" to a label the sidebar shows and the operator can rename. `root` is
+		// untouched, which is what makes this safe for a database that already holds
+		// rows: the directories those rows name keep pointing exactly where they did.
+		//
+		// The unique index on lower(name) stays: a name is how a scope refers to a
+		// workspace, and two rows answering to one name would make which-one-wins
+		// depend on the query.
+		//
+		// DROP COLUMN needs SQLite 3.35+ (modernc.org/sqlite is far past that), and
+		// refuses a column that is indexed or part of a constraint — none of these
+		// three is.
+		up: `ALTER TABLE workspaces DROP COLUMN description;
+		ALTER TABLE workspaces DROP COLUMN read_only;
+		ALTER TABLE workspaces DROP COLUMN enable_bash;`,
+	},
+	{
+		version: 11,
+		name:    "chat_message_stop_reason",
+		// A turn can end because a budget ran out rather than because the model
+		// answered, and that distinction used to exist only inside the answer
+		// text. Persisting it lets the console still mark the turn after a
+		// reload, and lets a reader tell "the answer is complete" from "the
+		// answer is what fit in the budget".
+		//
+		// Empty is the ordinary case, and the value every existing row gets: the
+		// model answered on its own.
+		up: `ALTER TABLE chat_messages ADD COLUMN stop_reason TEXT NOT NULL DEFAULT '';`,
+	},
 }
 
 // Migrate applies any pending migrations idempotently.

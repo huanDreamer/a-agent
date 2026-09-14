@@ -18,11 +18,15 @@ import (
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/tool"
 	"github.com/huan/huan-agent/internal/workspace"
+	"github.com/huan/huan-agent/internal/workspaces"
 )
 
 // defaultSystemPrompt is used when config does not override it.
 const defaultSystemPrompt = "You are huan-agent, a helpful personal AI assistant. " +
-	"Answer in the user's language, be concise, and use tools when they help."
+	"Answer in the user's language, be concise, and use tools when they help. " +
+	"Commands run with no terminal and with standard input at /dev/null, so run each one " +
+	"non-interactively — its flag for that (-y, --yes, --no-input, CI=1, git commit -m) or " +
+	"the answers piped in — instead of a command that waits for input, a REPL, a pager or an editor."
 
 // sseHeartbeat keeps an idle stream alive through proxies and lets the client
 // notice a dead connection.
@@ -71,12 +75,35 @@ type ChatDeps struct {
 	// Tools is the registry the runner may call, exposed to the UI so a user can
 	// see what the agent can do.
 	Tools *tool.Registry
+	// ToolsFor, when set, returns the registry for one turn, overriding Tools.
+	// It is what makes the tool set follow the conversation's workspace: the
+	// caller closes over the workspace layer and reads the turn's scope from the
+	// context (chat.ScopeFrom).
+	//
+	// The server resolves it once per turn and hands the result to the runner, so
+	// a turn cannot half-run against one workspace and half against another.
+	ToolsFor func(ctx context.Context) (*tool.Registry, error)
+	// Workspaces is the multi-workspace layer, when the deployment has one. Nil
+	// disables the sidebar's workspace folders, and conversations keep running in
+	// whatever Tools/Workspace were wired with.
+	Workspaces WorkspaceService
+	// Condenser bounds the in-loop history of a long turn. Nil means the history
+	// is sent whole, which is what an unconfigured context.max_tokens gets.
+	//
+	// It is supplied by the caller rather than derived here so this package does
+	// not have to know which model summarizes: the summarizer is a deployment
+	// choice, and the runner only needs the capability.
+	Condenser chat.Condenser
 	// SystemPrompt overrides the default.
 	SystemPrompt string
 	// Workspace confines the chat to one directory. It is where uploaded
 	// attachments are stored and read back from, so uploads are refused — with a
 	// clear message — when it is nil or read-only rather than written somewhere
 	// the agent's tools cannot reach.
+	//
+	// With Workspaces set this is the *fallback*: an upload is stored in the
+	// conversation's own workspace, and this is what a deployment without the
+	// workspace layer (or a session whose workspace cannot be resolved) uses.
 	Workspace *workspace.Workspace
 	// MaxAttachmentBytes overrides MaxAttachmentBytes for one upload. Zero uses
 	// the default; a deployment with a smaller storage budget can lower it.
@@ -90,6 +117,16 @@ type ChatDeps struct {
 	// The web chat is the surface most turns go through, so leaving this unset
 	// makes 统计监控 show nothing for the conversations a user actually has.
 	Usage UsageRecorder
+	// AskTimeout bounds how long an ask_user question waits for an answer. Zero
+	// uses DefaultAskTimeout.
+	//
+	// It is a deployment setting rather than a constant because the right value
+	// is about people, not about the code: a solo operator on the same machine
+	// wants a couple of minutes, and a shared console wants something closer to
+	// an hour. The wait is bounded again by the turn's context — a stop, a closed
+	// tab or a shutdown ends it — and it counts against the turn's wall-clock
+	// deadline, so this must stay well under chat.turn_deadline_seconds.
+	AskTimeout time.Duration
 }
 
 // UsageRecorder records one model call's token usage. It mirrors
@@ -224,6 +261,10 @@ func (s *Server) registerChatRoutes(authed *route.RouterGroup) {
 	// Streaming endpoint: Server-Sent Events, because the browser needs partial
 	// output as the model produces it.
 	authed.POST("/chat/sessions/:id/messages", s.handleSendMessage)
+	// The answer to an ask_user card arrives on its own request: the streaming
+	// response above is already committed to the event stream, so a browser
+	// cannot send a second body on it. The question id joins the two.
+	authed.POST("/chat/sessions/:id/questions/:qid/answer", s.handleAnswerQuestion)
 }
 
 // maxAttachmentBytes returns the effective per-upload cap.
@@ -253,6 +294,11 @@ func (s *Server) handleChatModels(ctx context.Context, c *app.RequestContext) {
 	out := map[string]any{
 		"system_prompt": s.chatPrompt(),
 		"max_steps":     s.chatMaxSteps(),
+		// The other two budgets travel with the step cap: the console shows what
+		// a turn may spend, and a user who just watched a turn stop on its
+		// budget should be able to see which budget that was.
+		"turn_max_tokens":       s.chatMaxTokens(),
+		"turn_deadline_seconds": int(s.chatTurnDeadline().Seconds()),
 	}
 	if s.chat.Builder != nil {
 		cat := s.chat.Builder.Catalog(ctx)
@@ -307,14 +353,52 @@ func (s *Server) chatMaxSteps() int {
 	return chat.DefaultMaxSteps
 }
 
+// chatMaxTokens returns the effective per-turn token budget, or 0 for unlimited.
+func (s *Server) chatMaxTokens() int {
+	if s.cfg.ChatMaxTokens > 0 {
+		return s.cfg.ChatMaxTokens
+	}
+	return 0
+}
+
+// chatTurnDeadline returns the effective per-turn wall-clock budget, or 0 for
+// unlimited.
+func (s *Server) chatTurnDeadline() time.Duration {
+	if s.cfg.ChatTurnDeadline > 0 {
+		return s.cfg.ChatTurnDeadline
+	}
+	return 0
+}
+
 // handleListSessions returns the caller's sessions, newest activity first.
 func (s *Server) handleListSessions(ctx context.Context, c *app.RequestContext) {
 	sessions, err := s.store.ListChatSessions(ctx, store.ChatSessionFilter{
-		Limit: limitFromQuery(c, 100),
+		Limit:     limitFromQuery(c, 100),
+		Workspace: c.Query("workspace"),
 	})
 	if err != nil {
 		s.fail(c, "list chat sessions", err)
 		return
+	}
+	// Every row carries the workspace it belongs to, because the sidebar groups
+	// by it (the store joins the binding in, so this is one query). A conversation
+	// whose binding is somehow missing is filled in with the fallback here rather
+	// than left blank, since a blank one has no folder to appear in.
+	if s.chat.Workspaces != nil {
+		fallback := ""
+		for i := range sessions {
+			if sessions[i].Workspace != "" {
+				continue
+			}
+			if fallback == "" {
+				def, derr := s.chat.Workspaces.Default(ctx)
+				if derr != nil {
+					break
+				}
+				fallback = def.Name
+			}
+			sessions[i].Workspace = fallback
+		}
 	}
 	c.JSON(http.StatusOK, map[string]any{"sessions": sessions})
 }
@@ -322,9 +406,10 @@ func (s *Server) handleListSessions(ctx context.Context, c *app.RequestContext) 
 // handleCreateSession creates a conversation, applying the default model.
 func (s *Server) handleCreateSession(ctx context.Context, c *app.RequestContext) {
 	var body struct {
-		Title    string `json:"title"`
-		Provider string `json:"provider"`
-		Model    string `json:"model"`
+		Title     string `json:"title"`
+		Provider  string `json:"provider"`
+		Model     string `json:"model"`
+		Workspace string `json:"workspace"`
 	}
 	if err := c.BindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
 		// An empty body is acceptable: it means "use the defaults".
@@ -332,6 +417,17 @@ func (s *Server) handleCreateSession(ctx context.Context, c *app.RequestContext)
 			c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 			return
 		}
+	}
+
+	// Every conversation belongs to a workspace, so which one is decided here
+	// rather than on the first message: the sidebar shows the conversation under
+	// its workspace immediately, and there is no window in which it belongs
+	// nowhere. An explicit choice wins; otherwise it starts where the last
+	// conversation was.
+	workspaceName, werr := s.sessionWorkspaceForCreate(ctx, body.Workspace)
+	if werr != nil {
+		s.workspaceError(c, "resolve workspace for new session", werr)
+		return
 	}
 
 	provider, model := s.resolveModelChoice(ctx, body.Provider, body.Model)
@@ -350,12 +446,47 @@ func (s *Server) handleCreateSession(ctx context.Context, c *app.RequestContext)
 		s.fail(c, "create chat session", err)
 		return
 	}
+	if workspaceName != "" {
+		if err := s.store.SetWorkspaceBinding(ctx, workspaces.WebScope(sess.ID), workspaceName); err != nil {
+			s.fail(c, "bind chat session workspace", err)
+			return
+		}
+	}
 	saved, err := s.store.GetChatSession(ctx, sess.ID)
 	if err != nil {
 		s.fail(c, "read back chat session", err)
 		return
 	}
+	if workspaceName != "" {
+		saved.Workspace = workspaceName
+	}
 	c.JSON(http.StatusOK, map[string]any{"session": saved})
+}
+
+// sessionWorkspaceForCreate decides which workspace a new conversation starts in.
+//
+// An empty name means "wherever the last conversation was" (the manager's
+// default), which is what the sidebar's own 新建对话 button relies on. A name that
+// does not exist is refused with the list of what does, rather than silently
+// creating the conversation somewhere else.
+func (s *Server) sessionWorkspaceForCreate(ctx context.Context, name string) (string, error) {
+	if s.chat.Workspaces == nil {
+		// No workspace layer: the conversation runs in whatever single directory
+		// the deployment configured, which is the pre-workspace behaviour.
+		return "", nil
+	}
+	if trimmed := strings.TrimSpace(name); trimmed != "" {
+		spec, err := s.chat.Workspaces.Get(ctx, trimmed)
+		if err != nil {
+			return "", err
+		}
+		return spec.Name, nil
+	}
+	spec, err := s.chat.Workspaces.Default(ctx)
+	if err != nil {
+		return "", err
+	}
+	return spec.Name, nil
 }
 
 // resolveModelChoice fills an unset provider/model from the defaults.
@@ -366,15 +497,36 @@ func (s *Server) resolveModelChoice(ctx context.Context, provider, model string)
 		return provider, model
 	}
 	catalog := s.chat.Builder.Catalog(ctx).Models
-	for _, m := range catalog {
-		if m.Provider == provider && provider != "" {
-			if model == "" {
-				return provider, m.Model
+
+	// 1. An explicit provider wins. A missing model takes that provider's first.
+	if provider != "" {
+		for _, m := range catalog {
+			if m.Provider == provider {
+				if model == "" {
+					return provider, m.Model
+				}
+				return provider, model
 			}
-			return provider, model
 		}
 	}
-	// Unknown or empty provider: fall back to the default entry.
+
+	// 2. Nothing chosen: reuse what the last conversation used, so a new
+	// conversation starts where the user left off rather than snapping back to
+	// the configured default. This is the same rule the workspace already
+	// follows, and it is resolved here rather than in the browser so it holds
+	// whichever device or tab opens the console.
+	if provider == "" && model == "" && s.store != nil {
+		if p, m, ok := s.store.LatestSessionModel(ctx); ok {
+			if chosen, usable := modelChoiceFrom(catalog, p, m); usable {
+				return chosen.Provider, chosen.Model
+			}
+			// The remembered model is gone (deleted, or its provider disabled).
+			// Falling through to the default is better than resurrecting a
+			// choice that can no longer run.
+		}
+	}
+
+	// 3. The catalog's default entry, else the first one.
 	for _, m := range catalog {
 		if m.Default {
 			return m.Provider, m.Model
@@ -384,6 +536,27 @@ func (s *Server) resolveModelChoice(ctx context.Context, provider, model string)
 		return catalog[0].Provider, catalog[0].Model
 	}
 	return provider, model
+}
+
+// modelChoiceFrom finds a catalog entry matching a remembered provider/model.
+// A remembered provider with no model recorded falls back to that provider's
+// first offered model. Both halves must be offered and enabled, otherwise the
+// choice is unusable and the caller should move on to the default.
+func modelChoiceFrom(catalog []ModelChoice, provider, model string) (ModelChoice, bool) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" {
+		return ModelChoice{}, false
+	}
+	for _, m := range catalog {
+		if m.Provider != provider {
+			continue
+		}
+		if model == "" || m.Model == model {
+			return m, true
+		}
+	}
+	return ModelChoice{}, false
 }
 
 // handleGetSession returns one session with its stored messages.
@@ -403,7 +576,45 @@ func (s *Server) handleGetSession(ctx context.Context, c *app.RequestContext) {
 		s.fail(c, "list chat messages", err)
 		return
 	}
-	c.JSON(http.StatusOK, map[string]any{"session": sess, "messages": msgs})
+	// The conversation's workspace travels with the conversation, and it has to be
+	// the same value the turn's tools will use rather than a client-side guess.
+	// The console no longer renders it (the sidebar's folder is where that fact
+	// lives), but the reply is the contract other clients read.
+	body := map[string]any{"session": sess, "messages": msgs}
+	if spec, ok := s.sessionWorkspace(ctx, sess); ok {
+		body["workspace"] = spec
+	}
+	c.JSON(http.StatusOK, body)
+}
+
+// sessionWorkspace returns the workspace a conversation is in.
+//
+// The second return is false when the deployment has no workspace layer, which
+// is a supported configuration (the conversation then runs in whatever single
+// workspace it was wired with). A failure to read the selection is logged and
+// treated the same way: it is presentation and audit metadata, and must not turn
+// a readable conversation into an error.
+func (s *Server) sessionWorkspace(ctx context.Context, sess store.ChatSession) (workspaces.Spec, bool) {
+	if s.chat.Workspaces == nil {
+		return workspaces.Spec{}, false
+	}
+	spec, err := s.chat.Workspaces.Active(ctx, workspaces.WebScope(sess.ID))
+	if err != nil {
+		s.logger.Warn("chat: read session workspace failed",
+			zapString("session", sess.ID), zapError(err))
+		return workspaces.Spec{}, false
+	}
+	return spec, true
+}
+
+// sessionWorkspaceName is sessionWorkspace reduced to the name the audit log
+// records, with "" when there is nothing to record.
+func (s *Server) sessionWorkspaceName(ctx context.Context, sess store.ChatSession) string {
+	spec, ok := s.sessionWorkspace(ctx, sess)
+	if !ok {
+		return ""
+	}
+	return spec.Name
 }
 
 // handlePatchSession renames a session or changes its model.
@@ -595,12 +806,33 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 	events := make(chan chat.Event, 64)
 	done := make(chan *chat.Result, 1)
 
+	// The turn's answerer. It writes the question onto the same channel the
+	// runner reports tool calls on, so the card appears in the conversation at
+	// the moment the model asks, and it is created per turn because the answer
+	// only means anything while this request is open.
+	runCtx := tool.WithAsker(ctx, &turnAsker{
+		hub:     s.questions,
+		session: sess.ID,
+		timeout: s.askTimeout(),
+		logger:  s.logger,
+		emit: func(e chat.Event) {
+			select {
+			case events <- e:
+			case <-clientGone:
+			}
+		},
+	})
+
 	go func() {
 		defer close(done)
-		res, runErr := runner.Run(ctx, chat.Request{
+		res, runErr := runner.Run(runCtx, chat.Request{
 			Messages:  history,
 			SessionID: sess.ID,
 			UserID:    sess.UserID,
+			// The scope is what the per-turn tool set is derived from, so this
+			// conversation's tools resolve inside its own workspace even while
+			// another conversation runs against a different one.
+			Scope: workspaces.WebScope(sess.ID),
 		}, func(e chat.Event) {
 			select {
 			case events <- e:
@@ -609,7 +841,16 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 		})
 		if runErr != nil {
 			// Run already emitted an error event; record it for the history.
-			res = &chat.Result{Text: "", Usage: chat.Usage{}}
+			//
+			// The trace id survives the reset: a failed turn is exactly when
+			// someone wants to open the trace, and the store already holds it —
+			// the runner opened the trace before it failed and closes it on the
+			// way out.
+			traceID := ""
+			if res != nil {
+				traceID = res.TraceID
+			}
+			res = &chat.Result{Text: "", Usage: chat.Usage{}, TraceID: traceID}
 			select {
 			case events <- chat.Event{Type: chat.EventError, Error: runErr.Error()}:
 			case <-clientGone:
@@ -637,6 +878,16 @@ func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.C
 		usage     chat.Usage
 		toolRuns  []chat.ToolRun
 		runErr    string
+		// stopReason is why the turn ended when it was not the model's own
+		// answer. It is captured from the event so a turn that stops on its
+		// budget is still marked after a reload, not just while the stream is
+		// open.
+		stopReason string
+		// traceID is known only once the run reports back, so a turn persisted
+		// because the client vanished mid-flight stores no trace link. The trace
+		// itself is still recorded and the trace panel can find it by session;
+		// what is lost is only the shortcut from that one message.
+		traceID string
 	)
 
 	write := func(v any) bool {
@@ -654,7 +905,8 @@ func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.C
 	flush := func() {
 		// Persist what we have once the turn is over, even if the client
 		// disconnected: the conversation should survive a closed tab.
-		s.persistTurn(ctx, sess, answer.String(), reasoning.String(), toolRuns, usage, runErr)
+		s.persistTurn(ctx, sess, s.sessionWorkspaceName(ctx, sess), answer.String(), reasoning.String(),
+			toolRuns, usage, runErr, traceID, stopReason)
 	}
 
 	for {
@@ -698,6 +950,8 @@ func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.C
 				if e.Usage != nil {
 					usage = *e.Usage
 				}
+			case chat.EventBudgetStop:
+				stopReason = e.Reason
 			case chat.EventDone:
 				if e.Text != "" {
 					answer.Reset()
@@ -719,6 +973,8 @@ func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.C
 					switch e.Type {
 					case chat.EventReasoningDelta:
 						reasoning.WriteString(e.Text)
+					case chat.EventBudgetStop:
+						stopReason = e.Reason
 					case chat.EventDone:
 						if e.Text != "" {
 							answer.Reset()
@@ -734,6 +990,7 @@ func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.C
 				break
 			}
 			if res != nil {
+				traceID = res.TraceID
 				if res.Text != "" {
 					answer.Reset()
 					answer.WriteString(res.Text)
@@ -748,6 +1005,11 @@ func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.C
 				if len(res.Tools) > 0 {
 					toolRuns = res.Tools
 				}
+				// The result carries the reason too, so a turn that lost its
+				// budget_stop event to a dropped connection is still marked.
+				if res.StopReason != "" {
+					stopReason = res.StopReason
+				}
 			}
 			flush()
 			// A terminating frame tells the client the stream is complete even
@@ -759,8 +1021,13 @@ func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.C
 }
 
 // persistTurn stores the assistant message (or the failure) for later reloads.
-func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, answer, reasoning string,
-	tools []chat.ToolRun, usage chat.Usage, runErr string) {
+//
+// workspace names the workspace the turn ran in, for the audit rows: a tool path
+// is workspace-relative, so "write_file src/main.go" looks identical in every
+// workspace and the audit would otherwise be unable to say which project a
+// change landed in.
+func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, workspace, answer, reasoning string,
+	tools []chat.ToolRun, usage chat.Usage, runErr, traceID, stopReason string) {
 
 	// Use a fresh context: the request context is already cancelled when the
 	// client disconnects, and the answer must still be saved.
@@ -803,6 +1070,7 @@ func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, answer
 			Arguments:  t.Args,
 			Result:     t.Result,
 			Err:        t.Err,
+			Workspace:  workspace,
 			DurationMs: t.DurationMs,
 		}); err != nil {
 			s.logger.Warn("persist chat tool invocation failed", zapError(err))
@@ -819,6 +1087,14 @@ func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, answer
 		ToolCalls: toolCallsJSON,
 		UsageJSON: usageJSON,
 		Error:     runErr,
+		// Why the turn ended, when it was not the model's own answer. Empty is
+		// the ordinary case, and the UI renders a set value as a badge on the
+		// message rather than leaving the reader to find the sentence inside it.
+		StopReason: stopReason,
+		// The link from this answer to the trace that produced it. Empty when
+		// tracing is off, which the UI renders as "no link" rather than a link
+		// that leads nowhere.
+		TraceID: traceID,
 	}
 	if _, err := s.store.AppendChatMessage(saveCtx, sess.ID, msg); err != nil {
 		s.logger.Warn("persist chat answer failed", zapError(err))

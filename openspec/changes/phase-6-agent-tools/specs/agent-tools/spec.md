@@ -58,6 +58,17 @@ declared capability so a caller can expose a subset.
     MUST return an error, never panic.
 14. **Testability.** Every tool MUST be exercisable against a temporary
     directory with no network access.
+15. **No terminal, and the model knows it.** `bash` MUST run with standard input
+    at `/dev/null` and no PTY, so a command that waits for an answer fails rather
+    than hanging, and its description MUST state both that fact and the way out —
+    the flag a tool offers for running non-interactively (`-y` / `--yes`,
+    `--no-input`, `CI=1`, `git commit -m`) or answers piped in. A prompt that
+    tells the model the command fails without telling it what to write instead
+    leaves it to discover this by burning a turn.
+16. **The prompt says it too.** A surface that offers these tools SHOULD carry
+    the same instruction in the system prompt it sends, so the guidance survives
+    a model that reads the prompt and skims the tool list. A configured
+    `chat.system_prompt` still replaces the default and is the operator's call.
 
 ## Non-goals
 

@@ -7,7 +7,19 @@
 
 import { computed, reactive } from 'vue'
 import { api, streamChatTurn } from './api.js'
+import {
+  ASK_ANSWERED,
+  ASK_CANCELLED,
+  ASK_PENDING,
+  ASK_SUBMITTING,
+  applyAskOutcome,
+  askCardsFromTools,
+  askFromEvent,
+  isAskTool,
+} from './ask.js'
 import { normalize as normalizeAttachments } from './attachments.js'
+import { formatCompact, formatDuration } from './format.js'
+import { noteJobsToolRan } from './jobsStore.js'
 import {
   catalogView,
   modelOptionHint,
@@ -53,6 +65,42 @@ export const chat = reactive({
   pendingAttachments: [],
   /** Transient confirmation line ("模型已切换"). */
   notice: '',
+
+  // --- workspaces: the sidebar's folders ---------------------------------
+  /**
+   * The workspace this conversation works in, as the server reports it:
+   * {name, root, session_count}. Null when the deployment has no workspace
+   * layer.
+   *
+   * Per conversation on purpose: the header shows which directory this one is
+   * pointed at, and two conversations may be in two different ones.
+   */
+  workspace: null,
+  /** Every workspace: GET /api/workspaces. */
+  workspaces: [],
+  workspacesStatus: 'ready',
+  workspacesError: '',
+  /** Note the workspaces list carries, shown once above the folders. */
+  workspacesNote: '',
+  /** Workspaces whose directory is gone, as warnings from the server. */
+  workspaceWarnings: [],
+  /** The workspace a new conversation would start in. */
+  defaultWorkspace: '',
+  /** Home directory, the picker's starting point. */
+  homeDir: '',
+  /**
+   * Whether this server has a workspace layer.
+   *
+   * False when /api/workspaces answers 404, which is a supported deployment (the
+   * layer is optional). The sidebar then falls back to the flat session list:
+   * showing "no workspaces yet" plus a create button that can only fail would be
+   * worse than showing no folders at all.
+   */
+  workspacesAvailable: true,
+  /** Workspace names with an operation in flight, so their controls can lock. */
+  pendingWorkspace: '',
+  /** Workspace names whose folder is folded. */
+  collapsedWorkspaces: {},
 })
 
 // ---------------------------------------------------------------- helpers --
@@ -225,6 +273,7 @@ export function buildItems(messages) {
       continue
     }
     if (row.role === 'assistant') {
+      const tools = parseToolCalls(row.tool_calls, true)
       items.push({
         key: `assistant-${row.id ?? nextKey('assistant')}`,
         role: 'assistant',
@@ -232,10 +281,24 @@ export function buildItems(messages) {
         reasoning: row.reasoning || '',
         reasoningOpen: false,
         reasoningTouched: false,
-        tools: parseToolCalls(row.tool_calls, true),
+        tools,
+        // The model's questions, rebuilt from the persisted ask_user calls: the
+        // tool call carries the question and its result carries the answer, so a
+        // reloaded conversation shows the card without a table of its own.
+        asks: askCardsFromTools(tools),
         usage: normalizeUsage(row.usage),
         error: row.error || '',
         createdAt: row.created_at || '',
+        // The trace that produced this answer, when one was recorded. Empty for
+        // a turn that ran with tracing off and for messages written before the
+        // column existed; the bubble then offers no link at all rather than one
+        // that leads nowhere.
+        traceId: row.trace_id || '',
+        // Why the turn ended when it was not the model's own answer ("steps",
+        // "tokens" or "deadline"). Persisted, so a reloaded conversation still
+        // shows that the answer is what fitted in the budget.
+        stopReason: row.stop_reason || '',
+        notices: [],
         streaming: false,
       })
       continue
@@ -466,6 +529,10 @@ export async function loadSessions({ quiet = false, select = true } = {}) {
     chat.sessions = list
     chat.sessionsError = ''
     chat.sessionsStatus = 'ready'
+    // The sidebar groups these by workspace, so the folder data has to be
+    // current whenever the list is: a conversation filed under a workspace the
+    // page has not heard of would otherwise be invisible.
+    if (!chat.workspaces.length) await loadWorkspaces({ quiet: true })
 
     if (!select) return
     const active = list.find((s) => s && s.id === chat.activeId)
@@ -510,7 +577,10 @@ export async function selectSession(id, { quiet = false } = {}) {
   if (!quiet) {
     // Never show the previous conversation's bubbles under a new title.
     chat.items = []
-    if (!chat.session || chat.session.id !== id) chat.session = null
+    if (!chat.session || chat.session.id !== id) {
+      chat.session = null
+      chat.workspace = null
+    }
     chat.messagesStatus = 'loading'
     chat.messagesError = ''
   }
@@ -518,6 +588,9 @@ export async function selectSession(id, { quiet = false } = {}) {
     const res = await api.chatSession(id)
     if (chat.activeId !== id) return // a newer selection won
     chat.session = res && res.session ? res.session : null
+    // The workspace travels with the conversation: a reload must show the one
+    // this conversation is in, not the one the last conversation used.
+    chat.workspace = (res && res.workspace) || null
     chat.items = buildItems(res && res.messages)
     chat.messagesError = ''
     chat.messagesStatus = 'ready'
@@ -545,26 +618,35 @@ function replaceSession(session) {
   if (!found) chat.sessions = [session, ...chat.sessions]
 }
 
-export async function createSession() {
+/**
+ * Create a conversation.
+ *
+ * `workspace` files it under that workspace immediately (the sidebar shows it
+ * there before the first message); omitted, it starts in the workspace the last
+ * conversation used, which is what the sidebar's own 新建对话 button relies on.
+ */
+export async function createSession({ workspace = '' } = {}) {
   if (chat.creating) return null
   chat.creating = true
   chat.actionError = ''
-  const fallback = defaultModel.value || {}
   try {
-    const res = await api.createChatSession({
-      title: '',
-      provider: fallback.provider || '',
-      model: fallback.model || '',
-    })
+    // No provider/model: the server decides, preferring the model the last
+    // conversation used and falling back to the catalog default. Sending the
+    // client's default here would override that and snap every new
+    // conversation back to the default.
+    const res = await api.createChatSession({ title: '', workspace })
     const session = res && res.session ? res.session : null
     if (session && session.id) {
       replaceSession(session)
       chat.sessions = chat.sessions.slice().sort(byRecency)
       chat.activeId = session.id
       chat.session = session
+      chat.workspace = null
       chat.items = []
       chat.messagesError = ''
       chat.messagesStatus = 'ready'
+      // The folder counts changed, and the grouping depends on them.
+      await loadWorkspaces({ quiet: true })
     }
     return session
   } catch (err) {
@@ -718,8 +800,15 @@ export async function sendMessage(rawContent, { attachments = [] } = {}) {
     reasoningOpen: true,
     reasoningTouched: false,
     tools: [],
+    // Cards the model raises while this turn runs, in the order it asks them.
+    asks: [],
     usage: null,
     error: '',
+    // Notices are the turn's own remarks about itself — a condensed window, a
+    // budget that ran out. They are kept apart from `text` because the answer
+    // is the model's words and these are the runner's.
+    notices: [],
+    stopReason: '',
     createdAt: '',
     streaming: true,
   })
@@ -781,6 +870,31 @@ export async function sendMessage(rawContent, { attachments = [] } = {}) {
 
 const wait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms))
 
+/**
+ * One line explaining why a turn stopped on its budget.
+ *
+ * The server already appends an explanation to the answer text; this is the
+ * same fact as a rendered notice, so it can be styled apart from the model's
+ * own words and so a reader who scrolled past the text still sees it.
+ */
+function budgetStopText(event) {
+  const reason = typeof event.reason === 'string' ? event.reason : ''
+  const steps = numberOrNull(event.step)
+  const tokens = numberOrNull(event.tokens)
+  const elapsed = numberOrNull(event.elapsed_ms)
+
+  let headline = '本轮已达到步数上限'
+  if (reason === 'tokens') headline = '本轮已达到 token 预算'
+  else if (reason === 'deadline') headline = '本轮已达到时间上限'
+
+  const parts = [headline]
+  if (steps) parts.push(`共 ${steps} 步`)
+  if (tokens) parts.push(`已用 ${formatCompact(tokens)} tokens`)
+  if (elapsed !== null) parts.push(`耗时 ${formatDuration(elapsed)}`)
+  parts.push('工作区改动已落盘，回复「继续」可接着做')
+  return parts.join(' · ')
+}
+
 /** Stop the running turn. The server still persists what it produced. */
 export function stopStreaming() {
   if (!controller) return
@@ -788,6 +902,54 @@ export function stopStreaming() {
   controller = null
   setNotice('已停止生成')
   pending.abort()
+}
+
+/** The card with this id, wherever it currently lives in the conversation. */
+function findAsk(id) {
+  for (let i = chat.items.length - 1; i >= 0; i--) {
+    const item = chat.items[i]
+    const asks = item && Array.isArray(item.asks) ? item.asks : []
+    const found = asks.find((card) => card && card.id === id)
+    if (found) return found
+  }
+  return null
+}
+
+/**
+ * Submit one card's answer.
+ *
+ * The answer travels on its own request (the turn's response is busy streaming),
+ * so this is a plain POST whose success means the waiting tool has been woken
+ * up. The card is settled from what was submitted immediately, because the model
+ * may take a while to use it — and it is settled *only* after the POST returns,
+ * so a failure leaves the choices editable rather than pretending they were sent.
+ */
+export async function submitAsk(askId, { selected = [], text = '' } = {}) {
+  const sessionId = chat.activeId
+  const card = findAsk(askId)
+  if (!card || !sessionId) return
+  // Already answered (another tab, or a double click): the first submission wins.
+  if (card.status !== ASK_PENDING) return
+
+  const picked = Array.isArray(selected) ? [...selected] : []
+  const typed = typeof text === 'string' ? text.trim() : ''
+  card.status = ASK_SUBMITTING
+  card.error = ''
+  chat.streamTick += 1
+
+  try {
+    await api.answerQuestion(sessionId, askId, { selected: picked, text: typed })
+    card.selected = picked
+    card.text = typed
+    card.status = ASK_ANSWERED
+  } catch (err) {
+    if (err && err.status === 401) return
+    card.error = errorText(err, '提交失败，请重试')
+    // 404 means the question is no longer waiting — answered elsewhere, timed
+    // out, or the turn is over. Offering the card again would only fail again.
+    card.status = err && err.status === 404 ? ASK_CANCELLED : ASK_PENDING
+  }
+  chat.streamTick += 1
 }
 
 function handleEvent(turn, event) {
@@ -812,6 +974,10 @@ function handleEvent(turn, event) {
       return true
 
     case 'tool_call': {
+      // ask_user is not rendered as a tool row: the case it belongs to is the
+      // card, and pushing it here would show the same exchange twice — and, for
+      // the moment between the call and the question, as a card nobody answered.
+      if (isAskTool(event.tool_name)) return true
       turn.tools.push(
         toolItem(
           { id: event.tool_call_id, name: event.tool_name, args: event.tool_args },
@@ -823,6 +989,7 @@ function handleEvent(turn, event) {
     }
 
     case 'tool_result': {
+      if (isAskTool(event.tool_name)) return true
       const id = String(event.tool_call_id || '')
       let tool = turn.tools.find((item) => item.id === id)
       if (!tool) {
@@ -833,11 +1000,59 @@ function handleEvent(turn, event) {
       tool.error = typeof event.tool_error === 'string' ? event.tool_error : ''
       tool.durationMs = numberOrNull(event.duration_ms)
       tool.status = tool.error ? 'failed' : 'ok'
+      // A tool that manages background processes just ran, so the count in this
+      // conversation's header is now stale. This is the only signal that a job
+      // appeared while nothing was running to poll for: the store's interval
+      // exists only while something is alive.
+      noteJobsToolRan(tool.name)
+      return true
+    }
+
+    // A question the model is waiting on, or the outcome of one that was already
+    // on screen. Both shapes share the event type; `ask` marks the announcement.
+    case 'ask_user': {
+      const card = askFromEvent(event)
+      if (card) {
+        turn.asks.push(card)
+        return true
+      }
+      const id = typeof event.ask_id === 'string' ? event.ask_id : ''
+      const existing = id ? turn.asks.find((item) => item.id === id) : null
+      if (existing) {
+        applyAskOutcome(existing, event)
+        // The server's word replaces the local one, including when it settles a
+        // card the user never managed to answer.
+        existing.error = ''
+      }
       return true
     }
 
     case 'usage':
       turn.usage = addUsage(turn.usage, event.usage)
+      return true
+
+    // The window was condensed to stay inside the token budget. It is a notice
+    // rather than a warning: the turn carries on, with a smaller window.
+    case 'context_compressed':
+      turn.notices.push({
+        kind: 'context',
+        step: numberOrNull(event.step),
+        text: typeof event.text === 'string' ? event.text : '上下文已压缩',
+      })
+      return true
+
+    // The turn stopped because a budget ran out, not because the model was
+    // done. Recorded on the turn (and rendered as its own line) so the answer
+    // is never mistaken for a complete one.
+    case 'budget_stop':
+      turn.stopReason = typeof event.reason === 'string' ? event.reason : 'budget'
+      turn.notices.push({
+        kind: 'budget',
+        step: numberOrNull(event.step),
+        tokens: numberOrNull(event.tokens),
+        elapsedMs: numberOrNull(event.elapsed_ms),
+        text: budgetStopText(event),
+      })
       return true
 
     case 'done':
@@ -868,3 +1083,180 @@ export function dismissActionError() {
   chat.pendingContent = ''
   chat.pendingAttachments = []
 }
+
+// ------------------------------------------------------- workspace (per conversation) --
+
+/**
+ * Load the workspaces and the sidebar's grouping data.
+ *
+ * One request answers the whole sidebar: the workspaces with their conversation
+ * counts, which one a new conversation would start in, and the home directory
+ * the picker opens at. A failure is recorded rather than thrown — a deployment
+ * without the workspace layer answers 404, and that must leave the conversation
+ * usable rather than putting an error banner over a working chat.
+ */
+export async function loadWorkspaces({ quiet = false } = {}) {
+  if (!quiet) chat.workspacesStatus = 'loading'
+  try {
+    const res = await api.workspaces()
+    chat.workspaces = (res && res.workspaces) || []
+    chat.defaultWorkspace = (res && res.default) || ''
+    chat.homeDir = (res && res.home) || ''
+    chat.workspacesNote = (res && res.note) || ''
+    chat.workspaceWarnings = (res && res.warnings) || []
+    chat.workspacesError = ''
+    chat.workspacesStatus = 'ready'
+    return true
+  } catch (err) {
+    if (err && err.status === 401) return false
+    if (err && err.status === 404) {
+      // No workspace layer on this server: a state the sidebar renders as a
+      // plain list, not an error to complain about.
+      chat.workspacesAvailable = false
+      chat.workspaces = []
+      chat.workspacesStatus = 'ready'
+      return false
+    }
+    chat.workspacesError = errorText(err, '无法读取工作区列表')
+    chat.workspaces = []
+    chat.workspacesStatus = 'ready'
+    return false
+  }
+}
+
+/**
+ * The sidebar's folders: every workspace, with the conversations that belong to
+ * it, in the order the server sent them.
+ *
+ * A conversation whose workspace is unknown (deleted while the page was open)
+ * is not dropped: it appears under a final "未归类" folder, because losing a
+ * conversation from the list is worse than showing it in the wrong place.
+ */
+export const workspaceGroups = computed(() => {
+  if (!chat.workspacesAvailable) {
+    // One group with no workspace: the sidebar renders its sessions without a
+    // folder head, which is exactly the flat list this console had before
+    // workspaces existed.
+    return [{ workspace: null, sessions: chat.sessions, flat: true }]
+  }
+  const groups = chat.workspaces.map((ws) => ({
+    workspace: ws,
+    sessions: chat.sessions.filter((session) => session.workspace === ws.name),
+  }))
+  const known = new Set(chat.workspaces.map((ws) => ws.name))
+  const orphans = chat.sessions.filter((session) => !known.has(session.workspace))
+  if (orphans.length) {
+    groups.push({
+      workspace: { name: '未归类', root: '', session_count: orphans.length, missing: true },
+      sessions: orphans,
+      orphan: true,
+    })
+  }
+  return groups
+})
+
+/** Fold or unfold a workspace folder. Local to this browser, like the theme. */
+export function toggleWorkspaceFold(name) {
+  chat.collapsedWorkspaces = {
+    ...chat.collapsedWorkspaces,
+    [name]: !chat.collapsedWorkspaces[name],
+  }
+}
+
+function workspaceErrorMessage(err, fallback) {
+  if (err && err.status === 0) return errorText(err, fallback)
+  return errorText(err, fallback)
+}
+
+/**
+ * Create a workspace from a directory the user picked.
+ *
+ * The name is optional: the server defaults it to the directory's base name,
+ * which is almost always what a person wants and is what the form pre-fills.
+ */
+export async function createWorkspace({ root, name }) {
+  chat.pendingWorkspace = root || 'new'
+  chat.actionError = ''
+  try {
+    const res = await api.createWorkspace({ root, name })
+    if (res && res.ok === false) {
+      chat.actionError = res.error || '创建工作区失败'
+      return null
+    }
+    await Promise.all([loadWorkspaces({ quiet: true }), loadSessions({ quiet: true })])
+    const created = res && res.workspace
+    if (created && created.name) setNotice(`工作区已创建：${created.name}`)
+    return created || null
+  } catch (err) {
+    if (!err || err.status !== 401) chat.actionError = workspaceErrorMessage(err, '创建工作区失败')
+    return null
+  } finally {
+    chat.pendingWorkspace = ''
+  }
+}
+
+/** Rename a workspace's label. The directory is untouched. */
+export async function renameWorkspace(from, to) {
+  const name = (to || '').trim()
+  if (!name || name === from) return false
+  chat.pendingWorkspace = from
+  chat.actionError = ''
+  try {
+    const res = await api.renameWorkspace(from, name)
+    if (res && res.ok === false) {
+      chat.actionError = res.error || '重命名失败'
+      return false
+    }
+    await Promise.all([loadWorkspaces({ quiet: true }), loadSessions({ quiet: true })])
+    // The open conversation may be in the renamed workspace, so its copy of the
+    // workspace is refreshed with it. Nothing renders that copy today — the
+    // sidebar draws the folders from chat.workspaces — but a stale one would be
+    // the next reader's bug.
+    if (chat.workspace && chat.workspace.name === from && res && res.workspace) {
+      chat.workspace = res.workspace
+    }
+    setNotice(`工作区已重命名为 ${name}`)
+    return true
+  } catch (err) {
+    if (!err || err.status !== 401) chat.actionError = workspaceErrorMessage(err, '重命名失败')
+    return false
+  } finally {
+    chat.pendingWorkspace = ''
+  }
+}
+
+/**
+ * Delete a workspace.
+ *
+ * The confirmation is the caller's job (it is destructive-looking even though it
+ * never deletes files). The answer's note is surfaced, because what a person
+ * needs to know afterwards is where their conversations went.
+ */
+export async function deleteWorkspace(name) {
+  chat.pendingWorkspace = name
+  chat.actionError = ''
+  try {
+    const res = await api.deleteWorkspace(name)
+    if (res && res.ok === false) {
+      chat.actionError = res.error || '删除工作区失败'
+      return false
+    }
+    await Promise.all([loadWorkspaces({ quiet: true }), loadSessions({ quiet: true })])
+    setNotice(res && res.moved_to ? `工作区已删除，对话已移动到 ${res.moved_to}` : '工作区已删除')
+    return true
+  } catch (err) {
+    if (!err || err.status !== 401) chat.actionError = workspaceErrorMessage(err, '删除工作区失败')
+    return false
+  } finally {
+    chat.pendingWorkspace = ''
+  }
+}
+
+// Pointing an existing conversation at another workspace is deliberately gone
+// from the console: the header picker was removed because the sidebar already
+// says which workspace a conversation is in, and nothing else offered the move.
+// A conversation is placed in a workspace when it is created — the + on a
+// workspace folder — and stays there. The server route it used to call
+// (PUT /api/chat/sessions/:id/workspace) still exists for a script that needs
+// it; the console has no control for it.
+

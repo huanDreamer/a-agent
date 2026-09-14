@@ -17,6 +17,13 @@ import (
 	"github.com/huan/huan-agent/internal/usage"
 )
 
+// MaxStepsCeiling is the largest step budget this agent will honour.
+//
+// It is deliberately lower than chat.MaxStepsCeiling: the web/IM runner carries
+// a token budget and a deadline alongside its step cap, while this ReAct loop
+// has only the step count, so the ceiling is doing more of the work here.
+const MaxStepsCeiling = 200
+
 // Config wires an Agent to its dependencies. Model is required; the
 // other fields are optional. Tools may be nil for a chat-only agent.
 type Config struct {
@@ -28,7 +35,10 @@ type Config struct {
 	// mutating the registry afterwards requires a new Agent.
 	Tools *tool.Registry
 
-	// MaxSteps caps model→tool→model iterations. Default 12, max 25.
+	// MaxSteps caps model→tool→model iterations. Default 12, ceiling
+	// MaxStepsCeiling. A larger value is clamped to the ceiling and logged:
+	// this loop has no token or wall-clock budget of its own, so the step count
+	// is the only thing standing between a looping model and an unbounded bill.
 	MaxSteps int
 
 	// Recorder persists LLM token usage. Optional.
@@ -60,14 +70,22 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	if cfg.Tools == nil {
 		cfg.Tools = tool.NewRegistry()
 	}
+	// Logger first: the clamp below reports itself through it, and a nil logger
+	// in a test would otherwise be a nil dereference rather than a warning.
+	if cfg.Logger == nil {
+		cfg.Logger = zap.NewNop()
+	}
 	if cfg.MaxSteps <= 0 {
 		cfg.MaxSteps = 12
 	}
-	if cfg.MaxSteps > 25 {
-		cfg.MaxSteps = 25
-	}
-	if cfg.Logger == nil {
-		cfg.Logger = zap.NewNop()
+	if cfg.MaxSteps > MaxStepsCeiling {
+		// Clamped rather than refused, and said out loud: the CLI is often run
+		// from a script whose exit code matters more than its step count.
+		// Silently honouring 5000 would be worse than either — a runaway loop
+		// with no budget to stop it, discovered on the invoice.
+		cfg.Logger.Warn("agent: max_steps clamped to the ceiling",
+			zap.Int("requested", cfg.MaxSteps), zap.Int("ceiling", MaxStepsCeiling))
+		cfg.MaxSteps = MaxStepsCeiling
 	}
 
 	specs, err := cfg.Tools.List(ctx)

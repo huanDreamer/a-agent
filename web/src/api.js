@@ -1,12 +1,14 @@
 // Minimal fetch wrapper for the huan-agent admin API.
 //
 // - sends cookies (`credentials: 'same-origin'`) so a deployment with
-//   `admin.require_login: true` would still be able to carry a session cookie;
-//   the login-free default (require_login: false) needs none;
+//   `admin.require_login: true` carries its session cookie; the login-free
+//   default (require_login: false) has no cookie to carry;
 // - decodes/encodes JSON and raises ApiError (carrying the HTTP status) on
 //   every failure, so views never have to inspect Response objects;
-// - a 401 means the server wants a session this console cannot provide: the
-//   registered handler surfaces a shell notice before the error propagates.
+// - a 401 on a data call means the session the console held is no longer
+//   accepted: the registered handler sends the console back to its login form
+//   (or, where login is off, reports the mismatch) before the error propagates.
+//   `POST /api/login` opts out of that handler — see `own401`.
 
 import { createSseParser, parseSsePayload } from './sse.js'
 
@@ -53,7 +55,11 @@ function buildUrl(path, query) {
 }
 
 async function request(path, options = {}) {
-  const { method = 'GET', body, query } = options
+  // `own401` marks a request that interprets 401 itself: on POST /api/login a
+  // 401 means "wrong password" (or the login throttle), which is the form's
+  // business, not a dead session — telling the console its session expired
+  // while it is trying to obtain one would be nonsense.
+  const { method = 'GET', body, query, own401 = false } = options
   const init = {
     method,
     credentials: 'same-origin',
@@ -78,7 +84,7 @@ async function request(path, options = {}) {
       data = JSON.parse(text)
     } catch (cause) {
       if (response.status === 401) {
-        notifyUnauthorized()
+        if (!own401) notifyUnauthorized()
         throw new ApiError('服务端要求登录（HTTP 401）', 401, null)
       }
       throw new ApiError(`服务器返回了非 JSON 响应（HTTP ${response.status}）`, response.status, text)
@@ -86,7 +92,7 @@ async function request(path, options = {}) {
   }
 
   if (response.status === 401) {
-    notifyUnauthorized()
+    if (!own401) notifyUnauthorized()
     throw new ApiError(messageOf(data, '服务端要求登录（HTTP 401）'), 401, data)
   }
 
@@ -315,10 +321,20 @@ function usageQuery(filters = {}) {
 }
 
 export const api = {
-  // --- bootstrap --------------------------------------------------------
-  // The console is login-free: /api/me is only the boot probe (it answers 200
-  // with {"authenticated":false} when require_login is off).
+  // --- session ----------------------------------------------------------
+  // The boot probe. It always answers 200 and says two things: whether *this
+  // caller* would be asked for a password (`login_required` — admin.require_login,
+  // minus the loopback exemption admin.trust_loopback gives a browser on the
+  // server's own machine) and whether we hold a session. The console picks
+  // between the shell and the login form from that, instead of mounting every
+  // panel and reading the answer out of a dozen 401s.
   me: () => request('/api/me'),
+  // Exchanges the single admin password for a session cookie. The token is
+  // httpOnly and never reaches this code: the browser stores it and sends it
+  // back on its own.
+  login: (password) => request('/api/login', { method: 'POST', body: { password }, own401: true }),
+  // Revokes the session server-side; the response also expires the cookie.
+  logout: () => request('/api/logout', { method: 'POST' }),
 
   // --- usage ------------------------------------------------------------
   usageSummary: (filters) => request('/api/usage/summary', { query: usageQuery(filters) }),
@@ -337,9 +353,38 @@ export const api = {
   audit: ({ limit = 50, tool, user } = {}) => request('/api/audit', { query: { limit, tool, user } }),
 
   // --- skills -----------------------------------------------------------
+  // A skill is one markdown file (YAML frontmatter + instructions) in the
+  // configured skills directory. The list is the toggle surface; the detail
+  // route carries the body the editor loads, and PUT writes it back.
   skills: () => request('/api/skills'),
   setSkillEnabled: (name, enabled) =>
     request(`/api/skills/${encodeURIComponent(name)}`, { method: 'POST', body: { enabled } }),
+  skillDetail: (name) => request(`/api/skills/${encodeURIComponent(name)}`),
+  saveSkill: (name, body) =>
+    request(`/api/skills/${encodeURIComponent(name)}`, { method: 'PUT', body }),
+  deleteSkill: (name) =>
+    request(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  // 技能写作助手: a description in, a draft skill out. Nothing is written —
+  // saving is a separate, deliberate PUT.
+  draftSkill: (body) => request('/api/skills-draft', { method: 'POST', body }),
+
+  // --- MCP servers -------------------------------------------------------
+  // The row shape is the stored definition plus `runtime` (connected / tools /
+  // error), so one object is enough to render a row.
+  mcpServers: () => request('/api/mcp/servers'),
+  saveMcpServer: (body) => request('/api/mcp/servers', { method: 'POST', body }),
+  deleteMcpServer: (id) =>
+    request(`/api/mcp/servers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // 测试连接: on a saved server, or on a definition that has not been saved yet
+  // (probe), which is what the form uses so a broken server never reaches the
+  // runtime.
+  testMcpServer: (id) =>
+    request(`/api/mcp/servers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  probeMcpServer: (body) => request('/api/mcp/probe', { method: 'POST', body }),
+  // 重连: reconnect everything, for a transport that died under a running server.
+  reloadMcp: () => request('/api/mcp/reload', { method: 'POST' }),
+  // 配置助手: a description in, a draft definition out.
+  draftMcpServer: (body) => request('/api/mcp/draft', { method: 'POST', body }),
 
   // --- chat -------------------------------------------------------------
   chatModels: () => request('/api/chat/models'),
@@ -352,12 +397,84 @@ export const api = {
     request(`/api/chat/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   clearChatSession: (id) =>
     request(`/api/chat/sessions/${encodeURIComponent(id)}/clear`, { method: 'POST' }),
+  // The answer to an ask_user card. It is a second request on purpose: the
+  // streaming response for this turn is already committed to its event stream,
+  // so the question id is the only thing that can join the two.
+  answerQuestion: (sessionId, questionId, body) =>
+    request(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(questionId)}/answer`,
+      { method: 'POST', body },
+    ),
 
   // --- traces (Langfuse) ------------------------------------------------
   traceStatus: () => request('/api/traces/status'),
   traces: ({ limit = 50, page = 1, session, user, name } = {}) =>
     request('/api/traces', { query: { limit, page, session, user, name } }),
   trace: (id) => request(`/api/traces/${encodeURIComponent(id)}`),
+
+  // --- openviking (context database) -------------------------------------
+  // Every route answers 200 when the integration is off, with
+  // `{enable:false, message}`: "not configured" is a state the console renders,
+  // not an error it reports. A sync that cannot run answers 200 with
+  // `{ok:false, error}` for the same reason, and 409 only when one is already
+  // running — which api.js surfaces as an ordinary message.
+  openVikingStatus: () => request('/api/openviking/status'),
+  syncOpenViking: (full = false) =>
+    request('/api/openviking/sync', { method: 'POST', body: { full } }),
+  saveOpenVikingDocument: (body) => request('/api/openviking/save', { method: 'POST', body }),
+  openVikingDocuments: () => request('/api/openviking/documents'),
+  flushOpenViking: () => request('/api/openviking/flush', { method: 'POST' }),
+
+  // --- workspaces (the sidebar's folders) --------------------------------
+  // A workspace is a directory the agent may work in, and every conversation
+  // belongs to one. The console creates one by *picking an existing directory*,
+  // which is why the picker talks to /api/fs/dirs rather than using a file
+  // input: a browser cannot hand the server a path it chose.
+  //
+  // Two contracts worth knowing:
+  //   * deleting never deletes files, and moves the folder's conversations to
+  //     another workspace — the answer says where;
+  //   * renaming changes only the label, never the directory.
+  workspaces: () => request('/api/workspaces'),
+  workspace: (name) => request(`/api/workspaces/${encodeURIComponent(name)}`),
+  createWorkspace: ({ root, name }) =>
+    request('/api/workspaces', { method: 'POST', body: { root, name } }),
+  renameWorkspace: (name, next) =>
+    request(`/api/workspaces/${encodeURIComponent(name)}`, {
+      method: 'PATCH',
+      body: { name: next },
+    }),
+  deleteWorkspace: (name) =>
+    request(`/api/workspaces/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  // browseDirs lists the subdirectories of a path (the home directory when it is
+  // empty), for the picker. A path that cannot be read answers 200 with
+  // `{ok:false, error}`: the picker shows the reason in place rather than
+  // replacing the view with an error page.
+  browseDirs: (path = '') => request('/api/fs/dirs', { query: { path } }),
+  // GET/PUT /api/chat/sessions/:id/workspace are deliberately not wrapped here
+  // any more: the console has no control that reads or moves a conversation's
+  // workspace (it is chosen when the conversation is created, and the sidebar
+  // shows it as the folder). The routes still exist server-side for a script
+  // that needs them.
+
+  // --- background jobs (the agent's own shell processes) ------------------
+  // The list is bounded server-side and keeps finished jobs, so one call is
+  // enough to render "运行中" and "已结束" side by side.
+  //
+  // `output` is a window, not the whole log: omitting `from` returns the tail
+  // (plus the byte offset to continue from), and `dropped_bytes` reports how
+  // much was discarded before the window — the caller is expected to say so
+  // rather than present a partial log as complete.
+  //
+  // stop and forget are the only two mutations, and each is refused by the
+  // server in the state where it would be meaningless: 409 when stopping a job
+  // that already ended, and 409 when forgetting one that is still running.
+  listJobs: ({ session } = {}) => request('/api/jobs', { query: { session } }),
+  jobOutput: (id, { from, maxBytes } = {}) =>
+    request(`/api/jobs/${encodeURIComponent(id)}`, { query: { from, max_bytes: maxBytes } }),
+  stopJob: (id, { signal = 'term' } = {}) =>
+    request(`/api/jobs/${encodeURIComponent(id)}/stop`, { method: 'POST', body: { signal } }),
+  forgetJob: (id) => request(`/api/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   // --- meta -------------------------------------------------------------
   meta: () => request('/api/meta'),

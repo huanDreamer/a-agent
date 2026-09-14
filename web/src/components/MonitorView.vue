@@ -35,7 +35,7 @@ const NOTES = {
   user: () => `${rangeNote.value} · 用户维度用量（key 为飞书 open_id）`,
   recent: () => `${rangeNote.value} · 最新在前 · 悬停时间可查看绝对时间`,
   audit: () => '工具调用审计 · 最新在前 · 可按工具名与用户过滤',
-  traces: () => '对话与工具调用的 trace 来自 Langfuse，经本机 API 代理读取',
+  traces: () => '对话与工具调用的 trace 记录在本机数据库，无需外部服务',
 }
 
 const active = computed(() => PANELS[state.monitor] || DashboardView)

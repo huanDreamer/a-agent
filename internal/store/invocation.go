@@ -16,9 +16,9 @@ func (s *sqliteStore) RecordInvocation(ctx context.Context, e InvocationEvent) e
 	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO tool_invocations
-		 (session_id, user_id, tool_name, arguments, result, err, duration_ms)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		e.SessionID, e.UserID, e.ToolName, e.Arguments, e.Result, e.Err, e.DurationMs,
+		 (session_id, user_id, tool_name, arguments, result, err, workspace, duration_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.SessionID, e.UserID, e.ToolName, e.Arguments, e.Result, e.Err, e.Workspace, e.DurationMs,
 	)
 	if err != nil {
 		return fmt.Errorf("invocation insert: %w", err)
@@ -55,7 +55,7 @@ func (s *sqliteStore) QueryInvocations(ctx context.Context, f InvocationFilter) 
 		args = append(args, f.Until.UTC())
 	}
 
-	q := `SELECT id, session_id, user_id, tool_name, arguments, result, err, duration_ms, created_at
+	q := `SELECT id, session_id, user_id, tool_name, arguments, result, err, workspace, duration_ms, created_at
 	      FROM tool_invocations`
 	q += whereClause(conds)
 	q += " ORDER BY id DESC LIMIT ?"
@@ -71,7 +71,7 @@ func (s *sqliteStore) QueryInvocations(ctx context.Context, f InvocationFilter) 
 	for rows.Next() {
 		var r InvocationRecord
 		if err := rows.Scan(&r.ID, &r.SessionID, &r.UserID, &r.ToolName, &r.Arguments,
-			&r.Result, &r.Err, &r.DurationMs, &r.CreatedAt); err != nil {
+			&r.Result, &r.Err, &r.Workspace, &r.DurationMs, &r.CreatedAt); err != nil {
 			return nil, fmt.Errorf("invocation scan: %w", err)
 		}
 		out = append(out, r)

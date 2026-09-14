@@ -19,6 +19,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/huan/huan-agent/internal/config"
+	"github.com/huan/huan-agent/internal/jobs"
+	"github.com/huan/huan-agent/internal/mcp"
 	"github.com/huan/huan-agent/internal/pricing"
 	"github.com/huan/huan-agent/internal/store"
 )
@@ -151,17 +153,40 @@ func requireStatus(t *testing.T, resp *http.Response, want int) {
 type buildOpts struct {
 	seed func(store.Store)
 	chat ChatDeps
+	// mcpDial replaces how MCP connections are opened, so the MCP API can be
+	// tested against in-process servers instead of spawned processes.
+	mcpDial mcp.Dialer
+	// st, when set, replaces the database the harness would open itself.
+	//
+	// A test that needs the tracer and the server on one database has to own the
+	// store: building the recorder first and handing it in is the only way to
+	// keep them together, and a tracer writing to a different database would
+	// prove nothing about what the console reads back.
+	st store.Store
+	// tracer and traces wire the conversation's tracer and the trace reader.
+	tracer chatTracer
+	traces TraceReader
+	// openviking, when set, is the context-database integration the console
+	// talks to. Nil covers the "not configured" state.
+	openviking OpenVikingConsole
+	// jobs, when set, is the background-process supervisor the console lists and
+	// stops. Nil covers a deployment with background jobs turned off.
+	jobs *jobs.Manager
 }
 
 // buildServerWith constructs a Server with optional chat wiring.
 func buildServerWith(t *testing.T, opts buildOpts) (*Server, store.Store) {
 	t.Helper()
 
-	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
+	st := opts.st
+	if st == nil {
+		opened, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		st = opened
+		t.Cleanup(func() { _ = st.Close() })
 	}
-	t.Cleanup(func() { _ = st.Close() })
 	if opts.seed != nil {
 		opts.seed(st)
 	}
@@ -180,6 +205,11 @@ func buildServerWith(t *testing.T, opts buildOpts) (*Server, store.Store) {
 		Model:         "deepseek-chat",
 		ChatMaxSteps:  4,
 		Chat:          opts.chat,
+		OpenViking:    opts.openviking,
+		Jobs:          opts.jobs,
+		MCPDial:       opts.mcpDial,
+		Tracer:        opts.tracer,
+		Traces:        opts.traces,
 		Logger:        zap.NewNop(),
 	}, st, pricing.NewTable(map[string]pricing.Rate{
 		"deepseek/deepseek-chat": {PromptPer1K: 0.001, CompletionPer1K: 0.002},
@@ -193,6 +223,10 @@ func buildServerWith(t *testing.T, opts buildOpts) (*Server, store.Store) {
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
+	// Apply the stored MCP servers, which is what the process does at startup.
+	// Doing it here keeps a test's first assertion about a config-declared
+	// server from racing a background goroutine.
+	srv.SyncMCP(context.Background())
 	return srv, st
 }
 

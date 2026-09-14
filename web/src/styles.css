@@ -410,6 +410,10 @@ samp {
   gap: 4px;
   flex-wrap: wrap;
   font-size: 11px;
+  /* Pinned rather than left to the inherited 1.55: the row's action icons are
+     centred on this line by calculation (see .session-actions), and a line box
+     that moved with the font size would put them off by a couple of pixels. */
+  line-height: 17px;
   color: var(--muted-foreground);
 }
 
@@ -423,21 +427,35 @@ samp {
    section). */
 .session-item {
   position: relative;
+  /* The three numbers .session-actions uses to sit on the metadata line: this
+     row's padding, the pick button's vertical padding, and that line's height. */
+  --item-pad: 2px;
+  --pick-pad-y: 6px;
+  --meta-line: 17px;
+  --action-size: 26px;
 }
 
-/* The group is centred on the row and has no surface of its own: each button
-   carries a rounded hover fill instead. A solid background patch floating over
-   the row's second line is what read as a block pasted on top of the row.
+/* The group hangs on the row's SECOND line — the metadata — and has no surface
+   of its own: each button carries a rounded hover fill instead. A solid
+   background patch floating over the row is what read as a block pasted on top
+   of it.
 
-   `bottom` is deliberately absent: centring with a transform keeps the group
-   inside the row whatever its height, and the absolute position means the row
-   itself never changes size when they appear. */
+   It is anchored to the metadata line rather than centred on the row, because
+   the row's first line is the title: centred, the icons sat across the title and
+   covered the tail of a long one (which is ellipsised at the right edge, exactly
+   where the icons are). On the metadata line they sit with "xx 小时前 · xx 条"
+   instead, and the title keeps its full width.
+
+   `bottom` is computed from the paddings above and the line height, so the
+   alignment survives a change to any of them. The absolute position is what
+   keeps the row from reflowing when the icons appear. */
 .session-actions,
 .session-confirm {
   position: absolute;
   right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
+  bottom: calc(
+    var(--item-pad) + var(--pick-pad-y) + (var(--meta-line) - var(--action-size)) / 2
+  );
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -850,6 +868,18 @@ samp {
   color: var(--muted-strong);
   border-color: var(--border);
   background: var(--muted);
+}
+
+/* Something is degraded without being a failure: OpenViking enabled but
+   unreachable. It has to be visible, and it must not read as a broken page. */
+.banner.warn {
+  color: var(--warning-soft);
+  border-color: var(--warning-soft);
+  background: var(--warning-fill);
+}
+
+.banner.warn > .ico {
+  color: var(--warning-soft);
 }
 
 .banner .banner-text {
@@ -1463,12 +1493,6 @@ table.data tbody tr.selected {
   margin-bottom: 4px;
 }
 
-.msg-role {
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--muted-strong);
-}
-
 .msg-head .chip {
   padding: 2px 8px;
   font-size: 11px;
@@ -1497,6 +1521,45 @@ table.data tbody tr.selected {
 .banner.turn-warn {
   margin-top: 8px;
   font-size: 12.5px;
+}
+
+/* A budget stop is not an error — the turn did its work and stopped — but it is
+   not business as usual either, so it borrows the warning tone rather than the
+   destructive one. */
+.banner.notice {
+  border-color: var(--warning-soft);
+  background: var(--warning-fill);
+  color: var(--foreground);
+}
+
+.banner.notice > .ico {
+  color: var(--warning-soft);
+}
+
+/* 上下文已压缩: a quiet fact about the turn, listed above its footer. Deliberately
+   not a banner — the turn carried on normally, and a banner would read as a
+   failure. */
+.turn-notices {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+
+.turn-notices li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.turn-notices li > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* 思考过程 panel: a quiet hairline, scrolls on its own. */
@@ -1538,6 +1601,191 @@ table.data tbody tr.selected {
   overflow-wrap: anywhere;
   max-height: 260px;
   overflow-y: auto;
+}
+
+/* --------------------------------------------------------- ask card -- */
+/* The model's question, as a card the user answers in place. It is the only
+   interactive thing inside an assistant bubble, so it is drawn as a raised
+   panel rather than as another quiet row: border + shadow say "this wants a
+   click", while the surrounding tool cards stay flat. All colours are tokens,
+   so the card follows the theme like everything else. */
+
+.asks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 6px 0 8px;
+}
+
+.ask-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+/* While it waits for an answer the card is the one thing on screen that has to
+   be noticed: a primary-tinted border, and no shadow change (the page must not
+   jump when the answer lands). */
+.ask-card.ask-live {
+  border-color: var(--primary);
+}
+
+.ask-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted-strong);
+  min-height: 20px;
+}
+
+.ask-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+/* The question keeps its own line breaks: a model that writes two lines means
+   two lines, and collapsing them would run a condition into its consequence. */
+.ask-question {
+  font-size: 13.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The choices. Each is a full-width row: the label is the answer and has to be
+   readable at a glance, and the description under it is the reason to pick it. */
+.ask-options {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.ask-option {
+  appearance: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  color: var(--foreground);
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ask-option:hover:not(:disabled) {
+  background: var(--secondary);
+  border-color: var(--border-strong);
+}
+
+.ask-option:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.ask-option:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+
+/* The picked state is the answer, so it is marked twice — the check glyph for
+   what was chosen and the border for where the eye already is. */
+.ask-option.picked {
+  border-color: var(--primary);
+  background: var(--secondary);
+}
+
+.ask-mark {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--primary-foreground);
+  background: var(--muted);
+}
+
+.ask-option.picked .ask-mark {
+  background: var(--primary);
+  border-color: var(--primary);
+}
+
+.ask-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ask-option-label {
+  overflow-wrap: anywhere;
+}
+
+.ask-option-desc {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  overflow-wrap: anywhere;
+}
+
+/* The free-text box: same input styling as the rest of the console, one line
+   tall until something is typed (the component grows it). */
+.ask-input {
+  resize: none;
+  min-height: 32px;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-y: auto;
+}
+
+/* The settled card states the answer in the same words the model was given. */
+.ask-answer {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--success-soft);
+  overflow-wrap: anywhere;
+}
+
+.ask-answer-text {
+  color: var(--foreground);
+}
+
+.ask-closed {
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.ask-error {
+  font-size: 12.5px;
+  color: var(--destructive);
+  overflow-wrap: anywhere;
+}
+
+.ask-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ask-hint {
+  font-size: 12px;
+  min-width: 0;
 }
 
 .tools {
@@ -1620,8 +1868,14 @@ table.data tbody tr.selected {
   margin-top: 4px;
 }
 
+/* The turn's numbers and, when tracing recorded one, the way into its trace.
+   `align-items: center` matters only once the button is present: without it the
+   default `stretch` sets every text run against the top of the button's box
+   instead of on the button's own centre line, so 耗时 and 链路 disagree by a few
+   pixels — exactly the misalignment this row is supposed to avoid. */
 .turn-usage {
   display: flex;
+  align-items: center;
   gap: 12px;
   flex-wrap: wrap;
   margin-top: 9px;
@@ -1630,6 +1884,18 @@ table.data tbody tr.selected {
   font-size: 11.5px;
   color: var(--muted-foreground);
   font-variant-numeric: tabular-nums;
+}
+
+/* The answer's actions sit together at the far edge, not trailing the last
+   number: the numbers are a summary and these are actions.
+   `margin-left: auto` rather than a spacer element, because the row wraps on a
+   narrow bubble — a spacer would hold line one open and leave the group
+   left-aligned on line two, which is where it most needs to stay right. */
+.turn-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
 }
 
 .turn-usage b {
@@ -3180,6 +3446,130 @@ table.data tbody tr.row-click:focus-visible {
   min-width: 0;
 }
 
+/* ---------------------------------------------------------------- MCP --- */
+
+/* Server rows. They share the shape of a provider row (a pick-less main block
+   plus an action strip that wraps) because they carry the same kind of facts:
+   an identity, a live status, and a set of per-row actions. */
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+
+.mcp-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 13px 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.mcp-row.off .mcp-main {
+  opacity: 0.62;
+}
+
+.mcp-main {
+  flex: 1 1 320px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.mcp-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.mcp-endpoint {
+  color: var(--muted-foreground);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.mcp-env,
+.mcp-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+/* A child that must be readable across the whole row rather than inside the
+   flex main column, which is narrower once the actions take their width. */
+.mcp-full {
+  flex: 1 1 100%;
+}
+
+/* The AI-assistant output: a quiet inset panel, like the refresh report. */
+.mcp-assistant-row {
+  margin-top: 10px;
+}
+
+.mcp-assistant-out {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--muted);
+  font-size: 12.5px;
+  color: var(--muted-strong);
+}
+
+.mcp-assistant-note {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.mcp-warn-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mcp-warn-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--warning);
+  overflow-wrap: anywhere;
+}
+
+/* The model's raw reply, for when a draft looks wrong and the answer is "what
+   did it actually say?". Monospace and scrollable so a long JSON blob cannot
+   push the form off screen. */
+.mcp-raw {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 技能: the action strip sits to the right of the text block, wrapping under it
+   at narrow widths. */
+.skill-actions {
+  flex: 0 1 auto;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
 /* ------------------------------------------------- 能力绑定（模型） ------ */
 
 .bind-list {
@@ -3271,6 +3661,13 @@ table.data tbody tr.row-click:focus-visible {
 
   /* No hover on touch: keep the row actions reachable instead of hiding them. */
   .session-actions {
+    visibility: visible;
+    opacity: 1;
+  }
+
+  /* The same for a folder's own actions (new conversation / rename / delete):
+     the drawer is opened precisely to reach them. */
+  .ws-actions {
     visibility: visible;
     opacity: 1;
   }
@@ -3378,5 +3775,609 @@ table.data tbody tr.row-click:focus-visible {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+/* ------------------------------------------------- workspace folders --- */
+
+/* The session list is grouped by workspace, one folder per workspace, because
+   "which project is this conversation in" is the first thing a person looks for
+   in a long list — and it is also where the workspace itself is managed. */
+
+.ws-folder {
+  margin-bottom: 2px;
+}
+
+.ws-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 6px 5px 4px;
+  border-radius: var(--radius);
+  color: var(--muted-foreground);
+}
+
+.ws-head:hover {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+/* The fold toggle is the row: clicking the folder name anywhere folds it. */
+.ws-fold {
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 2px;
+  display: inline-flex;
+  align-items: center;
+  color: inherit;
+  cursor: pointer;
+}
+
+.ws-name {
+  appearance: none;
+  border: 1px solid transparent;
+  background: none;
+  color: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 1px 3px;
+  border-radius: 6px;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.ws-name:hover {
+  border-color: var(--border);
+}
+
+.ws-count {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  flex: 0 0 auto;
+}
+
+.ws-head .spacer {
+  flex: 1 1 auto;
+}
+
+/* Row actions appear on hover or keyboard focus, like the session rows — and,
+   like them, they use visibility rather than display so the ≤900px touch
+   override below can reveal them (there is no hover on a phone, and a folder's
+   rename/delete are exactly what the drawer is opened for). */
+.ws-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  flex: 0 0 auto;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.ws-head:hover .ws-actions,
+.ws-head:focus-within .ws-actions,
+.ws-head.pending .ws-actions {
+  visibility: visible;
+  opacity: 1;
+}
+
+/* The rename field replaces the label in place, so it stays inside the head. */
+.ws-head .input {
+  height: 26px;
+  font-size: 12.5px;
+  min-width: 0;
+}
+
+.ws-warning {
+  font-size: 11px;
+  color: var(--warning, var(--amber));
+  padding: 2px 8px 4px 22px;
+}
+
+.ws-sessions {
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 0 0 0 10px;
+  border-left: 1px solid var(--border);
+  margin-left: 12px;
+}
+
+/* A deployment without a workspace layer: no folder head, and no indent or rule
+   to imply one. */
+.ws-folder.flat .ws-sessions {
+  margin-left: 0;
+  padding-left: 0;
+  border-left: none;
+}
+
+.ws-empty {
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+  padding: 3px 8px 6px 14px;
+}
+
+.side-foot {
+  flex: 0 0 auto;
+  padding: 6px 8px 2px;
+  border-top: 1px solid var(--border);
+}
+
+/* ---------------------------------------------------------- dir picker --- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: var(--overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(760px, 100%);
+  max-height: min(640px, calc(100vh - 40px));
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: var(--shadow);
+  color: var(--foreground);
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.modal-title {
+  font-weight: 650;
+  font-size: 14px;
+  flex: 1 1 auto;
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1px;
+  font-size: 12px;
+  font-family: var(--mono);
+  min-height: 22px;
+}
+
+.crumb {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--muted-foreground);
+  padding: 1px 4px;
+  border-radius: 5px;
+  cursor: pointer;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.crumb:hover {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+.crumb-sep {
+  color: var(--muted-foreground);
+  opacity: 0.6;
+}
+
+.picker-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.picker-toolbar .spacer {
+  flex: 1 1 auto;
+}
+
+/* Column view, the way macOS shows a hierarchy: each column is one directory,
+   and the folder you click is highlighted in its own column with its contents in
+   the column to its right — so the directory being chosen is always the one whose
+   contents you can see. The strip scrolls horizontally as columns appear. */
+.cols {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: stretch;
+  min-height: 190px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+.col {
+  flex: 0 0 190px;
+  min-width: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+  border-right: 1px solid var(--border);
+}
+
+/* The last column needs no divider: nothing follows it. */
+.col:last-child {
+  border-right: none;
+}
+
+.col-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 6px;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.col-row:hover {
+  background: var(--muted);
+}
+
+/* The selection: the folder whose contents fill the next column. */
+.col-row.active {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.col-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.col-note {
+  padding: 6px 8px;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+
+.col-note.error {
+  color: var(--destructive);
+}
+
+.col-note-start {
+  padding: 10px;
+}
+
+.picker-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  border-top: 1px solid var(--border);
+  padding-top: 9px;
+}
+
+/* The picker's path field: a place to paste a path, between the navigation
+   buttons and the listing they drive. */
+.picker-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  font-size: 12px;
+}
+
+/* ------------------------------------------------- login / account ----- */
+
+/* The login screen replaces the whole shell on a deployment that requires a
+   password (admin.require_login: true): one column, one field, centred. It is
+   the only screen that is not the console, so it owns the viewport instead of
+   sitting inside .app. */
+.login-gate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh; /* fallback */
+  height: 100svh;
+  padding: 24px;
+  overflow: auto;
+  background: var(--background);
+}
+
+.login-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+  max-width: 384px;
+  padding: 22px 22px 20px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+}
+
+.login-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--foreground);
+}
+
+.login-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.login-note {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--muted-strong);
+}
+
+/* Both the expired-session notice and a rejected attempt: full width in the
+   card, which is narrower than the panels the banner was designed for. */
+.login-banner {
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.login-foot {
+  margin: 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+
+/* Shown for the one request that decides between the shell and the login form,
+   so neither of them flashes on the way to the other. */
+.boot-splash {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 100vh; /* fallback */
+  height: 100svh;
+  background: var(--background);
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+/* .spin carries an inline-text margin; here it is a flex child of the splash. */
+.boot-splash .spin {
+  margin-right: 0;
+}
+
+/* Who is logged in: the last thing in the sidebar, and only present where the
+   deployment enforces a password. With require_login off there is no account to
+   show and nothing 退出登录 could end. */
+.side-account {
+  flex: 0 0 auto;
+  padding: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.account-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted-foreground);
+}
+
+.account-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--foreground);
+}
+
+.account-error {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  color: var(--destructive);
+}
+
+/* ---------------------------------------------------- background jobs ----- */
+
+/* The count in a conversation's header is a chip that acts like a button: same
+   shape and tone as the status chips beside it, but clickable, because it opens
+   the drawer that holds the list, the logs and the stop button. */
+.chip-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11.5px;
+  appearance: none;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.chip-btn:hover {
+  border-color: var(--border-strong);
+}
+
+.chip-btn > .ico {
+  flex: 0 0 auto;
+}
+
+/* The drawer of a conversation's own processes: a right-hand panel over the
+   chat column, fixed so it never reflows the transcript behind it. */
+.jobs-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  width: min(460px, 100vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--background);
+  border-left: 1px solid var(--border);
+  box-shadow: -18px 0 40px rgb(0 0 0 / 22%);
+}
+
+.jobs-drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.jobs-drawer-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex: 1 1 auto;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.jobs-drawer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 14px 16px;
+}
+
+/* A group of rows: 本会话 first, then the same workspace's other processes. */
+.jobs-group + .jobs-group {
+  margin-top: 16px;
+}
+
+.jobs-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted-strong);
+}
+
+.jobs-group-note {
+  margin: 0 0 8px;
+}
+
+.job-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  padding: 10px 11px;
+}
+
+.job-card + .job-card {
+  margin-top: 8px;
+}
+
+.job-card.selected {
+  border-color: var(--border-strong);
+}
+
+.job-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.job-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.job-command {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.job-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.job-log-head,
+.job-log-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.job-log-actions {
+  margin-top: 8px;
+}
+
+/* Below the two-row breakpoint the chat pane fills the window, so the drawer
+   becomes the whole screen and its own backdrop is enough. */
+@media (max-width: 900px) {
+  .jobs-drawer {
+    width: 100vw;
+  }
+}
+
+.jobs-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 39;
+  background: rgb(0 0 0 / 30%);
+}
+
+@media (min-width: 901px) {
+  /* On a wide screen the drawer sits beside the conversation, and a backdrop
+     that dimmed the transcript would fight the point of having both visible. */
+  .jobs-backdrop {
+    display: none;
   }
 }

@@ -16,6 +16,11 @@ type Loader struct {
 	dir string
 	mu  sync.RWMutex
 	all map[string]*Skill
+	// paths maps a skill's frontmatter name to the file it came from, so a
+	// caller that edits a skill writes back to the file it was read from
+	// instead of guessing a name from the skill's own name. The two differ
+	// whenever the file's base name is not the frontmatter name.
+	paths map[string]string
 }
 
 // NewLoader creates a Loader over dir. The directory MAY be empty
@@ -36,18 +41,21 @@ func (l *Loader) LoadAll() ([]*Skill, error) {
 
 	if l.dir == "" {
 		l.all = map[string]*Skill{}
+		l.paths = map[string]string{}
 		return nil, nil
 	}
 	entries, err := os.ReadDir(l.dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			l.all = map[string]*Skill{}
+			l.paths = map[string]string{}
 			return nil, nil
 		}
 		return nil, fmt.Errorf("skill: read dir %s: %w", l.dir, err)
 	}
 
 	loaded := map[string]*Skill{}
+	loadedPaths := map[string]string{}
 	var errs []string
 	for _, e := range entries {
 		if e.IsDir() {
@@ -74,8 +82,10 @@ func (l *Loader) LoadAll() ([]*Skill, error) {
 			continue
 		}
 		loaded[s.Frontmatter.Name] = s
+		loadedPaths[s.Frontmatter.Name] = path
 	}
 	l.all = loaded
+	l.paths = loadedPaths
 
 	if len(errs) > 0 {
 		return sortedSkills(loaded), fmt.Errorf("skill: %d file(s) failed: %s", len(errs), strings.Join(errs, "; "))
@@ -90,6 +100,17 @@ func (l *Loader) Get(name string) (*Skill, bool) {
 	s, ok := l.all[name]
 	return s, ok
 }
+
+// Path returns the file a loaded skill was read from, if it is loaded.
+func (l *Loader) Path(name string) (string, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	p, ok := l.paths[name]
+	return p, ok
+}
+
+// Dir returns the directory the loader scans.
+func (l *Loader) Dir() string { return l.dir }
 
 // Names returns all loaded skill names in deterministic order.
 func (l *Loader) Names() []string {

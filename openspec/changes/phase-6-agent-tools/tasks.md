@@ -37,6 +37,7 @@
 - [x] **修复 os/exec 陷阱**：`sh -c 'sleep 5 &'` 不会触发 `cmd.Cancel`（shell 已退出），改用 watchdog + 无条件 reap
 - [x] 拒绝清单（rm -rf /、mkfs、dd of=/dev/、fork bomb、shutdown…）
 - [x] 所有拒绝发生在 Start 之前，测试断言未执行
+- [x] **stdin 是 `/dev/null`**：描述里不止说"会提示的命令会失败"，还写明该写什么 —— 工具自带的非交互参数（`-y` / `--yes` / `--no-input` / `CI=1` / `git commit -m`）或把答案 pipe 进去，且不要起 REPL / pager / editor；测试固定住这几句
 - [x] 覆盖率：bash.go 92.9%
 
 ## 5. 能力与过滤

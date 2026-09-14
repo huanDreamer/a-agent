@@ -34,6 +34,14 @@ type ChatSession struct {
 	// MessageCount is populated by list queries so a UI can show it without
 	// fetching every message.
 	MessageCount int `json:"message_count"`
+	// Workspace is the workspace this conversation belongs to, read from its
+	// binding by the list/get queries.
+	//
+	// A conversation always belongs to one: the sidebar groups by this field, so
+	// a conversation without it would have no folder to appear in. A row whose
+	// binding is missing reads back with the fallback the caller passes in, which
+	// is what keeps a pre-workspace database usable.
+	Workspace string `json:"workspace"`
 }
 
 // ChatMessage is one persisted turn part.
@@ -59,15 +67,33 @@ type ChatMessage struct {
 	// defensively, and an empty value must stay distinguishable from "no
 	// attachments" without the shape changing under a client.
 	Attachments string `json:"attachments,omitempty"`
+	// TraceID is the trace that produced this answer (added in migration 7), so
+	// the conversation can offer a way into the trace that explains it. It is
+	// empty when tracing was off for the turn, or for messages written before
+	// the column existed — the UI renders that as "no link" rather than a link
+	// that leads nowhere.
+	TraceID string `json:"trace_id,omitempty"`
 	// Error records a failed turn so the UI can show it after a reload.
-	Error     string    `json:"error,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	Error string `json:"error,omitempty"`
+	// StopReason records that the turn ended on a budget rather than on the
+	// model's own answer: "steps", "tokens" or "deadline" (added in migration
+	// 11). Empty means the model finished the answer itself, which is the
+	// ordinary case and what every pre-migration row holds.
+	//
+	// It is stored next to the answer rather than only inside it because a
+	// sentence in the text cannot be rendered as a badge, counted, or read by
+	// anything that is not a human.
+	StopReason string    `json:"stop_reason,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // ChatSessionFilter narrows a session listing. Zero fields are ignored.
 type ChatSessionFilter struct {
 	UserID string
-	Limit  int
+	// Workspace restricts the listing to one workspace, for a caller that wants
+	// a single folder rather than all of them.
+	Workspace string
+	Limit     int
 }
 
 // CreateChatSession inserts a session.
@@ -96,13 +122,15 @@ func (s *sqliteStore) CreateChatSession(ctx context.Context, sess ChatSession) e
 func (s *sqliteStore) GetChatSession(ctx context.Context, id string) (ChatSession, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, title, user_id, provider, model, created_at, updated_at,
-		       (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id)
+		       (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id),
+		       COALESCE((SELECT b.workspace FROM workspace_bindings b
+		                  WHERE b.scope = 'web:' || s.id), '')
 		FROM chat_sessions s WHERE id = ?`, id)
 
 	var out ChatSession
 	var created, updated sql.NullTime
 	if err := row.Scan(&out.ID, &out.Title, &out.UserID, &out.Provider, &out.Model,
-		&created, &updated, &out.MessageCount); err != nil {
+		&created, &updated, &out.MessageCount, &out.Workspace); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ChatSession{}, ErrNotFound
 		}
@@ -123,13 +151,32 @@ func (s *sqliteStore) ListChatSessions(ctx context.Context, f ChatSessionFilter)
 		limit = 1000
 	}
 
+	// The workspace comes from the binding, joined here rather than left to the
+	// client: the sidebar groups conversations by it, so every row a list returns
+	// has to carry one, and a second request per conversation would be both
+	// slower and able to disagree with this answer.
+	//
+	// A conversation with no binding yields the empty string; the caller decides
+	// what that means (the server passes it through, and a client that groups by
+	// workspace treats it as "not yet placed" rather than inventing one).
 	q := `SELECT s.id, s.title, s.user_id, s.provider, s.model, s.created_at, s.updated_at,
-	             (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id)
+	             (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id),
+	             COALESCE((SELECT b.workspace FROM workspace_bindings b
+	                        WHERE b.scope = 'web:' || s.id), '')
 	      FROM chat_sessions s`
 	var args []any
+	conds := []string{}
 	if f.UserID != "" {
-		q += " WHERE s.user_id = ?"
+		conds = append(conds, "s.user_id = ?")
 		args = append(args, f.UserID)
+	}
+	if f.Workspace != "" {
+		conds = append(conds, `COALESCE((SELECT b.workspace FROM workspace_bindings b
+		                                 WHERE b.scope = 'web:' || s.id), '') = ?`)
+		args = append(args, f.Workspace)
+	}
+	if len(conds) > 0 {
+		q += " WHERE " + strings.Join(conds, " AND ")
 	}
 	q += " ORDER BY s.updated_at DESC, s.id DESC LIMIT ?"
 	args = append(args, limit)
@@ -145,7 +192,7 @@ func (s *sqliteStore) ListChatSessions(ctx context.Context, f ChatSessionFilter)
 		var sess ChatSession
 		var created, updated sql.NullTime
 		if err := rows.Scan(&sess.ID, &sess.Title, &sess.UserID, &sess.Provider, &sess.Model,
-			&created, &updated, &sess.MessageCount); err != nil {
+			&created, &updated, &sess.MessageCount, &sess.Workspace); err != nil {
 			return nil, fmt.Errorf("scan chat session: %w", err)
 		}
 		sess.CreatedAt = nullTime(created)
@@ -235,10 +282,10 @@ func (s *sqliteStore) AppendChatMessage(ctx context.Context, sessionID string, m
 	}
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO chat_messages
-		  (session_id, role, content, reasoning, tool_calls, tool_call_id, tool_name, usage_json, error, attachments, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  (session_id, role, content, reasoning, tool_calls, tool_call_id, tool_name, usage_json, error, attachments, trace_id, stop_reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sessionID, m.Role, m.Content, m.Reasoning, m.ToolCalls,
-		m.ToolCallID, m.ToolName, m.UsageJSON, m.Error, m.Attachments, m.CreatedAt)
+		m.ToolCallID, m.ToolName, m.UsageJSON, m.Error, m.Attachments, m.TraceID, m.StopReason, m.CreatedAt)
 	if err != nil {
 		return 0, fmt.Errorf("insert chat message: %w", err)
 	}
@@ -253,7 +300,7 @@ func (s *sqliteStore) AppendChatMessage(ctx context.Context, sessionID string, m
 // no limit.
 func (s *sqliteStore) ListChatMessages(ctx context.Context, sessionID string, limit int) ([]ChatMessage, error) {
 	q := `SELECT id, role, content, reasoning, tool_calls, tool_call_id, tool_name,
-	             usage_json, error, attachments, created_at
+	             usage_json, error, attachments, trace_id, stop_reason, created_at
 	      FROM chat_messages WHERE session_id = ? ORDER BY id ASC`
 	args := []any{sessionID}
 	if limit > 0 {
@@ -272,7 +319,8 @@ func (s *sqliteStore) ListChatMessages(ctx context.Context, sessionID string, li
 		var m ChatMessage
 		var created sql.NullTime
 		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.Reasoning, &m.ToolCalls,
-			&m.ToolCallID, &m.ToolName, &m.UsageJSON, &m.Error, &m.Attachments, &created); err != nil {
+			&m.ToolCallID, &m.ToolName, &m.UsageJSON, &m.Error, &m.Attachments, &m.TraceID,
+			&m.StopReason, &created); err != nil {
 			return nil, fmt.Errorf("scan chat message: %w", err)
 		}
 		m.CreatedAt = nullTime(created)

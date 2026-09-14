@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -16,6 +17,8 @@ import (
 	"github.com/cloudwego/hertz/pkg/protocol"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/huan/huan-agent/internal/config"
 )
 
 // cookieSameSiteLax is the SameSite policy used for the session cookie.
@@ -51,6 +54,12 @@ type authenticator struct {
 	// to combine it with a non-loopback bind.
 	disabled bool
 
+	// trustsLoopback makes every request *from this machine* pass, so a
+	// deployment can require a password of remote callers only. See
+	// config.AdminConfig.TrustLoopback for why that defaults to on and what it
+	// gives up.
+	trustsLoopback bool
+
 	mu       sync.Mutex
 	sessions map[string]time.Time // token -> expiry
 	failures []time.Time          // recent login failure timestamps
@@ -62,7 +71,8 @@ type authenticator struct {
 // With requireLogin false there are no credentials to validate: a single-user
 // local console has no account, and demanding a password hash would make a
 // fresh install refuse to start for a password it will never ask for.
-func newAuthenticator(username, passwordHash string, ttl time.Duration, logger *zap.Logger, requireLogin bool) (*authenticator, error) {
+func newAuthenticator(admin config.AdminConfig, ttl time.Duration, logger *zap.Logger) (*authenticator, error) {
+	username, passwordHash := admin.Username, admin.PasswordHash
 	if strings.TrimSpace(username) == "" {
 		username = "admin"
 	}
@@ -73,7 +83,7 @@ func newAuthenticator(username, passwordHash string, ttl time.Duration, logger *
 		logger = zap.NewNop()
 	}
 
-	if !requireLogin {
+	if !admin.RequireLogin {
 		return &authenticator{
 			username: username,
 			ttl:      ttl,
@@ -91,12 +101,52 @@ func newAuthenticator(username, passwordHash string, ttl time.Duration, logger *
 		return nil, fmt.Errorf("server: admin password_hash is not a valid bcrypt hash: %w", err)
 	}
 	return &authenticator{
-		username: username,
-		hash:     []byte(passwordHash),
-		ttl:      ttl,
-		logger:   logger,
-		sessions: make(map[string]time.Time),
+		username:       username,
+		hash:           []byte(passwordHash),
+		ttl:            ttl,
+		logger:         logger,
+		trustsLoopback: admin.TrustLoopback,
+		sessions:       make(map[string]time.Time),
 	}, nil
+}
+
+// isLoopbackPeer reports whether a connection came from this machine.
+//
+// It answers from the socket's peer address only, and never from a header:
+// X-Forwarded-For (what Hertz's ClientIP reads first) is written by whoever is
+// talking to us, so honouring it here would let any remote caller claim to be
+// local simply by sending one. The consequence is the opposite of convenient
+// and the right way round: a client behind a proxy looks like the proxy, which
+// is exactly why config.AdminConfig.TrustLoopback has to be turned off there.
+//
+// An unknown address — no connection, a unix socket, anything unparsable — is
+// not local. Hertz hands out a zero TCP address (0.0.0.0) when there is no
+// connection, so that case lands here too.
+func isLoopbackPeer(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	host := addr.String()
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	// Strip an IPv6 zone ("fe80::1%en0"), which ParseIP rejects.
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	ip := net.ParseIP(host)
+	// IsLoopback covers 127.0.0.0/8 and ::1, and To4 inside it also recognises
+	// the IPv4-mapped form (::ffff:127.0.0.1) a dual-stack listener reports.
+	return ip != nil && ip.IsLoopback()
+}
+
+// skipsPassword reports whether this caller is exempt from the password: login
+// is off entirely, or it came from this machine and loopback is trusted.
+func (a *authenticator) skipsPassword(addr net.Addr) bool {
+	if a.disabled {
+		return true
+	}
+	return a.trustsLoopback && isLoopbackPeer(addr)
 }
 
 // HashPassword produces a bcrypt hash suitable for config. It is exported so
@@ -203,10 +253,11 @@ func (a *authenticator) sessionCount() int {
 
 // requireSession is Hertz middleware rejecting unauthenticated requests.
 //
-// With login disabled it lets everything through: there is no session to check,
-// and the only thing protecting the console is that it listens on loopback.
+// It lets a caller through when this deployment has nothing to ask them:
+// login disabled entirely, or — with trust_loopback — a request that arrived
+// over the loopback interface.
 func (a *authenticator) requireSession(ctx context.Context, c *app.RequestContext) {
-	if a.disabled {
+	if a.skipsPassword(c.RemoteAddr()) {
 		c.Next(ctx)
 		return
 	}

@@ -20,6 +20,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/huan/huan-agent/internal/config"
+	"github.com/huan/huan-agent/internal/jobs"
+	"github.com/huan/huan-agent/internal/mcp"
 	"github.com/huan/huan-agent/internal/metrics"
 	"github.com/huan/huan-agent/internal/pricing"
 	"github.com/huan/huan-agent/internal/store"
@@ -65,15 +67,32 @@ type Config struct {
 	StatePath string
 	// ChatMaxSteps caps tool iterations per chat turn (0 = default).
 	ChatMaxSteps int
+	// ChatMaxTokens caps what one chat turn may spend, from the usage the
+	// provider reports (0 = unlimited).
+	ChatMaxTokens int
+	// ChatTurnDeadline bounds one chat turn's wall-clock time (0 = unlimited).
+	ChatTurnDeadline time.Duration
 	// ChatHistoryLimit bounds how many stored messages are replayed.
 	ChatHistoryLimit int
 	// ChatEnable turns the web chat endpoints on.
 	ChatEnable bool
 	// Chat carries the chat wiring. A nil Runner disables the chat endpoints.
 	Chat ChatDeps
+	// OpenViking is the context-database integration (memory mirror + document
+	// store). Nil is a supported state: every /api/openviking route then
+	// answers `enable: false` rather than failing.
+	OpenViking OpenVikingConsole
+	// MCPDial overrides how MCP connections are opened. Nil uses the real
+	// client; a test injects an in-process server so the whole MCP surface can
+	// be exercised without spawning a process.
+	MCPDial mcp.Dialer
 	// FeishuEnabled reports whether the IM bot is configured.
 	FeishuEnabled bool
-	Logger        *zap.Logger
+	// Jobs supervises the background processes this process started. Nil is a
+	// supported state: /api/jobs then answers enabled:false rather than failing,
+	// which is what a deployment with background jobs turned off should see.
+	Jobs   *jobs.Manager
+	Logger *zap.Logger
 }
 
 // Server is the admin HTTP service.
@@ -91,6 +110,27 @@ type Server struct {
 	tracer      chatTracer
 	traces      TraceReader
 	runnerCache runnerCache
+
+	// questions holds the ask_user questions currently waiting for an answer. It
+	// is the join between a streaming turn and the separate request that submits
+	// the answer, and it is per server rather than per turn because those two are
+	// different requests.
+	questions *questionHub
+
+	// mcp owns the live MCP connections and the tools they expose. It is nil
+	// when there is no tool registry to register into (chat disabled): servers
+	// can still be stored and tested, but nothing is connected.
+	mcp *mcp.Manager
+	// mcpDial is how MCP connections are opened. Kept on the server (rather
+	// than only inside the manager) so 测试连接 also works when no manager
+	// exists, which is the case with chat.enable = false.
+	mcpDial mcp.Dialer
+
+	// jobs is the background-process supervisor this process owns. It is not
+	// closed here: the command that built it owns its lifetime, because a job
+	// outliving a shut-down admin engine would be exactly the orphan this
+	// feature exists to prevent.
+	jobs *jobs.Manager
 
 	hertz  *server.Hertz
 	ln     net.Listener
@@ -133,9 +173,22 @@ func New(cfg Config, st store.Store, table *pricing.Table, adminCfg config.Admin
 			cfg.Host)
 	}
 
-	auth, err := newAuthenticator(adminCfg.Username, adminCfg.PasswordHash, cfg.SessionTTL, logger, adminCfg.RequireLogin)
+	auth, err := newAuthenticator(adminCfg, cfg.SessionTTL, logger)
 	if err != nil {
 		return nil, err
+	}
+	// `require_login: true` reads as "everyone needs the password", and with
+	// trust_loopback on (the default) that is not what this process enforces.
+	// Say what it does instead: it cannot be detected from the outside, and the
+	// case where it matters — a proxy or tunnel on this host, whose clients all
+	// arrive from 127.0.0.1 — is invisible in the config file.
+	if auth.trustsLoopback && !auth.disabled {
+		logger.Warn("admin login is not enforced for loopback clients",
+			zap.String("host", cfg.Host),
+			zap.String("hint", "requests from 127.0.0.1/::1 skip the password — which includes a "+
+				"reverse proxy, SSH tunnel or container port-forward on this host, and every "+
+				"caller when the bind itself is loopback; set admin.trust_loopback: false to ask "+
+				"them all for it"))
 	}
 
 	s := &Server{
@@ -148,7 +201,29 @@ func New(cfg Config, st store.Store, table *pricing.Table, adminCfg config.Admin
 		chat:       cfg.Chat,
 		tracer:     cfg.Tracer,
 		traces:     cfg.Traces,
+		jobs:       cfg.Jobs,
+		questions:  newQuestionHub(),
 		startT:     time.Now(),
+	}
+
+	// The MCP runtime writes into the same registry chat turns read, so a server
+	// added in 设置 → MCP is callable by the model on the very next message.
+	// Without a registry (chat.enable = false) there is nothing to register
+	// into, and the console says so rather than pretending to connect.
+	s.mcpDial = cfg.MCPDial
+	if cfg.Chat.Tools != nil {
+		s.mcp = mcp.NewManager(cfg.Chat.Tools, mcp.ManagerOptions{
+			Dial:          cfg.MCPDial,
+			Logger:        logger,
+			OnServerError: s.recordMCPError,
+		})
+	}
+	// The 技能 tool is part of the chat's tool set, not of the skills page: it is
+	// how the model reads an enabled skill's instructions. Registering it here
+	// (rather than in the caller) keeps the tool and the skill state that backs
+	// it on the same object.
+	if err := s.registerSkillTool(); err != nil {
+		logger.Warn("skill tool unavailable", zapError(err))
 	}
 
 	// Hertz logs every registered route at debug level, which drowns a normal
@@ -216,9 +291,24 @@ func (s *Server) registerRoutes(h *server.Hertz) {
 	authed.GET("/audit", s.handleAudit)
 	authed.GET("/skills", s.handleSkills)
 	authed.POST("/skills/:name", s.handleSetSkill)
+	authed.GET("/skills/:name", s.handleSkillDetail)
+	authed.PUT("/skills/:name", s.handleSaveSkill)
+	authed.DELETE("/skills/:name", s.handleDeleteSkill)
+	// The 写作助手 lives at /api/skills-draft rather than /api/skills/draft on
+	// purpose: the latter would be matched by the `/skills/:name` route above,
+	// and a skill literally named "draft" would then shadow the endpoint.
+	authed.POST("/skills-draft", s.handleDraftSkill)
 	s.registerProviderRoutes(authed)
 	s.registerChatRoutes(authed)
+	// Registered after the chat routes: /workspaces/preview must not be matched
+	// by /workspaces/:name, so the order inside that group keeps the literal
+	// path first (see registerWorkspaceRoutes).
+	s.registerWorkspaceRoutes(authed)
+	s.registerFSRoutes(authed)
 	s.registerTraceRoutes(authed)
+	s.registerMCPRoutes(authed)
+	s.registerOpenVikingRoutes(authed)
+	s.registerJobRoutes(authed)
 
 	s.registerUI(h)
 }
@@ -246,6 +336,13 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		return nil
 	case <-ctx.Done():
+	}
+
+	// Disconnect the MCP servers before the engine drains: a stdio server is a
+	// child process, and leaving it running after the console exits would leak
+	// one process per connection.
+	if s.mcp != nil {
+		s.mcp.Close()
 	}
 
 	// Give the drain slightly longer than the engine's own exit wait so the

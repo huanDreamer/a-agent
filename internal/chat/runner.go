@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -19,6 +20,15 @@ import (
 // bot behave the same.
 const DefaultMaxSteps = 12
 
+// MaxStepsCeiling is the largest step budget a Runner accepts.
+//
+// It is a typo guard, not a policy. With a token budget and a deadline in place
+// the step count is the least interesting of the three limits, but a configured
+// 1200 is far more likely to be a slip than an intention, and the turn it
+// produced would be paid for before anyone read the config back. Refusing it at
+// construction is the one moment the mistake is still free.
+const MaxStepsCeiling = 500
+
 // Request is one conversational turn.
 type Request struct {
 	// Messages is the full conversation to send, oldest first. The caller owns
@@ -29,8 +39,28 @@ type Request struct {
 	SessionID string
 	UserID    string
 
+	// Scope identifies what the turn belongs to when a capability is chosen per
+	// conversation rather than globally: a web chat session, or a Feishu user.
+	// The runner publishes it on the turn's context (see ScopeFrom) before any
+	// tool runs, so a per-scope tool set and anything a tool reports share one
+	// answer to "which scope is this turn in".
+	//
+	// It is deliberately distinct from SessionID: a Feishu user's usage rows are
+	// attributed to their memory session, while their workspace choice belongs
+	// to their open_id and must survive a new session.
+	//
+	// Empty means "no scoped capability": the turn runs in whatever default the
+	// caller wired, which is what a deployment with no scopes configured wants.
+	Scope string
+
 	// MaxSteps overrides DefaultMaxSteps.
 	MaxSteps int
+	// MaxTokens overrides the configured per-turn token budget. 0 means "use the
+	// runner's default", which is itself 0 (unlimited) unless configured.
+	MaxTokens int
+	// Deadline overrides the configured per-turn wall-clock budget. 0 means the
+	// same as MaxTokens: use the runner's default.
+	Deadline time.Duration
 }
 
 // Config wires a Runner.
@@ -40,21 +70,51 @@ type Config struct {
 	// Tools is the tool registry. Optional: a nil or empty registry runs in
 	// pure-chat mode.
 	Tools *tool.Registry
+	// ToolsFor, when set, returns the registry to use for one turn, overriding
+	// Tools. It is how a tool set that depends on the turn is supplied — the
+	// case it exists for is a conversation bound to a workspace, whose file tools
+	// must resolve inside that workspace and whose write tools must be absent
+	// when it is read-only.
+	//
+	// It is called once per turn (not per step) with the turn's context, so the
+	// registry a turn starts with is the one every tool call in it uses.
+	// Returning (nil, nil) runs the turn without tools, which is the fail-safe
+	// direction: falling back to a differently bound registry would be worse
+	// than having none, because writes would land somewhere the caller did not
+	// choose.
+	ToolsFor func(ctx context.Context) (*tool.Registry, error)
 	// Tracer receives trace/span/generation events. Optional; a nil Tracer
 	// disables tracing.
 	Tracer Tracer
 	// MaxSteps is the default step cap.
 	MaxSteps int
-	Logger   *zap.Logger
+	// MaxTokens is the default per-turn token budget, summed from the usage the
+	// provider reports. 0 (the default) means unlimited.
+	//
+	// It is a second bound on purpose: a step cap alone says nothing about what
+	// those steps cost, and a model that loops through long tool results can
+	// spend an unbounded amount inside a handful of steps.
+	MaxTokens int
+	// Deadline is the default per-turn wall-clock budget. 0 means unlimited.
+	Deadline time.Duration
+	// Condenser bounds the in-loop history when a token budget is configured.
+	// Nil means the history is sent whole, which is only safe for short turns:
+	// every step resends everything the turn has accumulated so far.
+	Condenser Condenser
+	Logger    *zap.Logger
 }
 
 // Runner drives a streaming tool-calling conversation.
 type Runner struct {
-	model    model.BaseChatModel
-	tools    *tool.Registry
-	tracer   Tracer
-	maxSteps int
-	logger   *zap.Logger
+	model     model.BaseChatModel
+	tools     *tool.Registry
+	toolsFor  func(ctx context.Context) (*tool.Registry, error)
+	tracer    Tracer
+	maxSteps  int
+	maxTokens int
+	deadline  time.Duration
+	condenser Condenser
+	logger    *zap.Logger
 }
 
 // New builds a Runner.
@@ -65,6 +125,15 @@ func New(cfg Config) (*Runner, error) {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+	if cfg.MaxSteps > MaxStepsCeiling {
+		return nil, fmt.Errorf("chat: MaxSteps %d exceeds the ceiling of %d", cfg.MaxSteps, MaxStepsCeiling)
+	}
+	if cfg.MaxTokens < 0 {
+		return nil, fmt.Errorf("chat: MaxTokens %d is negative", cfg.MaxTokens)
+	}
+	if cfg.Deadline < 0 {
+		return nil, fmt.Errorf("chat: Deadline %s is negative", cfg.Deadline)
 	}
 	max := cfg.MaxSteps
 	if max <= 0 {
@@ -77,21 +146,63 @@ func New(cfg Config) (*Runner, error) {
 		tracer = NopTracer{}
 	}
 	return &Runner{
-		model:    cfg.Model,
-		tools:    cfg.Tools,
-		tracer:   tracer,
-		maxSteps: max,
-		logger:   logger,
+		model:     cfg.Model,
+		tools:     cfg.Tools,
+		toolsFor:  cfg.ToolsFor,
+		tracer:    tracer,
+		maxSteps:  max,
+		maxTokens: cfg.MaxTokens,
+		deadline:  cfg.Deadline,
+		condenser: cfg.Condenser,
+		logger:    logger,
 	}, nil
+}
+
+// scopeKey is the context key carrying a turn's scope. It is unexported so the
+// only way to publish one is WithScope, which is what keeps every surface's
+// spelling of "a scope" identical.
+type scopeKey struct{}
+
+// WithScope returns ctx carrying the scope a turn belongs to.
+//
+// An empty scope returns ctx unchanged: "no scope" is the absence of the value,
+// not an empty string that a reader would have to distinguish from a real one.
+func WithScope(ctx context.Context, scope string) context.Context {
+	if strings.TrimSpace(scope) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, scopeKey{}, scope)
+}
+
+// ScopeFrom returns the scope the current turn belongs to, or "" when the turn
+// was not scoped.
+func ScopeFrom(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	scope, _ := ctx.Value(scopeKey{}).(string)
+	return scope
+}
+
+// resolveTools returns the registry for one turn.
+func (r *Runner) resolveTools(ctx context.Context) (*tool.Registry, error) {
+	if r.toolsFor == nil {
+		return r.tools, nil
+	}
+	reg, err := r.toolsFor(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("chat: resolve tools: %w", err)
+	}
+	return reg, nil
 }
 
 // toolInfos returns the model-facing specs for the permitted tools. It returns
 // nil when there are no tools, which selects pure-chat mode.
-func (r *Runner) toolInfos(ctx context.Context) ([]*schema.ToolInfo, error) {
-	if r.tools == nil {
+func (r *Runner) toolInfos(ctx context.Context, reg *tool.Registry) ([]*schema.ToolInfo, error) {
+	if reg == nil {
 		return nil, nil
 	}
-	specs, err := r.tools.List(ctx)
+	specs, err := reg.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("chat: list tools: %w", err)
 	}
@@ -130,12 +241,20 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 	if emit == nil {
 		emit = func(Event) {}
 	}
-	maxSteps := req.MaxSteps
-	if maxSteps <= 0 {
-		maxSteps = r.maxSteps
-	}
+	budget := r.budgetFor(req)
+	started := nowFunc()
 
-	infos, err := r.toolInfos(ctx)
+	// Publish the scope before anything else runs: a registry built for this
+	// turn reads it, and so does anything a tool reports about where it ran.
+	ctx = WithScope(ctx, req.Scope)
+
+	// The registry is resolved once per turn and used for every step, so a turn
+	// cannot half-run against one workspace and half against another.
+	reg, err := r.resolveTools(ctx)
+	if err != nil {
+		return nil, err
+	}
+	infos, err := r.toolInfos(ctx, reg)
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +276,12 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 	}
 
 	history := append([]*schema.Message(nil), req.Messages...)
+	// The head is computed once, from the window the caller sent: those are the
+	// rules of the turn (the system prompt and whatever it prepended to it).
+	// Deriving it again per step would pin the summary this runner inserted on
+	// the previous step, so every pass would pin one message more and the window
+	// would creep back up to the size the condensing exists to bound.
+	head := leadingSystem(history)
 	res := &Result{}
 
 	traceID := r.tracer.StartTrace(ctx, TraceInfo{
@@ -165,16 +290,33 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		UserID:    req.UserID,
 		Input:     lastUserText(history),
 	})
+	// The trace id leaves with the result: the caller stores it alongside the
+	// answer, which is what lets the conversation link to its own trace. The
+	// runner is the only place that ever knows it.
+	res.TraceID = traceID
 	// The trace is closed exactly once, on every exit path.
 	defer func() {
 		r.tracer.EndTrace(ctx, traceID, res.Text)
 	}()
 
-	for step := 1; step <= maxSteps; step++ {
+	for step := 1; step <= budget.maxSteps; step++ {
 		if err := ctx.Err(); err != nil {
 			emit(Event{Type: EventError, Step: step, Error: "cancelled"})
 			return res, err
 		}
+		// The budgets that are not the step count are checked before spending
+		// another model call, not after: the point of a budget is to stop before
+		// the money is spent, and a step that ran is already paid for.
+		if reason := budget.expired(started, res); reason != "" {
+			return r.stopOnBudget(req, res, emit, history, reason, budget, started)
+		}
+		// Bound the window before the model sees it. Every step adds an assistant
+		// message and its tool results, so an unbounded loop resends a growing
+		// history: the cost per step rises while the answer is still being
+		// worked out, which is what turns "a long task" into a context-limit
+		// error twenty steps in.
+		history = r.condense(ctx, res, emit, history, head)
+
 		res.Steps = step
 		emit(Event{Type: EventStepStart, Step: step})
 
@@ -213,7 +355,7 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 
 		// Announce and run each tool the model asked for.
 		for _, tc := range msg.ToolCalls {
-			run := r.runTool(ctx, tc, req, step, traceID, emit)
+			run := r.runTool(ctx, reg, tc, req, step, traceID, emit)
 			res.Tools = append(res.Tools, run)
 			history = append(history, &schema.Message{
 				Role:       schema.Tool,
@@ -224,11 +366,88 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		}
 	}
 
-	// Step budget exhausted: return what we have plus a clear explanation, so
-	// the UI shows why it stopped instead of appearing to hang.
-	res.Text = exhaustedMessage(history)
-	emit(Event{Type: EventDone, Text: res.Text})
+	// The step budget is exhausted: the loop's own bound is the check, so
+	// reaching here means the model asked for another tool call at the cap.
+	return r.stopOnBudget(req, res, emit, history, StopSteps, budget, started)
+}
+
+// stopOnBudget ends the turn with what it has, plus a reason the caller and the
+// user can act on.
+//
+// It is a normal end of the turn, not a failure: Run returns a nil error, the
+// last event is EventDone, and several steps of real work (files written, tests
+// run) are already on disk. The one thing it must never be is silent, which is
+// why it emits EventBudgetStop, logs, and sets Result.StopReason — a budget stop
+// that only shows up as a sentence inside the answer cannot be counted,
+// alerted on, or seen again after a page reload.
+func (r *Runner) stopOnBudget(req Request, res *Result, emit Emitter,
+	history []*schema.Message, reason string, budget turnBudget, started time.Time) (*Result, error) {
+
+	elapsed := time.Since(started)
+	res.StopReason = reason
+	res.Text = stopText(history, reason, budget, res, elapsed)
+
+	r.logger.Warn("chat: turn stopped on its budget",
+		zap.String("reason", reason),
+		zap.Int("steps", res.Steps),
+		zap.Int("tokens", res.Usage.TotalTokens),
+		zap.Duration("elapsed", elapsed),
+		zap.Int("tools", len(res.Tools)),
+		zap.String("session", req.SessionID),
+	)
+
+	emit(Event{
+		Type:      EventBudgetStop,
+		Step:      res.Steps,
+		Reason:    reason,
+		Tokens:    res.Usage.TotalTokens,
+		ElapsedMs: elapsed.Milliseconds(),
+		Text:      res.Text,
+	})
+	emit(Event{Type: EventDone, Step: res.Steps, Text: res.Text})
 	return res, nil
+}
+
+// condense bounds the in-loop history to the configured token budget.
+//
+// What it pins is the point of it: the system prompt states the rules and the
+// most recent user message states what was asked, so both survive verbatim while
+// the middle — the tool exchanges of the steps already taken — is folded into a
+// summary. A window that drops either is a turn that forgot its instructions or
+// its goal, which is a worse failure than a large prompt.
+//
+// A failure to condense is not a failure of the turn: the model call may still
+// succeed with a bigger window, and aborting a long task over a summary call
+// would be the wrong trade.
+func (r *Runner) condense(ctx context.Context, res *Result, emit Emitter, history []*schema.Message, head int) []*schema.Message {
+	if r.condenser == nil {
+		return history
+	}
+	before := len(history)
+
+	out, summary, err := r.condenser.CompressKeeping(ctx, history, head, true)
+	if err != nil {
+		r.logger.Warn("chat: condensing the history failed; sending it whole",
+			zap.Int("step", res.Steps+1), zap.Int("messages", before), zap.Error(err))
+		return history
+	}
+	if len(out) == before && summary == "" {
+		return history
+	}
+
+	r.logger.Info("chat: condensed the in-loop history",
+		zap.Int("step", res.Steps+1),
+		zap.Int("messages_before", before),
+		zap.Int("messages_after", len(out)),
+		zap.Int("tokens_so_far", res.Usage.TotalTokens),
+	)
+	emit(Event{
+		Type:   EventContextCompressed,
+		Step:   res.Steps + 1,
+		Tokens: res.Usage.TotalTokens,
+		Text:   fmt.Sprintf("上下文已压缩：%d 条消息 → %d 条（保留系统提示与本轮目标）", before, len(out)),
+	})
+	return out
 }
 
 // streamOnce performs one streaming model call, forwarding deltas as they
@@ -308,7 +527,7 @@ func (r *Runner) streamOnce(ctx context.Context, mdl model.BaseChatModel, histor
 }
 
 // runTool executes one tool call and reports it.
-func (r *Runner) runTool(ctx context.Context, tc schema.ToolCall, req Request,
+func (r *Runner) runTool(ctx context.Context, reg *tool.Registry, tc schema.ToolCall, req Request,
 	step int, traceID string, emit Emitter) ToolRun {
 
 	run := ToolRun{
@@ -328,10 +547,10 @@ func (r *Runner) runTool(ctx context.Context, tc schema.ToolCall, req Request,
 	})
 	started := nowFunc()
 
-	t, ok := r.toolsTool(run.Name)
+	t, ok := toolsTool(reg, run.Name)
 	if !ok {
 		run.Err = fmt.Sprintf("unknown tool %q", run.Name)
-	} else if !r.tools.IsAllowed(run.Name) {
+	} else if !reg.IsAllowed(run.Name) {
 		// A disallowed tool is refused rather than silently skipped, and the
 		// refusal is fed back to the model so it can choose another approach.
 		run.Err = fmt.Sprintf("tool %q is not permitted", run.Name)
@@ -359,12 +578,13 @@ func (r *Runner) runTool(ctx context.Context, tc schema.ToolCall, req Request,
 	return run
 }
 
-// toolsTool looks a tool up, tolerating a nil registry.
-func (r *Runner) toolsTool(name string) (tool.Tool, bool) {
-	if r.tools == nil {
+// toolsTool looks a tool up in the registry a turn is running against,
+// tolerating a nil registry (a turn with no tools at all).
+func toolsTool(reg *tool.Registry, name string) (tool.Tool, bool) {
+	if reg == nil {
 		return nil, false
 	}
-	return r.tools.Get(name)
+	return reg.Get(name)
 }
 
 // toolSpanOutput renders a tool run for tracing.
@@ -386,18 +606,6 @@ func toolResultContent(run ToolRun) string {
 		return "error: " + run.Err
 	}
 	return run.Result
-}
-
-// exhaustedMessage explains a step-budget stop, preferring the last assistant
-// text when there is one so the user still sees something useful.
-func exhaustedMessage(history []*schema.Message) string {
-	for i := len(history) - 1; i >= 0; i-- {
-		m := history[i]
-		if m.Role == schema.Assistant && strings.TrimSpace(m.Content) != "" {
-			return m.Content + "\n\n（已达到最大工具调用步数，回答可能不完整）"
-		}
-	}
-	return "（已达到最大工具调用步数，未能得出最终回答）"
 }
 
 // lastUserText returns the most recent user message, for the trace input.

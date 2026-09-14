@@ -10,6 +10,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/route"
 
 	"github.com/huan/huan-agent/internal/langfuse"
+	"github.com/huan/huan-agent/internal/store"
 )
 
 // TraceReader reads traces back from the tracing backend. It is an interface so
@@ -124,6 +125,15 @@ func (s *Server) traceError(c *app.RequestContext, err error) {
 		c.JSON(http.StatusOK, map[string]any{
 			"enabled": false,
 			"message": "链路追踪未启用",
+		})
+		return
+	}
+	// A trace that is gone is not an outage: it was pruned, cleared, or the link
+	// is stale. Reporting 502 would send the operator looking for a broken
+	// backend when the honest answer is "that record no longer exists".
+	if errors.Is(err, store.ErrNotFound) {
+		c.JSON(http.StatusNotFound, map[string]string{
+			"error": "该 trace 已不在保留范围内（可能已被裁剪或清空）",
 		})
 		return
 	}

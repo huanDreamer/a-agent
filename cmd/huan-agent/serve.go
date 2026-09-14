@@ -18,13 +18,16 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
+	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/llm"
+	"github.com/huan/huan-agent/internal/memory"
 	"github.com/huan/huan-agent/internal/metrics"
 	"github.com/huan/huan-agent/internal/obs"
 	"github.com/huan/huan-agent/internal/platform/feishu"
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/usage"
+	"github.com/huan/huan-agent/internal/workspaces"
 )
 
 var serveCmd = &cobra.Command{
@@ -57,8 +60,22 @@ type botHandler struct {
 	recorder   *usage.Recorder
 	sender     feishu.Sender
 	downloader feishu.ResourceDownloader
+	// memStore is the process-wide long-term memory (the OpenViking mirror when
+	// that is enabled). It is shared by every Feishu session because the mirror
+	// batches turns across sessions.
+	memStore memory.Store
 	// metrics may be nil when observability is disabled.
 	metrics *metrics.Metrics
+
+	// wsMgr is the workspace layer (nil when it is unavailable or switched off).
+	// The manager owns which workspace each sender is in, and the runner's
+	// ToolsFor closure turns that into the tool set for one turn.
+	wsMgr *workspaces.Manager
+	// runner runs a turn through the tool-calling loop. Nil means the bot
+	// answers with a plain chat model, which is what a deployment with
+	// feishu.enable_tools = false gets — and what this bot did before workspaces
+	// and tools existed.
+	runner *chat.Runner
 
 	mu       sync.Mutex
 	sessions map[string]*botSession
@@ -73,7 +90,7 @@ type botSession struct {
 
 // newBotHandler builds the handler; sender is set by the caller after wiring.
 func newBotHandler(cfg *config.Config, logger *zap.Logger, cm model.BaseChatModel,
-	provider, modelName string, st store.Store, rec *usage.Recorder) *botHandler {
+	provider, modelName string, st store.Store, rec *usage.Recorder, memStore memory.Store) *botHandler {
 	return &botHandler{
 		cfg:      cfg,
 		logger:   logger,
@@ -82,6 +99,7 @@ func newBotHandler(cfg *config.Config, logger *zap.Logger, cm model.BaseChatMode
 		model:    modelName,
 		st:       st,
 		recorder: rec,
+		memStore: memStore,
 		sessions: make(map[string]*botSession),
 	}
 }
@@ -104,7 +122,7 @@ func (h *botHandler) Handle(ctx context.Context, in feishu.Inbound) error {
 		lower := strings.ToLower(text)
 		switch lower {
 		case "/help":
-			return h.reply(ctx, in, "Commands:\n/reset 清空会话\n/remember key: value 记住事实\n/recall query 检索记忆\n/provider 查看模型")
+			return h.reply(ctx, in, h.feishuHelpText())
 		case "/provider":
 			return h.reply(ctx, in, fmt.Sprintf("provider=%s model=%s", h.provider, h.model))
 		case "/reset":
@@ -116,6 +134,21 @@ func (h *botHandler) Handle(ctx context.Context, in feishu.Inbound) error {
 		}
 		if strings.HasPrefix(lower, "/recall ") {
 			return h.recall(ctx, in, text[len("/recall "):])
+		}
+		// The explicit commands first: they mean exactly one thing, and they
+		// must not be at the mercy of prose interpretation.
+		if handled, err := h.handleWorkspaceCommand(ctx, in, text); handled {
+			return err
+		}
+		// Then the natural-language form, which is deliberately conservative:
+		// see parseWorkspaceIntent.
+		switch intent := h.parseWorkspaceIntent(ctx, in, text); intent.Kind {
+		case workspaces.IntentList:
+			return h.replyWorkspaceList(ctx, in)
+		case workspaces.IntentCurrent:
+			return h.replyCurrentWorkspace(ctx, in)
+		case workspaces.IntentSwitch:
+			return h.switchWorkspace(ctx, in, intent.Name)
 		}
 	}
 
@@ -217,7 +250,7 @@ func (h *botHandler) session(uid string) *botSession {
 		return s
 	}
 	sid := uuid.NewString()
-	mem, err := newSessionMemory(h.cfg, h.cm, h.systemPrompt(), sid, h.logger)
+	mem, err := newSessionMemory(h.cfg, h.cm, h.systemPrompt(), sid, h.logger, h.memStore)
 	if err != nil {
 		h.logger.Error("new session memory", zap.Error(err))
 		mem = nil
@@ -246,28 +279,23 @@ func (h *botHandler) answer(ctx context.Context, in feishu.Inbound, text string)
 	// Strip any leftover tool-call metadata from the assembled history before
 	// sending to the model. memory can persist an assistant message that still
 	// carries ToolCalls; without a paired tool result the OpenAI/DeepSeek
-	// protocol rejects it with `missing field tool_call_id`. For this
-	// conversational bot we only need the plain text, so drop tool-only
-	// messages and clear stale ToolCalls/ToolCallID.
+	// protocol rejects it with `missing field tool_call_id`. The tool-calling
+	// runner below pairs them itself, but this history comes from memory, where
+	// only the text was kept.
 	history = sanitizeBotHistory(history)
 
-	// Use the plain chat model (no ReAct agent) for the bot conversation. The
-	// ReAct agent manages tool_calls in its own message stream, which DeepSeek
-	// rejects with `missing field tool_call_id` unless every assistant
-	// tool_call has a paired tool result in the same request. For a plain
-	// conversational IM bot we don't need tools, so bypass the agent to keep
-	// the OpenAI-compatible message stream clean.
 	// Announce progress first: the model call can take many seconds and Feishu
 	// has no streaming, so a placeholder card is replaced with the answer once
 	// it is ready. Failure to send it is not fatal — we fall back to replying.
-	placeholderID := ""
-	if h.cfg.Feishu.Thinking && h.sender != nil {
-		id, perr := h.sender.SendCard(ctx, in.ChatID, "huan-agent", thinkingPlaceholder)
-		if perr != nil {
-			h.logger.Warn("feishu: send thinking placeholder failed", zap.Error(perr))
-		} else {
-			placeholderID = id
-		}
+	placeholderID := h.announce(ctx, in)
+
+	// With tools on, the turn runs through the same tool-calling loop the web
+	// chat uses. That is what lets the bot actually work in a workspace, and it
+	// is also what makes the earlier bypass unnecessary: the runner emits a
+	// paired tool result for every assistant tool_call, so the OpenAI/DeepSeek
+	// protocol is satisfied — the problem the plain-model path was avoiding.
+	if h.runner != nil {
+		return h.answerWithTools(ctx, in, sess, history, placeholderID)
 	}
 
 	var out *schema.Message
@@ -303,6 +331,161 @@ func (h *botHandler) observeLLM(started time.Time, out *schema.Message, err erro
 	if out != nil && out.ResponseMeta != nil && out.ResponseMeta.Usage != nil {
 		prompt = out.ResponseMeta.Usage.PromptTokens
 		completion = out.ResponseMeta.Usage.CompletionTokens
+	}
+	h.metrics.ObserveLLMCall(h.provider, h.model, time.Since(started), err, prompt, completion)
+}
+
+// announce sends the "thinking…" placeholder card and returns its id, or "" when
+// there is nothing to replace later. A failure to send it is not fatal: the
+// answer is delivered as a fresh message instead.
+func (h *botHandler) announce(ctx context.Context, in feishu.Inbound) string {
+	if !h.cfg.Feishu.Thinking || h.sender == nil {
+		return ""
+	}
+	id, err := h.sender.SendCard(ctx, in.ChatID, "huan-agent", thinkingPlaceholder)
+	if err != nil {
+		h.logger.Warn("feishu: send thinking placeholder failed", zap.Error(err))
+		return ""
+	}
+	return id
+}
+
+// answerWithTools runs one turn through the tool-calling loop, in the workspace
+// the sender has selected.
+//
+// Feishu has no streaming, so the events are consumed rather than forwarded: the
+// answer and the tool activity are collected and delivered as one card when the
+// turn ends. Tool activity is summarised rather than omitted — a user watching a
+// bot edit files on their machine deserves to see that it happened, and which
+// workspace it happened in.
+func (h *botHandler) answerWithTools(ctx context.Context, in feishu.Inbound, sess *botSession,
+	history []*schema.Message, placeholderID string) error {
+
+	scope := scopeFor(in)
+	workspaceName := ""
+	if h.wsMgr != nil {
+		if spec, err := h.wsMgr.Active(ctx, scope); err == nil {
+			workspaceName = spec.Name
+		}
+	}
+
+	started := time.Now()
+	res, err := h.runner.Run(ctx, chat.Request{
+		Messages:  history,
+		SessionID: sess.sid,
+		UserID:    in.OpenID,
+		Scope:     scope,
+	}, func(chat.Event) {})
+	h.observeLLMTurn(started, res, err)
+
+	if err != nil {
+		h.logger.Error("feishu: agent turn failed", zap.Error(err))
+		sess.Lock()
+		sess.mem.buffer.Reset()
+		sess.Unlock()
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return h.finish(ctx, in, placeholderID, "抱歉，出错了: "+err.Error())
+	}
+	if res == nil {
+		return h.finish(ctx, in, placeholderID, "(empty response)")
+	}
+
+	// Audit the tool calls, the same way the web chat does, so 审计日志 shows
+	// Feishu activity with the workspace it happened in.
+	h.recordToolAudit(ctx, sess.sid, in.OpenID, workspaceName, res.Tools)
+
+	// A turn that stopped on its budget is said out loud here too: the note is
+	// already in the answer text the user sees, but the log is where an operator
+	// notices that the bot keeps running out of steps on the same kind of task.
+	if res.BudgetExhausted() {
+		h.logger.Warn("feishu: turn stopped on its budget",
+			zap.String("reason", res.StopReason),
+			zap.Int("steps", res.Steps),
+			zap.Int("tokens", res.Usage.TotalTokens),
+			zap.Int("tools", len(res.Tools)),
+			zap.String("session", sess.sid),
+		)
+	}
+
+	if strings.TrimSpace(res.Text) == "" && len(res.Tools) == 0 {
+		return h.finish(ctx, in, placeholderID, "(empty response)")
+	}
+	sess.Lock()
+	sess.mem.addAssistantMessage(&schema.Message{Role: schema.Assistant, Content: res.Text})
+	sess.Unlock()
+
+	return h.finish(ctx, in, placeholderID, res.Text+toolSummary(res.Tools, workspaceName))
+}
+
+// recordToolAudit writes one row per tool call, with the workspace it ran in.
+func (h *botHandler) recordToolAudit(ctx context.Context, sessionID, userID, workspaceName string,
+	runs []chat.ToolRun) {
+	if h.st == nil {
+		return
+	}
+	for _, run := range runs {
+		if err := h.st.RecordInvocation(ctx, store.InvocationEvent{
+			SessionID:  sessionID,
+			UserID:     userID,
+			ToolName:   run.Name,
+			Arguments:  run.Args,
+			Result:     run.Result,
+			Err:        run.Err,
+			Workspace:  workspaceName,
+			DurationMs: run.DurationMs,
+		}); err != nil {
+			h.logger.Warn("feishu: persist tool invocation failed", zap.Error(err))
+		}
+	}
+}
+
+// toolSummary renders the small footer that says what the agent did, in which
+// workspace. It is empty when no tool ran, so an ordinary answer stays clean.
+func toolSummary(runs []chat.ToolRun, workspaceName string) string {
+	if len(runs) == 0 {
+		return ""
+	}
+	counts := map[string]int{}
+	var order []string
+	failed := 0
+	for _, run := range runs {
+		if _, seen := counts[run.Name]; !seen {
+			order = append(order, run.Name)
+		}
+		counts[run.Name]++
+		if run.Err != "" {
+			failed++
+		}
+	}
+	parts := make([]string, 0, len(order))
+	for _, name := range order {
+		if counts[name] > 1 {
+			parts = append(parts, fmt.Sprintf("%s×%d", name, counts[name]))
+			continue
+		}
+		parts = append(parts, name)
+	}
+	line := fmt.Sprintf("\n\n---\n🛠 工具 %d 次（%s）", len(runs), strings.Join(parts, "、"))
+	if failed > 0 {
+		line += fmt.Sprintf("，其中 %d 次失败", failed)
+	}
+	if workspaceName != "" {
+		line += " · 工作区 `" + workspaceName + "`"
+	}
+	return line
+}
+
+// observeLLMTurn records one agent turn in the metrics registry. A turn is
+// several model calls, but the metric is about the turn the user asked for.
+func (h *botHandler) observeLLMTurn(started time.Time, res *chat.Result, err error) {
+	if h.metrics == nil {
+		return
+	}
+	var prompt, completion int
+	if res != nil {
+		prompt, completion = res.Usage.PromptTokens, res.Usage.CompletionTokens
 	}
 	h.metrics.ObserveLLMCall(h.provider, h.model, time.Since(started), err, prompt, completion)
 }
@@ -380,7 +563,10 @@ func (h *botHandler) sendContinuations(ctx context.Context, in feishu.Inbound, r
 
 // systemPrompt returns the default system prompt.
 func (h *botHandler) systemPrompt() string {
-	return "You are huan-agent, a helpful personal AI assistant. Answer concisely."
+	return "You are huan-agent, a helpful personal AI assistant. Answer concisely. " +
+		"Commands run with no terminal and with standard input at /dev/null, so use the " +
+		"non-interactive flag a tool offers (-y, --yes, --no-input, CI=1) instead of a " +
+		"command that waits for input."
 }
 
 // reply sends text back to the user.
@@ -505,9 +691,86 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("init feishu downloader: %w", err)
 	}
 
-	handler := newBotHandler(cfg, logger, cm, cfg.LLM.DefaultProvider, cfg.LLM.DefaultProvider, st, rec)
+	// OpenViking integration: memory mirror + document sync. A failure to build
+	// it is fatal on purpose — an operator who configured it wants to know at
+	// startup, not to discover later that memory was silently local-only.
+	vikingSvc, err := newVikingService(cfg, logger)
+	if err != nil {
+		return err
+	}
+	if vikingSvc != nil {
+		defer vikingSvc.Close()
+	}
+	memStore, closeMemory, err := buildMemoryStore(cfg, vikingSvc, logger)
+	if err != nil {
+		return err
+	}
+	defer closeMemory()
+
+	handler := newBotHandler(cfg, logger, cm, cfg.LLM.DefaultProvider, cfg.LLM.DefaultProvider, st, rec, memStore)
 	handler.sender = sender
 	handler.downloader = downloader
+
+	// Tools and workspaces. Off means the bot answers with a plain chat model —
+	// exactly what it did before either existed — so an operator who does not
+	// want an IM-reachable shell can turn it off without losing the bot.
+	// Background processes. A failure to build the supervisor is not fatal: the
+	// bot keeps working with the background tools withheld.
+	jobMgr, jobErr := newJobManager(cfg, logger)
+	if jobErr != nil {
+		logger.Warn("background jobs disabled", zap.Error(jobErr))
+	}
+	// The bot's jobs die with the bot: a dev server started over Feishu is not
+	// meant to keep running once the process supervising it is gone.
+	defer jobMgr.Close()
+
+	if cfg.Feishu.EnableTools {
+		tooling, terr := buildFeishuTooling(cmd.Context(), cfg, st, logger, vikingSvc, jobMgr)
+		if terr != nil {
+			// Fatal on purpose: an operator who asked for tools and got none
+			// would otherwise discover it from a model that apologises for
+			// being unable to read a file.
+			return fmt.Errorf("feishu tools: %w", terr)
+		}
+		defer tooling.close()
+
+		condenser, cErr := turnCondenser(cfg, cm, logger)
+		if cErr != nil {
+			// Not fatal: the bot keeps answering, with a window that grows with
+			// the turn instead of being condensed.
+			logger.Warn("feishu: in-turn context compression disabled", zap.Error(cErr))
+		}
+		runner, rerr := chat.New(chat.Config{
+			Model:     cm,
+			Tools:     tooling.base,
+			ToolsFor:  tooling.bindings.forScope,
+			MaxSteps:  cfg.Chat.MaxSteps,
+			MaxTokens: cfg.Chat.TurnMaxTokens,
+			Deadline:  cfg.Chat.TurnDeadline(),
+			Condenser: condenser,
+			Logger:    logger,
+		})
+		if rerr != nil {
+			return fmt.Errorf("feishu agent runner: %w", rerr)
+		}
+		handler.runner = runner
+		handler.wsMgr = tooling.manager
+
+		// Seed before the bot answers: it registers the configured directory when
+		// nothing is registered yet, so a message that arrives before anything was
+		// set up in the console still has somewhere to run.
+		if seed, seedErr := tooling.manager.EnsureSeed(cmd.Context()); seedErr != nil {
+			logger.Warn("feishu: workspace seed failed", zap.Error(seedErr))
+		} else {
+			logger.Info("feishu workspaces ready",
+				zap.String("default_workspace", seed.Name), zap.String("root", seed.Root))
+		}
+		logger.Warn("飞书已获得文件/命令工具：任何能给机器人发消息的人都可以在选定工作区内读写文件并执行命令（bash 仍可访问工作区外的绝对路径）。如需关闭请设置 feishu.enable_tools: false",
+			zap.Int("tools", len(tooling.base.Names())),
+		)
+	} else {
+		logger.Info("feishu tools disabled (feishu.enable_tools = false); the bot answers from the model alone")
+	}
 
 	// Observability is best-effort: a metrics failure must not stop the bot.
 	// The registry is shared with the admin server when both run together.
@@ -539,6 +802,15 @@ func runServe(cmd *cobra.Command, _ []string) error {
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Periodic workspace sync, when configured. Off by default: a long-running
+	// process re-crawling a workspace on a timer is a surprising amount of
+	// embedding traffic for a feature nobody switched on.
+	if vikingSvc != nil {
+		if interval := cfg.OpenViking.Documents.SyncInterval(); interval > 0 {
+			startWorkspaceSyncLoop(ctx, vikingSvc, interval, logger)
+		}
+	}
 	logger.Info("feishu bot starting",
 		zap.String("provider", cfg.LLM.DefaultProvider),
 		zap.String("transport", string(mode)),

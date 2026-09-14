@@ -30,6 +30,15 @@ type fakeModel struct {
 	gotMessages  [][]*schema.Message
 }
 
+// reset replaces the scripted turns and rewinds the call counter, so one test
+// can run several turns against fresh scripts.
+func (f *fakeModel) reset(turns []*schema.Message) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.turns = turns
+	f.calls = 0
+}
+
 func (f *fakeModel) WithTools(infos []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
 	if f.withToolsErr != nil {
 		return nil, f.withToolsErr
@@ -430,6 +439,30 @@ func TestRun_DisallowedToolIsRefused(t *testing.T) {
 	}
 }
 
+func TestNew_RefusesBudgetsItCannotHonour(t *testing.T) {
+	m := &fakeModel{}
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{"step budget above the ceiling", Config{Model: m, MaxSteps: MaxStepsCeiling + 1}},
+		{"negative token budget", Config{Model: m, MaxTokens: -1}},
+		{"negative deadline", Config{Model: m, Deadline: -time.Second}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := New(tc.cfg); err == nil {
+				t.Fatal("New accepted a budget it cannot honour")
+			}
+		})
+	}
+	// The ceiling itself is allowed: refusing it would make the documented
+	// maximum unreachable.
+	if _, err := New(Config{Model: m, MaxSteps: MaxStepsCeiling}); err != nil {
+		t.Errorf("New(MaxSteps=%d) = %v, want the ceiling to be accepted", MaxStepsCeiling, err)
+	}
+}
+
 func TestRun_MaxStepsExhausted(t *testing.T) {
 	// Every turn asks for another tool call, so the loop must stop at the cap.
 	tl := &fakeTool{name: "loop", desc: "l", run: func(context.Context, string) (string, error) {
@@ -458,9 +491,229 @@ func TestRun_MaxStepsExhausted(t *testing.T) {
 	if !strings.Contains(res.Text, "最大工具调用步数") {
 		t.Errorf("Text = %q, want an explanation of the step cap", res.Text)
 	}
-	if got := typesOf(*events); got[len(got)-1] != EventDone {
-		t.Errorf("last event = %v, want done", got[len(got)-1])
+	// A budget stop is reported, not inferred: the reason travels on the result
+	// and on its own event, and the turn still ends with done rather than error.
+	if res.StopReason != StopSteps {
+		t.Errorf("StopReason = %q, want %q", res.StopReason, StopSteps)
 	}
+	if !res.BudgetExhausted() {
+		t.Error("BudgetExhausted = false, want true")
+	}
+	got := typesOf(*events)
+	if len(got) < 2 || got[len(got)-2] != EventBudgetStop || got[len(got)-1] != EventDone {
+		t.Fatalf("event tail = %v, want ... budget_stop, done", got)
+	}
+	last := (*events)[len(*events)-2]
+	if last.Reason != StopSteps || last.Step != 3 {
+		t.Errorf("budget_stop = %+v, want reason=%s step=3", last, StopSteps)
+	}
+	// The note has to be actionable, not just apologetic.
+	if !strings.Contains(res.Text, "继续") {
+		t.Errorf("Text = %q, want it to say what to do next", res.Text)
+	}
+}
+
+func TestRun_TokenBudgetStopsBeforeTheNextCall(t *testing.T) {
+	tl := &fakeTool{name: "loop", desc: "l", run: func(context.Context, string) (string, error) {
+		return "again", nil
+	}}
+	// Two calls of 600 tokens each: the second crosses the 1000 budget, so the
+	// third call must never happen.
+	m := &fakeModel{turns: []*schema.Message{usageTurn(600), usageTurn(600), usageTurn(600)}}
+	r, _ := New(Config{Model: m, Tools: newRegistry(t, tl), MaxSteps: 10, MaxTokens: 1000, Logger: zap.NewNop()})
+
+	events, emit := collect()
+	res, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "go"}},
+	}, emit)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.StopReason != StopTokens {
+		t.Fatalf("StopReason = %q, want %q (text: %q)", res.StopReason, StopTokens, res.Text)
+	}
+	if res.Steps != 2 {
+		t.Errorf("Steps = %d, want 2: the budget stops the call it would have paid for", res.Steps)
+	}
+	if m.calls != 2 {
+		t.Errorf("model called %d times, want 2", m.calls)
+	}
+	if !strings.Contains(res.Text, "token 预算") {
+		t.Errorf("Text = %q, want it to name the token budget", res.Text)
+	}
+	if got := typesOf(*events); got[len(got)-2] != EventBudgetStop {
+		t.Errorf("event tail = %v, want a budget_stop before done", got)
+	}
+}
+
+func TestRun_DeadlineStopsBeforeTheFirstCall(t *testing.T) {
+	// A deadline already in the past: the check happens before the first model
+	// call, so an expired budget costs nothing.
+	m := &fakeModel{turns: []*schema.Message{{Role: schema.Assistant, Content: "never"}}}
+	r, _ := New(Config{Model: m, MaxSteps: 5, Deadline: time.Nanosecond, Logger: zap.NewNop()})
+
+	res, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "go"}},
+	}, func(Event) {})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.StopReason != StopDeadline {
+		t.Fatalf("StopReason = %q, want %q", res.StopReason, StopDeadline)
+	}
+	if m.calls != 0 {
+		t.Errorf("model called %d times, want 0 (the budget was already spent)", m.calls)
+	}
+	if res.Steps != 0 {
+		t.Errorf("Steps = %d, want 0", res.Steps)
+	}
+	// No assistant text exists to fall back on, so the note has to stand alone.
+	if !strings.Contains(res.Text, "未能得出最终回答") {
+		t.Errorf("Text = %q, want the no-answer form", res.Text)
+	}
+}
+
+func TestRun_TokenBudgetNeedsReportedUsage(t *testing.T) {
+	// A provider that reports no usage cannot be bounded by tokens. The runner
+	// must not pretend otherwise, so the turn runs to the step cap instead.
+	tl := &fakeTool{name: "loop", desc: "l", run: func(context.Context, string) (string, error) {
+		return "again", nil
+	}}
+	m := &fakeModel{turns: []*schema.Message{toolCallTurn("c1"), toolCallTurn("c2")}}
+	r, _ := New(Config{Model: m, Tools: newRegistry(t, tl), MaxSteps: 2, MaxTokens: 1, Logger: zap.NewNop()})
+
+	res, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "go"}},
+	}, func(Event) {})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.StopReason != StopSteps {
+		t.Errorf("StopReason = %q, want %q when no usage is reported", res.StopReason, StopSteps)
+	}
+}
+
+// fakeCondenser records what it was asked to compress and folds the middle away,
+// so a test can see the window the model actually received.
+type fakeCondenser struct {
+	mu    sync.Mutex
+	calls int
+	heads []int
+	pins  []bool
+	err   error
+}
+
+func (f *fakeCondenser) CompressKeeping(_ context.Context, msgs []*schema.Message, head int, pinLastUser bool) ([]*schema.Message, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.heads = append(f.heads, head)
+	f.pins = append(f.pins, pinLastUser)
+	if f.err != nil {
+		return nil, "", f.err
+	}
+	if len(msgs) <= head+3 {
+		return msgs, "", nil
+	}
+	out := make([]*schema.Message, 0, head+3)
+	out = append(out, msgs[:head]...)
+	out = append(out, &schema.Message{Role: schema.System, Content: "SUMMARY"})
+	out = append(out, msgs[len(msgs)-2:]...)
+	return out, "SUMMARY", nil
+}
+
+func TestRun_CondenserBoundsTheWindowEveryStep(t *testing.T) {
+	tl := &fakeTool{name: "loop", desc: "l", run: func(context.Context, string) (string, error) {
+		return strings.Repeat("tool output ", 20), nil
+	}}
+	m := &fakeModel{turns: []*schema.Message{
+		toolCallTurn("c1"), toolCallTurn("c2"), toolCallTurn("c3"), toolCallTurn("c4"),
+		{Role: schema.Assistant, Content: "done"},
+	}}
+	cd := &fakeCondenser{}
+	r, _ := New(Config{Model: m, Tools: newRegistry(t, tl), MaxSteps: 20, Condenser: cd, Logger: zap.NewNop()})
+
+	res, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{
+			{Role: schema.System, Content: "SYSTEM"},
+			{Role: schema.User, Content: "GOAL"},
+		},
+	}, func(Event) {})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Text != "done" || res.StopReason != "" {
+		t.Fatalf("res = %+v, want a normal answer", res)
+	}
+	if cd.calls < 2 {
+		t.Fatalf("condenser called %d times, want once per step", cd.calls)
+	}
+	for i, head := range cd.heads {
+		if head != 1 {
+			t.Errorf("call %d pinned %d head messages, want 1 (the system prompt)", i, head)
+		}
+	}
+	for i, pin := range cd.pins {
+		if !pin {
+			t.Errorf("call %d did not pin the user message", i)
+		}
+	}
+	// The window the model saw must stay bounded even though the turn kept
+	// adding tool output: that is the whole point of condensing every step.
+	last := m.gotMessages[len(m.gotMessages)-1]
+	if len(last) > 6 {
+		t.Errorf("model saw %d messages on the last step, want a bounded window: %v",
+			len(last), contentsOf(last))
+	}
+	if last[0].Content != "SYSTEM" {
+		t.Errorf("the system prompt was dropped from the window: %v", contentsOf(last))
+	}
+}
+
+func TestRun_CondenserFailureDoesNotFailTheTurn(t *testing.T) {
+	tl := &fakeTool{name: "loop", desc: "l", run: func(context.Context, string) (string, error) {
+		return "again", nil
+	}}
+	m := &fakeModel{turns: []*schema.Message{
+		toolCallTurn("c1"), {Role: schema.Assistant, Content: "answered anyway"},
+	}}
+	cd := &fakeCondenser{err: errors.New("summarizer exploded")}
+	r, _ := New(Config{Model: m, Tools: newRegistry(t, tl), MaxSteps: 5, Condenser: cd, Logger: zap.NewNop()})
+
+	res, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "go"}},
+	}, func(Event) {})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Text != "answered anyway" {
+		t.Errorf("Text = %q, want the answer: a summary failure must not abort a long task", res.Text)
+	}
+}
+
+// usageTurn is an assistant message that asks for another tool call and reports
+// the given token usage, which is what a token budget measures.
+func usageTurn(total int) *schema.Message {
+	m := toolCallTurn("c")
+	m.ResponseMeta = &schema.ResponseMeta{Usage: &schema.TokenUsage{TotalTokens: total, PromptTokens: total}}
+	return m
+}
+
+// toolCallTurn is an assistant message whose only content is a tool call, which
+// is what keeps the loop going.
+func toolCallTurn(id string) *schema.Message {
+	return &schema.Message{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
+		ID: id, Type: "function",
+		Function: schema.FunctionCall{Name: "loop", Arguments: "{}"},
+	}}}
+}
+
+func contentsOf(msgs []*schema.Message) []string {
+	out := make([]string, len(msgs))
+	for i, m := range msgs {
+		out[i] = string(m.Role) + ":" + m.Content
+	}
+	return out
 }
 
 func TestRun_ContextCancelled(t *testing.T) {
@@ -939,7 +1192,7 @@ func TestToolInfos_AlwaysHaveAnObjectSchema(t *testing.T) {
 				t.Fatalf("New: %v", err)
 			}
 
-			infos, err := r.toolInfos(context.Background())
+			infos, err := r.toolInfos(context.Background(), r.tools)
 			if err != nil {
 				t.Fatalf("toolInfos: %v", err)
 			}
@@ -973,7 +1226,7 @@ func TestToolInfos_PreservesDeclaredProperties(t *testing.T) {
 	}
 	r, _ := New(Config{Model: &fakeModel{}, Tools: newRegistry(t, tl), Logger: zap.NewNop()})
 
-	infos, err := r.toolInfos(context.Background())
+	infos, err := r.toolInfos(context.Background(), r.tools)
 	if err != nil {
 		t.Fatalf("toolInfos: %v", err)
 	}
@@ -1032,5 +1285,168 @@ func TestRun_ToolDurationIsMeasured(t *testing.T) {
 	}
 	if len(res.Tools) != 1 || res.Tools[0].DurationMs < 20 {
 		t.Errorf("Result tool duration = %dms, want >= 20ms", res.Tools[0].DurationMs)
+	}
+}
+
+// TestRun_ScopeIsVisibleToTools: a tool must be able to see which scope its turn
+// belongs to, because that is what a per-scope capability (a workspace) is
+// resolved from, and it has to be the turn's scope rather than the runner's.
+func TestRun_ScopeIsVisibleToTools(t *testing.T) {
+	var seen []string
+	tl := &fakeTool{name: "where", desc: "d", run: func(ctx context.Context, _ string) (string, error) {
+		return ScopeFrom(ctx), nil
+	}}
+	m := &fakeModel{turns: []*schema.Message{
+		{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
+			ID: "c1", Function: schema.FunctionCall{Name: "where", Arguments: "{}"},
+		}}},
+		{Role: schema.Assistant, Content: "done"},
+	}}
+	r, err := New(Config{Model: m, Tools: newRegistry(t, tl), Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Two turns with different scopes: each must see its own, and the second
+	// must not inherit the first's. Each turn gets a fresh scripted model,
+	// because a turn consumes as many scripted replies as it takes steps.
+	for _, scope := range []string{"web:s1", "feishu:ou_1"} {
+		m.reset([]*schema.Message{
+			{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
+				ID: "c1", Function: schema.FunctionCall{Name: "where", Arguments: "{}"},
+			}}},
+			{Role: schema.Assistant, Content: "done"},
+		})
+		res, err := r.Run(context.Background(), Request{
+			SessionID: "sess", Scope: scope,
+			Messages: []*schema.Message{{Role: schema.User, Content: "where am i"}},
+		}, func(Event) {})
+		if err != nil {
+			t.Fatalf("Run(%s): %v", scope, err)
+		}
+		if len(res.Tools) != 1 {
+			t.Fatalf("expected 1 tool run, got %d", len(res.Tools))
+		}
+		seen = append(seen, res.Tools[0].Result)
+	}
+	if seen[0] != "web:s1" || seen[1] != "feishu:ou_1" {
+		t.Errorf("tools saw %v, want each turn's own scope", seen)
+	}
+}
+
+// TestRun_UnscopedTurnHasNoScope: a deployment without scopes must not have one
+// invented for it.
+func TestRun_UnscopedTurnHasNoScope(t *testing.T) {
+	if got := ScopeFrom(WithScope(context.Background(), "")); got != "" {
+		t.Errorf("WithScope(\"\") produced %q, want no scope", got)
+	}
+	if got := ScopeFrom(context.Background()); got != "" {
+		t.Errorf("ScopeFrom on a bare context = %q, want empty", got)
+	}
+	// A nil context must not panic: ScopeFrom is called from tool paths.
+	if got := ScopeFrom(nil); got != "" {
+		t.Errorf("ScopeFrom(nil) = %q, want empty", got)
+	}
+}
+
+// TestRun_ToolsForOverridesRegistry: the per-turn registry is what a
+// workspace-bound turn runs against, so it has to win over the static one — and
+// it has to be resolved once per turn, not once per step.
+func TestRun_ToolsForOverridesRegistry(t *testing.T) {
+	static := &fakeTool{name: "static", desc: "d", run: func(context.Context, string) (string, error) {
+		return "static", nil
+	}}
+	perTurn := &fakeTool{name: "perturn", desc: "d", run: func(context.Context, string) (string, error) {
+		return "perturn", nil
+	}}
+
+	calls := 0
+	m := &fakeModel{turns: []*schema.Message{
+		{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
+			ID: "c1", Function: schema.FunctionCall{Name: "perturn", Arguments: "{}"},
+		}}},
+		{Role: schema.Assistant, Content: "done"},
+	}}
+	r, err := New(Config{
+		Model: m,
+		Tools: newRegistry(t, static),
+		ToolsFor: func(ctx context.Context) (*tool.Registry, error) {
+			calls++
+			if ScopeFrom(ctx) != "web:s9" {
+				t.Errorf("ToolsFor saw scope %q, want web:s9", ScopeFrom(ctx))
+			}
+			return newRegistry(t, perTurn), nil
+		},
+		Logger: zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), Request{
+		Scope:    "web:s9",
+		Messages: []*schema.Message{{Role: schema.User, Content: "go"}},
+	}, func(Event) {})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("ToolsFor was called %d times, want exactly 1 per turn", calls)
+	}
+	if len(res.Tools) != 1 || res.Tools[0].Result != "perturn" {
+		t.Fatalf("the turn did not run against the per-turn registry: %+v", res.Tools)
+	}
+	// The static registry's own tool must not have been reachable.
+	if res.Tools[0].Name != "perturn" {
+		t.Errorf("tool %q ran, want perturn", res.Tools[0].Name)
+	}
+}
+
+// TestRun_ToolsForFailureIsARunFailure: a caller that cannot decide which tools a
+// turn may use must not have the turn run with the wrong ones.
+func TestRun_ToolsForFailureIsARunFailure(t *testing.T) {
+	m := &fakeModel{turns: []*schema.Message{{Role: schema.Assistant, Content: "x"}}}
+	r, err := New(Config{
+		Model:    m,
+		Tools:    newRegistry(t, &fakeTool{name: "static", desc: "d"}),
+		ToolsFor: func(context.Context) (*tool.Registry, error) { return nil, errors.New("no workspace") },
+		Logger:   zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "go"}},
+	}, func(Event) {})
+	if err == nil {
+		t.Fatal("Run succeeded although the tool set could not be resolved")
+	}
+	if !strings.Contains(err.Error(), "no workspace") {
+		t.Errorf("error %v does not explain the cause", err)
+	}
+}
+
+// TestRun_ToolsForNilMeansNoTools: falling back to the static registry would run
+// the turn against tools bound to a different workspace, which is worse than
+// running without any.
+func TestRun_ToolsForNilMeansNoTools(t *testing.T) {
+	m := &fakeModel{turns: []*schema.Message{{Role: schema.Assistant, Content: "plain"}}}
+	r, err := New(Config{
+		Model:    m,
+		Tools:    newRegistry(t, &fakeTool{name: "static", desc: "d"}),
+		ToolsFor: func(context.Context) (*tool.Registry, error) { return nil, nil },
+		Logger:   zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	res, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "hi"}},
+	}, func(Event) {})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Text != "plain" {
+		t.Errorf("text = %q, want the plain answer", res.Text)
 	}
 }

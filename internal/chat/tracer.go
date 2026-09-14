@@ -37,6 +37,14 @@ type TraceInfo struct {
 	SessionID string
 	UserID    string
 	Input     any
+	// ID is a caller-supplied trace id. An implementation MUST honour it when
+	// it is non-empty and generate its own when it is empty.
+	//
+	// It exists so a fan-out ([tracing.Multi]) can make every backend agree on
+	// one id: without it each sink would mint its own, and the observations
+	// reported afterwards — which only carry the id the fan-out returned —
+	// would be attached to a trace only one of the backends had created.
+	ID string
 }
 
 // SpanInfo describes a span being started.
@@ -44,6 +52,8 @@ type SpanInfo struct {
 	TraceID string
 	Name    string
 	Input   any
+	// ID is a caller-supplied observation id; see TraceInfo.ID.
+	ID string
 }
 
 // GenInfo describes a model call being started.
@@ -53,6 +63,8 @@ type GenInfo struct {
 	Model   string
 	Input   any
 	Step    int
+	// ID is a caller-supplied observation id; see TraceInfo.ID.
+	ID string
 }
 
 // NopTracer discards everything. It is the default so a Runner never needs a

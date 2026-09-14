@@ -200,11 +200,35 @@ func (s *fileStore) Facts(ctx context.Context, namespace string) ([]Fact, error)
 	out := make([]Fact, 0, len(entries))
 	for _, e := range entries {
 		f, fErr := parseFact(e.Content)
-		if fErr == nil {
-			out = append(out, f)
+		if fErr != nil {
+			continue
 		}
+		// AddFact records the keyword set in the entry's Meta because the
+		// content is a human-readable "key: value" line. Restore it here: a
+		// fact without its keywords cannot be found by the keyword fallback,
+		// which is exactly the recall path used when OpenViking is unavailable.
+		f.Keywords = keywordsFromMeta(e.Meta)
+		out = append(out, f)
 	}
 	return out, nil
+}
+
+// keywordsFromMeta reads the "keyword=a,b" marker AddFact writes into Meta. A
+// missing or malformed marker yields no keywords rather than an error: an
+// entry written by another path is still a usable fact.
+func keywordsFromMeta(meta string) []string {
+	const prefix = "keyword="
+	if !strings.HasPrefix(meta, prefix) {
+		return nil
+	}
+	parts := strings.Split(strings.TrimPrefix(meta, prefix), ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func parseFact(content string) (Fact, error) {
@@ -279,10 +303,13 @@ func (s *fileStore) SearchFacts(ctx context.Context, query string, limit int) ([
 			if e.Kind != KindFact {
 				continue
 			}
-			if f, fErr := parseFact(e.Content); fErr == nil && matchesAny(f, q) {
-				out = append(out, f)
-				if len(out) >= limit {
-					return out, nil
+			if f, fErr := parseFact(e.Content); fErr == nil {
+				f.Keywords = keywordsFromMeta(e.Meta)
+				if matchesAny(f, q) {
+					out = append(out, f)
+					if len(out) >= limit {
+						return out, nil
+					}
 				}
 			}
 		}

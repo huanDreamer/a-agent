@@ -62,24 +62,43 @@ llm:
 # Agent (ReAct loop) settings. Used by `huan-agent chat --tools` and by
 # any platform integrations that build an agent.Agent.
 agent:
-  max_steps: 12              # capped to 25 internally
+  # Caps model→tool→model iterations for the ReAct CLI. Values above 200 are
+  # clamped to it with a warning: this loop carries no token or time budget of
+  # its own, so the step count is the only bound on a model that keeps calling
+  # tools. Long tasks belong to the web/IM runner (chat.max_steps + the two
+  # budgets above), which has all three.
+  max_steps: 12
   # allowed_tools restricts which registered tools the LLM can call.
   # Empty list (default) = allow every registered tool.
   # Names must match the tools registered by the agent (built-ins:
   # time, calc, echo; MCP tools use their server-declared names).
   allowed_tools: []
 
-# MCP (Model Context Protocol) servers spawned at chat startup. Each
-# server is a separate subprocess. Set `command` to an executable on
-# PATH (or an absolute path); args + env are forwarded as-is.
+# MCP (Model Context Protocol) servers. An entry declared here is mirrored
+# into the database at startup so the console (设置 → MCP) lists it, and it is
+# re-applied from this file on every start — which is why its console row is
+# read-only apart from `enabled`. Servers added in the console live only in the
+# database and are left alone by this sync.
+#
+# transport: "stdio" (default) | "sse" | "http"
+#   * stdio spawns `command` with `args` and `env` ("KEY=value", merged onto the
+#     process environment).
+#   * sse / http dial `url` with `headers` ("Name: value", where a token goes).
 mcp:
   servers: []
   # Example: filesystem MCP server (uvx-installed)
   # servers:
   #   - name: "fs"
+  #     transport: "stdio"
   #     command: "uvx"
   #     args: ["mcp-server-filesystem", "/home/me/notes"]
   #     env: []
+  #     enabled: true
+  # Example: a hosted MCP server over SSE
+  #   - name: "hosted"
+  #     transport: "sse"
+  #     url: "https://example.com/sse"
+  #     headers: ["Authorization: Bearer "]
 
 # Skills (markdown + YAML frontmatter) loaded by `huan-agent chat --skill <name>`.
 skills:
@@ -102,7 +121,13 @@ memory:
 #   HUAN_CONTEXT_KEEP_RECENT=10
 #   HUAN_CONTEXT_SUMMARIZE=true
 context:
-  max_tokens: 0           # 0 = disabled (no compression). Set e.g. 8000 to enable.
+  # 0 = disabled. When it is set, compression runs twice over: once per turn on
+  # the assembled history (CLI / 飞书), and once before every model call inside a
+  # turn (all three surfaces, including the web console) — which is what keeps a
+  # long task from resending its whole transcript on every step. Compression
+  # always keeps the system prompt and the last user message verbatim, and rolls
+  # the middle into a summary. Pick something like 60%~70% of the model's window.
+  max_tokens: 0
   keep_recent: 10         # messages kept verbatim after a compression pass
   summarize: true         # use the LLM to summarize rolled-up turns (else drop + placeholder)
 
@@ -157,6 +182,15 @@ feishu:
   download_dir: ""
   max_download_mb: 32          # per-attachment cap
 
+  # Give the bot the file/search/command tools, confined to the workspace the
+  # sender selected (see 设置 → 工作区 and docs/tools.md).
+  #
+  # SECURITY: anyone who can message the bot can then read, write and execute
+  # inside a workspace, and `bash` can still reach absolute paths elsewhere on
+  # the machine. Set false to keep the bot conversational, or point it at a
+  # read-only workspace.
+  enable_tools: true
+
   # Legacy single-app form (alternative to `apps` + `active`):
   # app_id: "cli_xxx"
   # app_secret: ""
@@ -192,12 +226,28 @@ admin:
   # This is a single-user local console, so there is no login by default: the
   # only way in is loopback and a password you retype on every restart is
   # friction with nothing to protect.
+  #
+  # Turning this on is what makes the web console show its login screen: the
+  # console asks GET /api/me for `login_required` before it draws anything, so a
+  # login-free deployment never sees a password form. Sessions live in the
+  # server's memory — a restart logs everyone out.
   require_login: false
   username: "admin"
   # bcrypt hash; only needed when require_login is true. Generate and set it:
   #   huan-agent admin set-password
   # or via env: HUAN_ADMIN_PASSWORD_HASH
   password_hash: ""
+  # The password is asked of callers that are NOT on this machine: a request
+  # arriving over the loopback interface (127.0.0.1 / ::1) is treated as already
+  # authenticated, even with require_login: true. The decision comes from the
+  # socket's peer address, never from X-Forwarded-For, so a remote caller cannot
+  # claim to be local by sending a header.
+  #
+  # Set this to false if a reverse proxy, an SSH tunnel or a container
+  # port-forward is what reaches the server: those clients arrive from 127.0.0.1
+  # too and would skip the password, which would leave require_login protecting
+  # nothing. The server logs a warning at startup while this is on.
+  trust_loopback: true
   # The agent's tools can read, write and EXECUTE, so a login-free admin on a
   # non-loopback address would be a remote shell. The server therefore refuses
   # to start with that combination. Set this only when something else
@@ -207,9 +257,34 @@ admin:
 # Web chat in the admin UI (requires `huan-agent admin serve`).
 chat:
   enable: true             # off = the chat tab is hidden
-  max_steps: 12            # tool-calling iterations per turn
+  max_steps: 12            # tool-calling iterations per turn (> 500 is refused)
+  turn_max_tokens: 0       # per-turn token budget; 0 = unlimited
+  turn_deadline_seconds: 0 # per-turn wall-clock budget; 0 = unlimited
   history_limit: 40        # stored messages replayed to the model
   system_prompt: ""        # empty = built-in default
+  # ask_user 的交互卡片等多久算超时（秒）；0 = 默认 600。
+  # 等待发生在这一轮之内，所以要明显小于 turn_deadline_seconds，否则等到答案时
+  # 这一轮已经没有预算继续了。超时不算失败：模型收到「用户没有回答」后自行收口。
+  ask_user_timeout_seconds: 600
+
+# 长任务（几十步、十几分钟）：这四个开关要一起调，别只调 max_steps ——
+# 只把步数调大的结果是每一步都重发整段历史，token 成本近似平方增长，
+# 最后撞模型上下文上限报错；context.max_tokens 才是让它跑完的那一半。
+#
+#   chat:
+#     max_steps: 60
+#     turn_max_tokens: 400000       # 这一轮最多烧多少 token
+#     turn_deadline_seconds: 3600   # 这一轮最多跑多久
+#   context:
+#     max_tokens: 60000             # 循环内窗口上限，建议取模型窗口的 60%~70%
+#     keep_recent: 12               # 最近几步逐字保留，更早的折叠成摘要
+#     summarize: true
+#   tools:
+#     bash_timeout_seconds: 300     # 单条命令默认给多久
+#     bash_max_timeout_seconds: 1800  # 模型用 timeout_ms 最多能要到多久
+#
+# 停因不会被吞掉：到预算就收口，回答里写明是哪一个预算用尽，控制台给这一轮打标记，
+# 日志里有一条 warn（reason / steps / tokens / elapsed）。详见 docs/long-tasks.md。
 
 # Langfuse tracing. Traces every chat turn: model generations (with token
 # usage) and tool calls, viewable in the admin UI's 链路追踪 tab and in
@@ -230,13 +305,48 @@ langfuse:
 # confined; what a command can otherwise reach is not. For a real boundary, run
 # the agent as a dedicated user in a container with only the project mounted.
 tools:
-  # The confinement root. Empty = the process working directory.
+  # The first workspace: the directory the agent works in until other workspaces
+  # are set up in the console (left sidebar → 新建工作区). Empty = the process
+  # working directory.
+  #
+  # Every conversation belongs to a workspace, and a workspace is a directory you
+  # pick — so this is a starting point, not a global setting. See
+  # docs/tools.md → Workspaces.
   workspace: ""              # e.g. "/Users/me/code/my-project"
-  # Read and search only: write_file, edit_file and bash are withheld.
+  # Read and search only: write_file, edit_file, bash and generate_image are not
+  # registered at all. Process-wide: it applies to every workspace.
   read_only: false
   # Shell execution. Off = file editing without command execution.
   enable_bash: true
   bash_timeout_seconds: 120
+  # The ceiling a single call may raise its own timeout to with timeout_ms: a
+  # long build or a full test suite can ask for more time for that call without
+  # changing the default every other command waits under. A value below
+  # bash_timeout_seconds is raised to it, since a ceiling under the default
+  # would make the default itself unreachable. 0 = the default (900s).
+  bash_max_timeout_seconds: 900
+  # Background processes (bash_background / bash_jobs / bash_output / bash_stop):
+  # dev servers, --watch builds, resident APIs and databases. A `bash` call still
+  # kills what it started; these tools are the explicit way to start something
+  # that outlives the call. Off = the four tools are not registered at all.
+  # They also require enable_bash: starting a resident process is still running a
+  # command.
+  enable_background: true
+  # Where job logs are written. Empty = a "jobs" directory beside the database
+  # file. Logs live with the deployment's data rather than in a workspace, so they
+  # do not turn up in the model's own searches or in your git status.
+  background_dir: ""
+  # How many background jobs may run at once; starting one more is refused with a
+  # message that says so.
+  background_max_jobs: 8
+  # Per-job caps: the log file stops at background_log_max_mb (and says so in the
+  # file), and the in-memory tail a reader is served from is background_window_kb.
+  # Neither grows with how long the process runs.
+  background_log_max_mb: 8
+  background_window_kb: 256
+  # SIGTERM-to-SIGKILL grace when stopping a job. Generous on purpose: a database
+  # flushes on SIGTERM and losing that is worse than waiting.
+  background_stop_grace_seconds: 5
   # Per-call limits.
   max_read_kb: 512
   max_write_mb: 4
@@ -270,3 +380,71 @@ tools:
 # NOTE the /models endpoint does not report capabilities — it returns ids only.
 # The console guesses from the model name and lets you correct it, which is the
 # only accurate source.
+
+# ---------------------------------------------------------------------------
+# OpenViking — context database for long-term memory and documents
+#
+# OpenViking (https://github.com/volcengine/OpenViking) is an agent-native
+# context database: it stores memory and documents under viking:// URIs and
+# answers semantic queries over them. Install it (`uv tool install openviking`,
+# then `ov system ...` starts the server on 127.0.0.1:1933) and turn this on; the
+# whole integration is off unless `enable: true`.
+#
+# What it does when enabled:
+#   - Memory: every conversation turn is still written to the local JSONL store
+#     (the source of truth) and is additionally submitted to OpenViking, where
+#     it is extracted into long-term memory. Facts (`/remember`) also go to a
+#     plain journal file, which works even when OpenViking's VLM model is not
+#     activated on your account. Recall prefers semantic search and falls back
+#     to the local keyword index.
+#   - Documents: `save_document` (a tool the model can call), `huan-agent viking
+#     save`, the console, and the workspace sync all write into one viking://
+#     subtree, where they stay searchable in later conversations.
+#   - Tools: OpenViking's own MCP server is registered automatically, giving the
+#     model find/read/write/add_resource.
+#
+# OpenViking being down never blocks a conversation: the local store still has
+# everything and the failure is reported by `huan-agent viking status` and in
+# 设置 → OpenViking.
+#   HUAN_OPENVIKING_ENABLE=true
+#   HUAN_OPENVIKING_BASE_URL=http://127.0.0.1:1933
+openviking:
+  enable: false                       # off by default; a machine without the server is unaffected
+  base_url: "http://127.0.0.1:1933"   # a local `ov` server
+  api_key: ""                         # empty = dev auth (what a local install uses)
+  account: "default"                  # X-OpenViking-Account
+  user: "default"                     # X-OpenViking-User; data is scoped under viking://user/<user>
+  timeout_seconds: 15
+
+  memory:
+    enable: true
+    # Ask OpenViking to extract long-term memory from submitted turns. Requires
+    # its VLM model to be available on your account (`ov task list` shows the
+    # extraction task; `ModelNotOpen` means it is not activated).
+    commit: true
+    flush_every: 4        # batch this many messages per submission (0 = every turn)
+    recall_enable: true   # semantic recall, with the local keyword index as fallback
+    recall_limit: 5
+    recall_target: ""     # empty = viking://user/<user>/huan-agent
+    journal_enable: true  # VLM-independent append-only fact journal
+    session_prefix: "huan-agent"
+
+  documents:
+    enable: true
+    root_uri: ""              # empty = viking://user/<user>/huan-agent
+    sync_workspace: true      # publish workspace files
+    workspace_dir: ""         # empty = tools.workspace; both empty = sync disabled
+    # Glob patterns over workspace-relative paths. "**" crosses directories, and
+    # a pattern without "/" (e.g. "*.log") also matches the file name at any depth.
+    include: []
+    exclude: []
+    max_file_kb: 512          # per-file cap
+    binary_mode: "skip"       # skip | upload (upload sends binaries through temp_upload + add_resource)
+    wait_index: false         # saved documents always wait for indexing; bulk syncs do not
+    sync_interval_seconds: 0  # >0 = background sync on that period (serve)
+    sync_on_exit: true        # incremental sync when an interactive chat ends
+    state_path: "./data/openviking-docs.json"   # incremental sync state (uri -> content hash)
+
+  mcp:
+    register: true            # register <base_url>/mcp as an MCP server
+    name: "openviking"        # an entry with this name declared under mcp.servers wins

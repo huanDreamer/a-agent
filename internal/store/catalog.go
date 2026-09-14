@@ -508,3 +508,26 @@ func boolToInt(b bool) int {
 	}
 	return 0
 }
+
+// LatestSessionModel returns the provider and model of the most recently used
+// conversation that has one, so a new conversation can start where the last one
+// left off instead of snapping back to the configured default.
+//
+// Only non-empty rows are considered: a conversation created without a model
+// records nothing, and returning it would answer "nothing" as if it were an
+// answer.
+func (s *sqliteStore) LatestSessionModel(ctx context.Context) (string, string, bool) {
+	var provider, model string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT provider, model FROM chat_sessions
+		WHERE TRIM(provider) <> '' OR TRIM(model) <> ''
+		ORDER BY updated_at DESC, rowid DESC
+		LIMIT 1`).Scan(&provider, &model)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false
+	}
+	if err != nil {
+		return "", "", false
+	}
+	return provider, model, true
+}

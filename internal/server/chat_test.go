@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/huan/huan-agent/internal/chat"
+	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/tool"
 )
 
@@ -865,5 +866,131 @@ func TestChatTurn_NilRecorderIsSafe(t *testing.T) {
 		map[string]string{"content": "hi"})
 	if _, ok := findEvent(events, "done"); !ok {
 		t.Error("the turn should still complete without a recorder")
+	}
+}
+
+func TestCreateSession_PrefersTheLastUsedModel(t *testing.T) {
+	// A new conversation should start where the user left off rather than
+	// snapping back to the configured default — the same rule the workspace
+	// already follows. Resolved on the server so it holds across devices.
+	mdl := &scriptedModel{turns: [][]*schema.Message{{{Role: schema.Assistant, Content: "hi"}}}}
+	runner, err := chat.New(chat.Config{Model: mdl, MaxSteps: 3, Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("chat.New: %v", err)
+	}
+	builder := &staticBuilder{provider: "prov-a", model: "model-a", cm: mdl}
+	srv, _ := buildServerWith(t, buildOpts{chat: ChatDeps{Runner: runner, Builder: builder}})
+	startHarness(t, srv)
+	h := &harness{base: "http://" + srv.Addr(), client: newJar(t), srv: srv}
+	h.login(t)
+
+	type sessionModel struct {
+		Session struct {
+			Provider string `json:"provider"`
+			Model    string `json:"model"`
+		} `json:"session"`
+	}
+
+	first := createSession(t, h)
+	var got sessionModel
+	h.getJSON(t, "/api/chat/sessions/"+first, http.StatusOK, &got)
+	if got.Session.Provider != "prov-a" || got.Session.Model != "model-a" {
+		t.Fatalf("first session = %s/%s, want the catalog default prov-a/model-a",
+			got.Session.Provider, got.Session.Model)
+	}
+}
+
+// twoModelBuilder offers two chat models, so a test can show that a preference
+// expressed on one session carries into the next.
+type twoModelBuilder struct{ cm model.BaseChatModel }
+
+func (b *twoModelBuilder) Build(context.Context, string, string) (any, error) { return b.cm, nil }
+
+func (b *twoModelBuilder) Catalog(context.Context) ModelCatalog {
+	mk := func(m string, def bool) ModelChoice {
+		return ModelChoice{
+			Provider: "prov", ProviderName: "prov", Model: m, DisplayName: m,
+			Capabilities: []string{string(store.CapChat)}, ChatCapable: true,
+			Default: def, HasAPIKey: true,
+		}
+	}
+	return ModelCatalog{Models: []ModelChoice{mk("model-a", true), mk("model-b", false)}}
+}
+
+func TestCreateSession_InheritsTheModelChangedOnAnEarlierSession(t *testing.T) {
+	mdl := &scriptedModel{turns: [][]*schema.Message{{{Role: schema.Assistant, Content: "hi"}}}}
+	runner, err := chat.New(chat.Config{Model: mdl, MaxSteps: 3, Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("chat.New: %v", err)
+	}
+	srv, _ := buildServerWith(t, buildOpts{chat: ChatDeps{Runner: runner, Builder: &twoModelBuilder{cm: mdl}}})
+	startHarness(t, srv)
+	h := &harness{base: "http://" + srv.Addr(), client: newJar(t), srv: srv}
+	h.login(t)
+
+	type sessionModel struct {
+		Session struct {
+			Provider string `json:"provider"`
+			Model    string `json:"model"`
+		} `json:"session"`
+	}
+	read := func(id string) sessionModel {
+		t.Helper()
+		var got sessionModel
+		h.getJSON(t, "/api/chat/sessions/"+id, http.StatusOK, &got)
+		return got
+	}
+
+	first := createSession(t, h)
+	if got := read(first); got.Session.Model != "model-a" {
+		t.Fatalf("first session = %q, want the default model-a", got.Session.Model)
+	}
+
+	// The user picks the other model: that is the preference to remember.
+	resp := h.patchJSON(t, "/api/chat/sessions/"+first, map[string]string{
+		"provider": "prov", "model": "model-b",
+	})
+	requireStatus(t, resp, http.StatusOK)
+
+	second := createSession(t, h)
+	if got := read(second); got.Session.Model != "model-b" {
+		t.Errorf("new session = %q, want the last used model-b", got.Session.Model)
+	}
+}
+
+func TestCreateSession_AnExplicitChoiceStillWins(t *testing.T) {
+	// Remembering a preference must not override a caller that names a model.
+	mdl := &scriptedModel{turns: [][]*schema.Message{{{Role: schema.Assistant, Content: "hi"}}}}
+	runner, err := chat.New(chat.Config{Model: mdl, MaxSteps: 3, Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("chat.New: %v", err)
+	}
+	srv, _ := buildServerWith(t, buildOpts{chat: ChatDeps{Runner: runner, Builder: &twoModelBuilder{cm: mdl}}})
+	startHarness(t, srv)
+	h := &harness{base: "http://" + srv.Addr(), client: newJar(t), srv: srv}
+	h.login(t)
+
+	// Remember model-b on a first session.
+	first := createSession(t, h)
+	requireStatus(t, h.patchJSON(t, "/api/chat/sessions/"+first,
+		map[string]string{"provider": "prov", "model": "model-b"}), http.StatusOK)
+
+	// An explicit model-a on create must be honoured.
+	body, _ := json.Marshal(map[string]string{"provider": "prov", "model": "model-a"})
+	resp, err := h.client.Post(h.base+"/api/chat/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	var created struct {
+		Session struct {
+			Model string `json:"model"`
+		} `json:"session"`
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	decode(t, resp, &created)
+	if created.Session.Model != "model-a" {
+		t.Errorf("model = %q, want the explicitly requested model-a", created.Session.Model)
 	}
 }

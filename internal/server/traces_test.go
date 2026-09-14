@@ -190,6 +190,16 @@ func TestChatPromptAndLimits(t *testing.T) {
 			t.Errorf("chatPrompt = %q, want the default", got)
 		}
 	})
+	// The tools run with stdin at /dev/null, so the default prompt has to say so
+	// and name the way out: a model that only learns this by failing burns a turn
+	// on a prompt nobody can answer.
+	t.Run("default prompt covers the missing terminal", func(t *testing.T) {
+		for _, want := range []string{"/dev/null", "non-interactively", "-y", "CI=1"} {
+			if !strings.Contains(defaultSystemPrompt, want) {
+				t.Errorf("defaultSystemPrompt is missing %q: %s", want, defaultSystemPrompt)
+			}
+		}
+	})
 	t.Run("max steps", func(t *testing.T) {
 		if got := (&Server{cfg: Config{}}).chatMaxSteps(); got != chat.DefaultMaxSteps {
 			t.Errorf("chatMaxSteps = %d, want the default", got)

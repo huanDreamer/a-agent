@@ -56,16 +56,33 @@ func (s *Server) handleLogout(_ context.Context, c *app.RequestContext) {
 	c.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleMe reports whether the caller holds a valid session.
+// handleMe is the console's boot probe: it answers whether a session is
+// required at all and whether the caller holds one, always with 200.
+//
+// It deliberately sits outside the authenticated group. The console asks this
+// question *before* it has a session and has to branch on the answer — render
+// the shell or render the login form — so a 401 here would be the wrong
+// signal: it cannot distinguish "this deployment insists on a password" from
+// "your session expired", and a console that only learns the difference from a
+// failed data call has already drawn half a page of empty panels.
+//
+// `login_required` is that distinction, and it answers for the *caller*, not for
+// the process: admin.require_login turns the password on, and
+// admin.trust_loopback means it is not asked of a request that came from this
+// machine. So the same server reports true to the laptop across the network and
+// false to a browser on its own desktop, and each of them gets the screen that
+// fits. The console uses it twice — to choose between its shell and its login
+// form, and to decide whether offering 退出登录 means anything.
 func (s *Server) handleMe(_ context.Context, c *app.RequestContext) {
-	if !s.auth.valid(string(c.Cookie(SessionCookieName))) {
-		c.JSON(http.StatusOK, map[string]any{"authenticated": false})
-		return
+	body := map[string]any{
+		"authenticated":  false,
+		"login_required": !s.auth.skipsPassword(c.RemoteAddr()),
 	}
-	c.JSON(http.StatusOK, map[string]any{
-		"authenticated": true,
-		"username":      s.auth.username,
-	})
+	if s.auth.valid(string(c.Cookie(SessionCookieName))) {
+		body["authenticated"] = true
+		body["username"] = s.auth.username
+	}
+	c.JSON(http.StatusOK, body)
 }
 
 // handleHealth is an unauthenticated liveness probe.

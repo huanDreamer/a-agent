@@ -38,10 +38,14 @@ func (a *mcpAdapter) InvokableRun(ctx context.Context, args string, _ ...einotoo
 // adapter per tool into reg. Returns the number of tools
 // registered.
 //
-// The name "register" is a misnomer in spirit: this is one-time
-// bridge glue, not a hot-reload. We register sequentially and
-// bail out on the first error after rolling back any partial
-// registrations.
+// This is one-shot bridge glue for a caller that connects a server and keeps it
+// for the life of the process (the CLI's `chat --tools`). A runtime that adds
+// and removes servers while running uses Manager, which tracks which names it
+// registered so it can unregister exactly those.
+//
+// Tools are registered sequentially, and a failure rolls back the ones already
+// added: leaving them behind would offer the model tools pointing at a server
+// the caller then abandons.
 func RegisterMCPTools(ctx context.Context, reg *tool.Registry, c *Client, logger *zap.Logger) (int, error) {
 	specs, err := c.ListTools(ctx)
 	if err != nil {
@@ -51,12 +55,8 @@ func RegisterMCPTools(ctx context.Context, reg *tool.Registry, c *Client, logger
 	for _, s := range specs {
 		adapter := &mcpAdapter{client: c, name: s.Name, spec: s}
 		if err := reg.Register(adapter); err != nil {
-			// Roll back the partial registrations so we don't leave
-			// dangling tools that point at a server we then abandon.
 			for _, prev := range specs[:registered] {
-				if reg.IsAllowed(prev.Name) || registered == 1 {
-					_ = prev.Name
-				}
+				reg.Unregister(prev.Name)
 			}
 			return registered, fmt.Errorf("mcp: register %s/%s: %w", c.Name(), s.Name, err)
 		}

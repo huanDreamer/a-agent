@@ -368,3 +368,47 @@ func contains(haystack, needle string) bool {
 			return false
 		})()
 }
+
+func TestLatestSessionModel(t *testing.T) {
+	// A new conversation starts where the last one left off, so this lookup
+	// drives the default model of every session that is created.
+	ctx := context.Background()
+	st := newCatalogStore(t)
+
+	if _, _, ok := st.LatestSessionModel(ctx); ok {
+		t.Error("an empty database must report nothing rather than an empty answer")
+	}
+
+	// A conversation with no model recorded is not an answer.
+	if err := st.CreateChatSession(ctx, ChatSession{ID: "s-empty", Title: "no model"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, _, ok := st.LatestSessionModel(ctx); ok {
+		t.Error("a session with no model must not be reported")
+	}
+
+	// One that has, is.
+	if err := st.CreateChatSession(ctx, ChatSession{
+		ID: "s-a", Title: "a", Provider: "prov-a", Model: "model-a",
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	p, m, ok := st.LatestSessionModel(ctx)
+	if !ok || p != "prov-a" || m != "model-a" {
+		t.Fatalf("got (%q, %q, %v), want (prov-a, model-a, true)", p, m, ok)
+	}
+
+	// Changing the model of an older conversation makes it the most recent, so
+	// the choice the user just made is the one remembered.
+	if err := st.UpdateChatSession(ctx, "s-empty", ChatSessionPatch{
+		Provider: ptrString("prov-b"), Model: ptrString("model-b"),
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	p, m, ok = st.LatestSessionModel(ctx)
+	if !ok || p != "prov-b" || m != "model-b" {
+		t.Errorf("got (%q, %q, %v), want the most recently changed (prov-b, model-b)", p, m, ok)
+	}
+}
+
+func ptrString(s string) *string { return &s }

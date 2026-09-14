@@ -35,6 +35,17 @@ type BashPolicy struct {
 	// Timeout bounds one command. <=0 uses DefaultBashTimeout.
 	Timeout time.Duration
 
+	// MaxTimeout is the ceiling a single call may raise its own timeout to with
+	// timeout_ms. <=0 uses DefaultBashMaxTimeout, and a value below Timeout is
+	// raised to it: a ceiling under the default would make the default itself
+	// unreachable.
+	//
+	// The ceiling is what keeps "let a long build finish" from becoming "let a
+	// wedged command hold the turn open forever" — a command that ignores its
+	// input and never exits is the failure mode a timeout exists for, so the
+	// room to extend has to stop somewhere.
+	MaxTimeout time.Duration
+
 	// MaxOutputBytes caps captured stdout and stderr separately. <=0 uses
 	// DefaultBashMaxOutputBytes.
 	MaxOutputBytes int
@@ -54,6 +65,11 @@ type BashPolicy struct {
 const (
 	// DefaultBashTimeout bounds one command when the policy does not say.
 	DefaultBashTimeout = 120 * time.Second
+	// DefaultBashMaxTimeout is the ceiling for a per-call timeout override when
+	// the policy does not say. It mirrors config.DefaultBashMaxTimeoutSeconds:
+	// long enough for a cold dependency install or a full test suite, short
+	// enough that a hung command is noticed inside the same working session.
+	DefaultBashMaxTimeout = 900 * time.Second
 	// DefaultBashMaxOutputBytes caps captured stdout and stderr separately.
 	DefaultBashMaxOutputBytes = 128 << 10 // 128 KiB
 )
@@ -78,6 +94,12 @@ const (
 	// call short before this tool's limit is reached, and a note naming only the
 	// limit would then describe something that never happened.
 	bashTimeoutNoteFmt = "\n[bash] timed out after %s and the whole process group was killed; the output above is partial (the limit configured for one command is %s)\n"
+
+	// bashTimeoutCappedNoteFmt is appended to stderr when a call asked for more
+	// time than the ceiling allows. The applied limit is repeated because the
+	// transcript otherwise shows a command dying for a reason the request does
+	// not explain.
+	bashTimeoutCappedNoteFmt = "\n[bash] timeout_ms was capped at the configured ceiling of %s\n"
 )
 
 // bashDefaultDenyPatterns is the list DefaultBashPolicy ships. It is short and
@@ -99,6 +121,7 @@ func DefaultBashPolicy() BashPolicy {
 	return BashPolicy{
 		Enabled:        true,
 		Timeout:        DefaultBashTimeout,
+		MaxTimeout:     DefaultBashMaxTimeout,
 		MaxOutputBytes: DefaultBashMaxOutputBytes,
 		DenyPatterns:   append([]string(nil), bashDefaultDenyPatterns...),
 	}
@@ -113,7 +136,7 @@ type BashInput struct {
 	// only invite invented values.
 	Description string `json:"description,omitempty" jsonschema:"description=Short note about what this command is for. Echoed back in the result so the transcript explains itself"`
 	Cwd         string `json:"cwd,omitempty" jsonschema:"description=Directory to run in relative to the workspace root. Defaults to the workspace root"`
-	TimeoutMS   int    `json:"timeout_ms,omitempty" jsonschema:"description=Timeout for this call in milliseconds. May only shorten the configured default and never extend it"`
+	TimeoutMS   int    `json:"timeout_ms,omitempty" jsonschema:"description=Timeout for this call in milliseconds. Shortens the configured default or extends it up to the configured ceiling; a longer request is capped. Use it for a slow build or test suite"`
 }
 
 // BashOutput is what the bash tool returns.
@@ -133,6 +156,14 @@ type BashOutput struct {
 	StderrTruncated bool   `json:"stderr_truncated"`
 	DurationMS      int64  `json:"duration_ms"`
 	TimedOut        bool   `json:"timed_out"`
+	// TimeoutMS is the limit this call actually ran under, after the per-call
+	// override and the ceiling were applied. It is reported because "it timed
+	// out" is only actionable next to the limit that fired.
+	TimeoutMS int64 `json:"timeout_ms"`
+	// TimeoutCapped reports that timeout_ms asked for more time than the
+	// configured ceiling allows and was cut down to it. The model learns the
+	// ceiling from the result instead of from another failed attempt.
+	TimeoutCapped bool `json:"timeout_capped,omitempty"`
 }
 
 // bashDenyRule keeps the configured pattern text next to its compiled form, so a
@@ -146,10 +177,11 @@ type bashDenyRule struct {
 // bashConfig is the validated snapshot of a BashPolicy: defaults applied and
 // deny patterns compiled once at construction instead of on every call.
 type bashConfig struct {
-	enabled   bool
-	timeout   time.Duration
-	maxOutput int
-	deny      []bashDenyRule
+	enabled    bool
+	timeout    time.Duration
+	maxTimeout time.Duration
+	maxOutput  int
+	deny       []bashDenyRule
 }
 
 // NewBashTool returns a command-execution tool whose working directory is
@@ -169,7 +201,7 @@ func NewBashTool(ws *workspace.Workspace, policy BashPolicy) (tool.InvokableTool
 		return nil, err
 	}
 
-	return utils.InferTool("bash", bashDescription(cfg.timeout, cfg.maxOutput),
+	return utils.InferTool("bash", bashDescription(cfg.timeout, cfg.maxTimeout, cfg.maxOutput),
 		func(ctx context.Context, in BashInput) (BashOutput, error) {
 			return bashRun(ctx, ws, cfg, in)
 		})
@@ -178,7 +210,7 @@ func NewBashTool(ws *workspace.Workspace, policy BashPolicy) (tool.InvokableTool
 // bashDescription builds the model-facing description around the limits this
 // tool was really built with, so a deployment that changed the timeout or the
 // cap does not leave the model reading about defaults that no longer apply.
-func bashDescription(timeout time.Duration, maxOutput int) string {
+func bashDescription(timeout, maxTimeout time.Duration, maxOutput int) string {
 	return "Run a shell command and return its exit code, stdout and stderr. " +
 		"Use it for builds, test suites, git and package managers while working inside a repository. " +
 		"A non-zero exit status is reported in exit_code, not as an error. " +
@@ -186,35 +218,93 @@ func bashDescription(timeout time.Duration, maxOutput int) string {
 		"That confines the working directory only, not the command: it is not sandboxed and runs with the full rights of the agent's user, so it can read and write files anywhere that user can — inside the workspace or outside it — and it can reach the network. " +
 		"Commands matching a configured deny pattern are refused before they run, but that list is a speed bump against obviously destructive commands, not a security boundary, and it is easy to evade. " +
 		fmt.Sprintf("stdout and stderr are captured separately and each is capped at %d bytes; when the cap is hit the head is kept and an explicit marker reports how many bytes were discarded. ", maxOutput) +
-		fmt.Sprintf("Commands are killed after %s; timeout_ms can shorten that for one call but never extend it. ", timeout) +
+		fmt.Sprintf("Commands are killed after %s; timeout_ms may shorten that for one call or extend it up to %s, which is what a long build or a full test suite needs. ", timeout, maxTimeout) +
 		"Standard input is /dev/null, so a command that prompts for input fails instead of hanging. " +
-		"Anything still running in the process group the command started is killed when the call ends, so do not rely on a background process outliving it."
+		"Run commands non-interactively: pass the flag the tool offers for it (-y or --yes for package managers and scaffolders, --no-input, CI=1, git commit -m) or feed the answers through a pipe, and do not start a REPL, a pager or an editor. " +
+		"Anything still running in the process group the command started is killed when the call ends, so do not rely on a background process outliving it. " +
+		"For a process that is meant to keep running, use bash_background instead."
 }
 
 // bashConfigFrom validates a policy and applies the defaults.
 func bashConfigFrom(policy BashPolicy) (bashConfig, error) {
 	cfg := bashConfig{
-		enabled:   policy.Enabled,
-		timeout:   policy.Timeout,
-		maxOutput: policy.MaxOutputBytes,
+		enabled:    policy.Enabled,
+		timeout:    policy.Timeout,
+		maxTimeout: policy.MaxTimeout,
+		maxOutput:  policy.MaxOutputBytes,
 	}
 	if cfg.timeout <= 0 {
 		cfg.timeout = DefaultBashTimeout
 	}
+	if cfg.maxTimeout <= 0 {
+		cfg.maxTimeout = DefaultBashMaxTimeout
+	}
+	if cfg.maxTimeout < cfg.timeout {
+		// A ceiling below the default would make the default unreachable, which
+		// is a configuration that cannot mean what it says.
+		cfg.maxTimeout = cfg.timeout
+	}
 	if cfg.maxOutput <= 0 {
 		cfg.maxOutput = DefaultBashMaxOutputBytes
 	}
-	for _, pattern := range policy.DenyPatterns {
+	deny, err := compileDenyPatterns(policy.DenyPatterns)
+	if err != nil {
+		return bashConfig{}, err
+	}
+	cfg.deny = deny
+	return cfg, nil
+}
+
+// compileDenyPatterns validates the configured patterns once, at construction,
+// and keeps each one's text next to its compiled form.
+//
+// It is shared with the background tools rather than duplicated: one list of
+// patterns is one place to fix a bad regex, and a background process started by
+// a command the foreground tool refuses would be a hole in the same policy.
+func compileDenyPatterns(patterns []string) ([]bashDenyRule, error) {
+	var out []bashDenyRule
+	for _, pattern := range patterns {
 		if strings.TrimSpace(pattern) == "" {
 			continue
 		}
 		re, err := regexp.Compile(pattern)
 		if err != nil {
-			return bashConfig{}, fmt.Errorf("bash: deny pattern %q: %w", pattern, err)
+			return nil, fmt.Errorf("bash: deny pattern %q: %w", pattern, err)
 		}
-		cfg.deny = append(cfg.deny, bashDenyRule{pattern: pattern, re: re})
+		out = append(out, bashDenyRule{pattern: pattern, re: re})
 	}
-	return cfg, nil
+	return out, nil
+}
+
+// bashGuard applies everything that has to be true before any command runs. It
+// is shared by the foreground and the background tools so that a refusal means
+// the same thing whichever one the model called: a read-only workspace, command
+// execution disabled by policy, and a command matching a deny pattern.
+//
+// name is the tool name the message carries, so a refusal always names the tool
+// the model actually asked for. The order is deliberate — read-only, then
+// disabled, then deny — because those are increasingly specific reasons, and the
+// read-only case is the operator's standing decision rather than a match on the
+// command's text.
+//
+// Nothing here confines the command itself: see BashPolicy for what is and is
+// not promised.
+func bashGuard(name string, ws *workspace.Workspace, enabled bool, deny []bashDenyRule, command string) error {
+	if ws == nil {
+		return fmt.Errorf("%s: a workspace is required", name)
+	}
+	if ws.ReadOnly() {
+		return fmt.Errorf("%s: %w: no command was run", name, workspace.ErrReadOnly)
+	}
+	if !enabled {
+		return fmt.Errorf("%s: command execution is disabled by policy (BashPolicy.Enabled is false)", name)
+	}
+	for _, rule := range deny {
+		if rule.re.MatchString(command) {
+			return fmt.Errorf("%s: command refused by deny pattern %q: it looks destructive and nothing was run", name, rule.pattern)
+		}
+	}
+	return nil
 }
 
 // bashRun executes one command and shapes the result for the model.
@@ -236,19 +326,11 @@ func bashRun(ctx context.Context, ws *workspace.Workspace, cfg bashConfig, in Ba
 	}
 	out := BashOutput{Command: command, Description: strings.TrimSpace(in.Description)}
 
-	if ws.ReadOnly() {
-		return BashOutput{}, fmt.Errorf("bash: %w: no command was run", workspace.ErrReadOnly)
-	}
-	if !cfg.enabled {
-		return BashOutput{}, fmt.Errorf("bash: command execution is disabled by policy (BashPolicy.Enabled is false)")
-	}
-
-	// The deny list is checked before anything else can have an effect, so a
-	// refused command leaves no trace at all.
-	for _, rule := range cfg.deny {
-		if rule.re.MatchString(command) {
-			return BashOutput{}, fmt.Errorf("bash: command refused by deny pattern %q: it looks destructive and nothing was run", rule.pattern)
-		}
+	// The checks that must precede any execution — read-only workspace, tool
+	// disabled, deny pattern — are shared with the background tools, so the same
+	// command is refused the same way whichever tool asks for it.
+	if err := bashGuard("bash", ws, cfg.enabled, cfg.deny, command); err != nil {
+		return BashOutput{}, err
 	}
 
 	cwd, err := bashResolveCwd(ws, in.Cwd)
@@ -267,7 +349,9 @@ func bashRun(ctx context.Context, ws *workspace.Workspace, cfg bashConfig, in Ba
 	// taken while the shell itself is still running) and the watchdog goroutine
 	// after Start (which also covers a shell that already exited and left a
 	// child holding the output pipes).
-	timeout := bashTimeout(cfg.timeout, in.TimeoutMS)
+	timeout, capped := bashTimeout(cfg.timeout, cfg.maxTimeout, in.TimeoutMS)
+	out.TimeoutMS = timeout.Milliseconds()
+	out.TimeoutCapped = capped
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -370,6 +454,13 @@ func bashRun(ctx context.Context, ws *workspace.Workspace, cfg bashConfig, in Ba
 		out.ExitCode = -1
 		out.Stderr += fmt.Sprintf(bashTimeoutNoteFmt, elapsed.Round(time.Millisecond), timeout)
 	}
+	if capped {
+		// Reported in the result *and* on stderr: the field is what a caller
+		// branches on, and the note is what a model reads when a command it
+		// expected to have ten minutes dies at fifteen. The command still ran —
+		// this is not an error, it is a limit that was applied.
+		out.Stderr += fmt.Sprintf(bashTimeoutCappedNoteFmt, timeout)
+	}
 	return out, nil
 }
 
@@ -396,18 +487,27 @@ func bashResolveCwd(ws *workspace.Workspace, cwd string) (string, error) {
 	return dir, nil
 }
 
-// bashTimeout applies a per-call override. The override may only shorten the
-// policy timeout: a model must not be able to talk its way into a longer run
-// than the operator allowed.
-func bashTimeout(policy time.Duration, overrideMS int) time.Duration {
+// bashTimeout applies a per-call override against the configured ceiling.
+//
+// The override may shorten the default freely *and* extend it up to the ceiling:
+// a full test suite or a cold dependency install legitimately needs more than
+// the ordinary two minutes, and forcing that to be a global setting makes every
+// other call wait longer for its timeout too. The ceiling is what stops
+// "give this build more room" from becoming "let this command hold the turn open
+// for as long as it likes". The second return reports that a request was cut
+// down, so the caller can say so rather than leaving a mystery.
+func bashTimeout(def, max time.Duration, overrideMS int) (time.Duration, bool) {
 	if overrideMS <= 0 {
-		return policy
+		return def, false
 	}
 	want := time.Duration(overrideMS) * time.Millisecond
-	if want <= 0 || want > policy { // want <= 0 catches an overflowing duration
-		return policy
+	if want <= 0 { // an overflowing duration lands here
+		return def, false
 	}
-	return want
+	if max > 0 && want > max {
+		return max, true
+	}
+	return want, false
 }
 
 // bashShell returns the interpreter for a command string on this platform, as

@@ -347,3 +347,35 @@ func TestChatMessages_ErrorPersisted(t *testing.T) {
 		t.Errorf("error text not persisted intact: %q", got[0].Error)
 	}
 }
+
+// TestChatMessages_StopReasonPersisted covers the marker a budget-stopped turn
+// leaves behind: the console shows it after a reload, so it has to survive the
+// round trip, and a turn the model finished must not acquire one.
+func TestChatMessages_StopReasonPersisted(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if err := st.CreateChatSession(ctx, ChatSession{ID: "s"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	for _, m := range []ChatMessage{
+		{Role: "assistant", Content: "stopped", StopReason: "tokens"},
+		{Role: "assistant", Content: "finished"},
+	} {
+		if _, err := st.AppendChatMessage(ctx, "s", m); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	got, err := st.ListChatMessages(ctx, "s", 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d messages, want 2", len(got))
+	}
+	if got[0].StopReason != "tokens" {
+		t.Errorf("stop_reason = %q, want %q", got[0].StopReason, "tokens")
+	}
+	if got[1].StopReason != "" {
+		t.Errorf("stop_reason = %q, want empty for a turn the model finished", got[1].StopReason)
+	}
+}

@@ -7,8 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"go.uber.org/zap"
+
 	"github.com/cloudwego/eino/schema"
 
+	"github.com/huan/huan-agent/internal/jobs"
 	"github.com/huan/huan-agent/internal/media"
 	"github.com/huan/huan-agent/internal/tool"
 	"github.com/huan/huan-agent/internal/workspace"
@@ -35,6 +38,12 @@ func TestSchemaDescriptions_AreNotTruncated(t *testing.T) {
 		"glob":       GlobInput{},
 		"grep":       GrepInput{},
 		"bash":       BashInput{},
+		"ask_user":   AskUserInput{},
+
+		"bash_background": BackgroundStartInput{},
+		"bash_jobs":       BackgroundListInput{},
+		"bash_output":     BackgroundOutputInput{},
+		"bash_stop":       BackgroundStopInput{},
 
 		"describe_image":   DescribeImageInput{},
 		"generate_image":   GenerateImageInput{},
@@ -103,6 +112,15 @@ func TestSchemaDescriptions_ReachTheModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bash tool: %v", err)
 	}
+	jobsMgr, err := jobs.New(jobs.Options{Dir: t.TempDir(), Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("jobs.New: %v", err)
+	}
+	t.Cleanup(jobsMgr.Close)
+	background, err := NewBackgroundTools(ws, jobsMgr, DefaultBackgroundPolicy())
+	if err != nil {
+		t.Fatalf("background tools: %v", err)
+	}
 
 	// A phrase that appears after where a comma would have been: it only
 	// survives if the tag is comma-free.
@@ -114,6 +132,11 @@ func TestSchemaDescriptions_ReachTheModel(t *testing.T) {
 	}{
 		{"read_file.path", read, "path", "refused"},
 		{"bash.command", bash, "command", "verbatim"},
+		{"bash_background.command", background[0], "command", "verbatim"},
+		// The trailing ", required" in these tags is the schema option, not part
+		// of the description: the phrase below is what must survive the split.
+		{"bash_output.id", background[2], "id", "listed by bash_jobs"},
+		{"bash_stop.id", background[3], "id", "listed by bash_jobs"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -145,6 +168,16 @@ func TestToolDescriptionsAreSubstantive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workspace: %v", err)
 	}
+	jobsMgr, err := jobs.New(jobs.Options{Dir: t.TempDir(), Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("jobs.New: %v", err)
+	}
+	defer jobsMgr.Close()
+	background, err := NewBackgroundTools(ws, jobsMgr, DefaultBackgroundPolicy())
+	if err != nil {
+		t.Fatalf("background tools: %v", err)
+	}
+
 	makeTools := map[string]func() (tool.Tool, error){
 		"time": func() (tool.Tool, error) { return NewTimeTool() },
 		"read_file": func() (tool.Tool, error) {
@@ -161,6 +194,17 @@ func TestToolDescriptionsAreSubstantive(t *testing.T) {
 		"transcribe_audio": func() (tool.Tool, error) {
 			return NewTranscribeAudioTool(ws, schemaTestTarget())
 		},
+	}
+	// The four background tools share the description rules: a sentence or two
+	// that tell the model when to use them, and a schema a provider accepts.
+	for _, tl := range background {
+		info, ierr := tl.Info(context.Background())
+		if ierr != nil {
+			t.Fatalf("Info: %v", ierr)
+		}
+		built := tl
+		name := info.Name
+		makeTools[name] = func() (tool.Tool, error) { return built, nil }
 	}
 	for name, mk := range makeTools {
 		t.Run(name, func(t *testing.T) {

@@ -1,8 +1,8 @@
-// Package mcp integrates with Model Context Protocol servers. Phase 2
-// supports only the stdio transport; SSE / HTTP will land in a
-// later phase. The package is intentionally small — it wraps
-// mark3labs/mcp-go and bridges MCP tools into the internal/tool
-// registry used by the agent loop.
+// Package mcp integrates with Model Context Protocol servers. It supports the
+// three transports an operator can configure: stdio (spawn a local command),
+// sse (the legacy HTTP+SSE protocol) and http (streamable HTTP). The package is
+// intentionally small — it wraps mark3labs/mcp-go and bridges MCP tools into the
+// internal/tool registry used by the agent loop.
 package mcp
 
 import (
@@ -13,19 +13,107 @@ import (
 	"sync"
 	"time"
 
-	mcppkg "github.com/mark3labs/mcp-go/mcp"
 	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	mcppkg "github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/huan/huan-agent/internal/tool"
 )
 
-// ServerSpec describes how to spawn a single MCP server. Mirrors
-// config.MCPServer so this package does not need to import config.
+// Transport is how a server is reached. The values match store.MCPTransport,
+// which is what the console stores; the two cannot share a type because the
+// client package must not depend on the database layer.
+type Transport string
+
+const (
+	// TransportStdio spawns a command and talks over its stdin/stdout.
+	TransportStdio Transport = "stdio"
+	// TransportSSE dials the base URL and uses the HTTP+SSE transport.
+	TransportSSE Transport = "sse"
+	// TransportHTTP dials the base URL and uses streamable HTTP.
+	TransportHTTP Transport = "http"
+)
+
+// ParseTransport normalises a configured transport name. An empty value means
+// stdio, which is what every pre-existing config entry is.
+func ParseTransport(s string) (Transport, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "stdio", "local", "command":
+		return TransportStdio, nil
+	case "sse":
+		return TransportSSE, nil
+	case "http", "streamable-http", "streamable_http", "streamablehttp":
+		return TransportHTTP, nil
+	default:
+		return "", fmt.Errorf("mcp: unsupported transport %q (want stdio, sse or http)", s)
+	}
+}
+
+// Remote reports whether the transport dials a URL rather than spawning a
+// command.
+func (t Transport) Remote() bool { return t != TransportStdio && t != "" }
+
+// ServerSpec describes one MCP server: how to reach it and how the runtime
+// keys it.
+//
+// ID is the stable identity (a database row's id, or a slug derived from the
+// name for a config-file entry); Name is the display name. They are separate
+// because renaming a server must not orphan its connection state.
 type ServerSpec struct {
-	Name    string
+	ID        string
+	Name      string
+	Transport Transport
+	// Command, Args and Env describe a stdio server. Env entries follow the
+	// "KEY=value" shape and are merged onto os.Environ() at spawn.
 	Command string
 	Args    []string
-	Env     []string // merged onto os.Environ()
+	Env     []string
+	// URL and Headers describe a remote server. Headers entries are
+	// "Name: value" (an HTTP header line).
+	URL     string
+	Headers []string
+}
+
+// ResolvedTransport returns the spec's transport, defaulting to stdio.
+func (s ServerSpec) ResolvedTransport() Transport {
+	if s.Transport == "" {
+		return TransportStdio
+	}
+	return s.Transport
+}
+
+// Validate reports what a connection actually needs. It runs before a dial so
+// the error names the missing field rather than surfacing as a spawn or dial
+// failure with no context.
+func (s ServerSpec) Validate() error {
+	switch s.ResolvedTransport() {
+	case TransportStdio:
+		if strings.TrimSpace(s.Command) == "" {
+			return fmt.Errorf("mcp: %s: command is required for a stdio server", s.Name)
+		}
+	case TransportSSE, TransportHTTP:
+		if strings.TrimSpace(s.URL) == "" {
+			return fmt.Errorf("mcp: %s: url is required for a %s server", s.Name, s.ResolvedTransport())
+		}
+	default:
+		return fmt.Errorf("mcp: %s: unsupported transport %q", s.Name, s.Transport)
+	}
+	return nil
+}
+
+// Fingerprint renders the connection-relevant fields, so the runtime can tell
+// whether a server needs reconnecting after an edit. Display-only fields (the
+// name) are deliberately excluded: renaming a server should not drop its
+// connection.
+func (s ServerSpec) Fingerprint() string {
+	return strings.Join([]string{
+		string(s.ResolvedTransport()),
+		s.Command,
+		strings.Join(s.Args, "\x00"),
+		strings.Join(s.Env, "\x00"),
+		s.URL,
+		strings.Join(s.Headers, "\x00"),
+	}, "\x01")
 }
 
 // Client wraps an mcp-go client and the subprocess it owns.
@@ -36,25 +124,62 @@ type Client struct {
 	closed bool
 }
 
-// Connect spawns the MCP server subprocess, performs the
-// initialize handshake, and returns a ready Client.
+// connectTimeout bounds the initialize handshake. A server that spawns but
+// never answers must not hold a request (or the startup sync) open.
+const connectTimeout = 10 * time.Second
+
+// Connect builds a client for the spec, performs the initialize handshake, and
+// returns it ready to use.
 //
-// The returned Client MUST be Close()d by the caller to kill the
-// subprocess and release its pipes.
+// The returned Client MUST be Close()d by the caller: it owns a subprocess or a
+// live HTTP stream.
 func Connect(ctx context.Context, spec ServerSpec) (*Client, error) {
-	if spec.Command == "" {
-		return nil, fmt.Errorf("mcp: %s: command is required", spec.Name)
+	if err := spec.Validate(); err != nil {
+		return nil, err
 	}
-	env := append(os.Environ(), spec.Env...)
-
-	c, err := mcpclient.NewStdioMCPClient(spec.Command, env, spec.Args...)
-	if err != nil {
-		return nil, fmt.Errorf("mcp: %s: spawn: %w", spec.Name, err)
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("mcp: %s: %w", spec.Name, err)
 	}
 
-	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	var (
+		raw *mcpclient.Client
+		err error
+	)
+	switch spec.ResolvedTransport() {
+	case TransportStdio:
+		env := append(os.Environ(), spec.Env...)
+		raw, err = mcpclient.NewStdioMCPClient(spec.Command, env, spec.Args...)
+		if err != nil {
+			return nil, fmt.Errorf("mcp: %s: spawn: %w", spec.Name, err)
+		}
+	case TransportSSE:
+		raw, err = mcpclient.NewSSEMCPClient(spec.URL, mcpclient.WithHeaders(headerMap(spec.Headers)))
+		if err != nil {
+			return nil, fmt.Errorf("mcp: %s: sse client: %w", spec.Name, err)
+		}
+	case TransportHTTP:
+		raw, err = mcpclient.NewStreamableHttpClient(spec.URL,
+			transport.WithHTTPHeaders(headerMap(spec.Headers)),
+			transport.WithHTTPTimeout(connectTimeout))
+		if err != nil {
+			return nil, fmt.Errorf("mcp: %s: http client: %w", spec.Name, err)
+		}
+	}
+
+	// A remote transport needs an explicit Start. Its connection outlives the
+	// call that opened it (the runtime holds it until the server is edited or
+	// deleted), so the caller's cancellation is deliberately dropped: cancelling
+	// an admin request must not tear down a shared connection.
+	if spec.ResolvedTransport().Remote() {
+		if err := raw.Start(context.WithoutCancel(ctx)); err != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf("mcp: %s: start %s transport: %w", spec.Name, spec.ResolvedTransport(), err)
+		}
+	}
+
+	initCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
-	if _, err := c.Initialize(initCtx, mcppkg.InitializeRequest{
+	if _, err := raw.Initialize(initCtx, mcppkg.InitializeRequest{
 		Params: mcppkg.InitializeParams{
 			ProtocolVersion: mcppkg.LATEST_PROTOCOL_VERSION,
 			ClientInfo: mcppkg.Implementation{
@@ -64,11 +189,45 @@ func Connect(ctx context.Context, spec ServerSpec) (*Client, error) {
 			Capabilities: mcppkg.ClientCapabilities{},
 		},
 	}); err != nil {
-		_ = c.Close()
+		_ = raw.Close()
 		return nil, fmt.Errorf("mcp: %s: initialize: %w", spec.Name, err)
 	}
 
-	return &Client{spec: spec, raw: c}, nil
+	return &Client{spec: spec, raw: raw}, nil
+}
+
+// headerMap converts "Name: value" lines into the map mcp-go expects. A line
+// without a colon is skipped: an unmatched entry would otherwise become a
+// header with a name and no value, which some servers reject outright.
+func headerMap(lines []string) map[string]string {
+	if len(lines) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(lines))
+	for _, line := range lines {
+		name, value, ok := strings.Cut(line, ":")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			continue
+		}
+		out[name] = strings.TrimSpace(value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// WrapClient adapts an already-initialized mcp-go client, so a caller that
+// built its own transport can still use this package's ListTools / CallTool
+// bridge.
+//
+// It is how the in-process transport is used (mcp-go's NewInProcessClient),
+// which is what makes the runtime and the API above it testable without
+// spawning a process: the same Manager, registry and routes are exercised
+// either way.
+func WrapClient(spec ServerSpec, raw *mcpclient.Client) *Client {
+	return &Client{spec: spec, raw: raw}
 }
 
 // ListTools returns the tool metadata for this server, adapted to
@@ -86,8 +245,8 @@ func (c *Client) ListTools(ctx context.Context) ([]*tool.Spec, error) {
 		t := &res.Tools[i]
 		paramsJSON := toolInputSchemaJSON(t.InputSchema)
 		out = append(out, &tool.Spec{
-			Name:                t.Name,
-			Description:         t.Description,
+			Name:                 t.Name,
+			Description:          t.Description,
 			ParametersJSONSchema: paramsJSON,
 		})
 	}

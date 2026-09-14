@@ -15,7 +15,7 @@ huan-agent 是基于 CloudWeGo Eino 的个人 AI Agent 平台。
 - **日志**: Uber Zap
 - **数据库**: SQLite (MVP) / PostgreSQL (生产)
 - **IM**: 飞书 OpenAPI (lark-oapi-go)
-- **MCP**: 自实现 stdio + sse 客户端
+- **MCP**: 自实现 stdio / sse / streamable-http 客户端
 - **前端**: Vue 3 + Vite (Admin UI)
 - **Spec**: @fission-ai/openspec
 
@@ -61,6 +61,11 @@ huan-agent 是基于 CloudWeGo Eino 的个人 AI Agent 平台。
 | `platform-feishu` | 4 | proposed |
 | `usage-tracking` | 5 | proposed |
 | `admin-ui` | 5 | proposed |
+| `agent-tools` | 6 | proposed |
+| `workspace-sandbox` | 6 | proposed |
+| `settings-tabs` | 7 | proposed |
+| `mcp-runtime` | 7 | proposed |
+| `skill-console` | 7 | proposed |
 | `deployment` | 6 | proposed |
 
 ## Out of Scope (MVP)

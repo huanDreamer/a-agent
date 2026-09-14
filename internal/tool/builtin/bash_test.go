@@ -312,6 +312,7 @@ func TestBashTool_PerCallTimeoutIsClamped(t *testing.T) {
 	ws := bashNewWorkspace(t, workspace.Options{})
 	policy := DefaultBashPolicy()
 	policy.Timeout = 300 * time.Millisecond
+	policy.MaxTimeout = 400 * time.Millisecond
 	it := bashMustTool(t, ws, policy)
 
 	started := time.Now()
@@ -320,14 +321,50 @@ func TestBashTool_PerCallTimeoutIsClamped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("timeout returned a Go error: %v", err)
 	}
+	// The ceiling applies instead of the request, and the result says which
+	// limit ran: a command that dies at the ceiling must not look like one that
+	// died for no reason.
 	if !out.TimedOut {
-		t.Errorf("timed_out = false after %s: a per-call override extended the policy timeout", elapsed)
+		t.Errorf("timed_out = false after %s: the 60s request must have been capped", elapsed)
+	}
+	if !out.TimeoutCapped {
+		t.Error("timeout_capped = false, want true for a request beyond the ceiling")
+	}
+	if out.TimeoutMS != 400 {
+		t.Errorf("timeout_ms = %d, want the 400ms ceiling", out.TimeoutMS)
+	}
+	if !strings.Contains(out.Stderr, "capped") {
+		t.Errorf("stderr = %q, want a note about the ceiling", out.Stderr)
 	}
 	if elapsed > 3*time.Second {
 		t.Errorf("returned after %s, want the clamped %s timeout to have applied", elapsed, policy.Timeout)
 	}
 
-	// Shortening is allowed and is what the override is for.
+	// Extending within the ceiling is allowed, which is what makes a slow build
+	// possible without raising the default for every other call.
+	policy2 := DefaultBashPolicy()
+	policy2.Timeout = 200 * time.Millisecond
+	policy2.MaxTimeout = 5 * time.Second
+	it2 := bashMustTool(t, ws, policy2)
+	started = time.Now()
+	out, err = bashCall(t, it2, BashInput{Command: "sleep 1", TimeoutMS: 2000})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if out.TimedOut {
+		t.Errorf("timed_out = true: the 2s override should have outlasted the 1s command")
+	}
+	if out.TimeoutCapped {
+		t.Error("timeout_capped = true for a request inside the ceiling")
+	}
+	if out.TimeoutMS != 2000 {
+		t.Errorf("timeout_ms = %d, want the requested 2000", out.TimeoutMS)
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
+		t.Errorf("returned after %s, want the 1s command to have run under the 2s override", elapsed)
+	}
+
+	// Shortening stays allowed and is what the override is usually for.
 	started = time.Now()
 	out, err = bashCall(t, it, BashInput{Command: "sleep 5", TimeoutMS: 50})
 	if err != nil {
@@ -710,6 +747,9 @@ func TestBashTool_NameSchemaAndDescription(t *testing.T) {
 		"deny pattern", "not a security boundary",
 		"discarded",
 		"exit_code",
+		// The stdin caveat has to carry the way out as well: a model told only
+		// that a prompting command fails still has to discover -y by failing.
+		"/dev/null", "non-interactively", "--yes", "REPL",
 	} {
 		if !strings.Contains(info.Desc, want) {
 			t.Errorf("description is missing %q:\n%s", want, info.Desc)
@@ -806,25 +846,53 @@ func TestDefaultBashPolicy(t *testing.T) {
 }
 
 func TestBashTimeoutClamping(t *testing.T) {
-	policy := 5 * time.Second
+	def := 5 * time.Second
+	max := 30 * time.Second
 	cases := []struct {
-		name     string
-		override int
-		want     time.Duration
+		name       string
+		override   int
+		want       time.Duration
+		wantCapped bool
 	}{
-		{"absent", 0, policy},
-		{"negative", -1, policy},
-		{"shorter", 250, 250 * time.Millisecond},
-		{"equal", 5000, policy},
-		{"longer", 60_000, policy},
-		{"overflowing", int(^uint(0) >> 1), policy},
+		{"absent", 0, def, false},
+		{"negative", -1, def, false},
+		{"shorter", 250, 250 * time.Millisecond, false},
+		{"equal to default", 5000, def, false},
+		// Extending is the point of the ceiling: a full test suite needs longer
+		// than the ordinary two minutes without changing every other call.
+		{"longer, within the ceiling", 10_000, 10 * time.Second, false},
+		{"equal to the ceiling", 30_000, max, false},
+		{"beyond the ceiling", 600_000, max, true},
+		{"overflowing", int(^uint(0) >> 1), def, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := bashTimeout(policy, tc.override); got != tc.want {
-				t.Errorf("bashTimeout(%s, %d) = %s, want %s", policy, tc.override, got, tc.want)
+			got, capped := bashTimeout(def, max, tc.override)
+			if got != tc.want || capped != tc.wantCapped {
+				t.Errorf("bashTimeout(%s, %s, %d) = %s capped=%v, want %s capped=%v",
+					def, max, tc.override, got, capped, tc.want, tc.wantCapped)
 			}
 		})
+	}
+}
+
+func TestBashConfigRaisesACeilingBelowTheDefault(t *testing.T) {
+	// A ceiling under the default would make the default unreachable, which is
+	// a configuration that cannot mean what it says.
+	cfg, err := bashConfigFrom(BashPolicy{Enabled: true, Timeout: 60 * time.Second, MaxTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("bashConfigFrom: %v", err)
+	}
+	if cfg.maxTimeout != cfg.timeout {
+		t.Errorf("maxTimeout = %s, want it raised to the %s default", cfg.maxTimeout, cfg.timeout)
+	}
+	// An unset ceiling gets the shipped default rather than zero.
+	cfg, err = bashConfigFrom(BashPolicy{Enabled: true})
+	if err != nil {
+		t.Fatalf("bashConfigFrom: %v", err)
+	}
+	if cfg.maxTimeout != DefaultBashMaxTimeout {
+		t.Errorf("maxTimeout = %s, want %s", cfg.maxTimeout, DefaultBashMaxTimeout)
 	}
 }
 

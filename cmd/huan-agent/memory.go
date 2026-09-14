@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -34,7 +33,12 @@ type sessionMemory struct {
 
 // newSessionMemory builds the memory+context wiring. When memory is disabled
 // (cfg.Memory.Enable == false) all methods are safe no-ops.
-func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, ns string, logger *zap.Logger) (*sessionMemory, error) {
+//
+// The long-term store is passed in rather than opened here: the OpenViking
+// mirror batches turns across sessions, so it belongs to the process. A nil
+// store means "no long-term persistence" (memory off, or no directory
+// configured) and every write becomes a no-op.
+func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, ns string, logger *zap.Logger, st memory.Store) (*sessionMemory, error) {
 	m := &sessionMemory{
 		buffer:       memory.NewBuffer(cfg.Memory.MaxTurns),
 		ns:           ns,
@@ -46,19 +50,14 @@ func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, 
 	if !m.enable {
 		return m, nil
 	}
-	// Long-term JSONL store.
-	if cfg.Memory.Dir != "" {
-		st, err := memory.NewStore(cfg.Memory.Dir)
-		if err != nil {
-			return nil, fmt.Errorf("open memory store: %w", err)
-		}
+	if st != nil {
 		m.store = st
 		m.persist = true
 	}
 	// Context manager (auto-compression disabled when MaxTokens == 0).
 	var summarizer gctx.Summarizer
 	if cfg.Context.Summarize && cm != nil {
-		summarizer = llmSummarizer{cm: cm}
+		summarizer = gctx.LLMSummarizer{Model: cm}
 	}
 	mgr, err := gctx.NewManager(gctx.Budget{
 		MaxTokens:  cfg.Context.MaxTokens,
@@ -71,27 +70,6 @@ func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, 
 	m.manager = mgr
 	mgr.SetLog(func(s string) { fmt.Fprintln(os.Stderr, "["+s+"]") })
 	return m, nil
-}
-
-// llmSummarizer adapts a chat model into a gctx.Summarizer.
-type llmSummarizer struct{ cm model.BaseChatModel }
-
-func (l llmSummarizer) Summarize(ctx context.Context, msgs []*schema.Message) (string, error) {
-	if l.cm == nil {
-		return "", errors.New("no model available for summarization")
-	}
-	var b strings.Builder
-	b.WriteString("请把以下对话压缩成一段简短的摘要，保留关键事实、决策和未完成事项，不要复述原话：\n\n")
-	for _, m := range msgs {
-		b.WriteString("[" + string(m.Role) + "]: " + m.Content + "\n")
-	}
-	out, err := l.cm.Generate(ctx, []*schema.Message{
-		{Role: schema.User, Content: b.String()},
-	})
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out.Content), nil
 }
 
 // addUserMessage records a user message to short (buffer) + long-term (store)
@@ -158,9 +136,7 @@ func (m *sessionMemory) history() ([]*schema.Message, error) {
 	return out, nil
 }
 
-// close releases the long-term store.
-func (m *sessionMemory) close() {
-	if m.store != nil {
-		_ = m.store.Close()
-	}
-}
+// close releases this session's resources. The long-term store is deliberately
+// not closed here: it is shared (and its OpenViking mirror batches across
+// sessions), so the process owns its lifetime.
+func (m *sessionMemory) close() {}

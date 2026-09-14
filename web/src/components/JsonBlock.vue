@@ -2,9 +2,11 @@
 // Collapsible, null-safe JSON viewer.
 //
 // Trace input/output payloads are arbitrary JSON (string, object, array or
-// absent), so the value is pretty-printed and truncated by format.js rather
-// than rendered as-is. `toggle: false` makes the block follow the `open` prop
-// only, which lets a parent row own the expand/collapse (the trace waterfall).
+// absent), so the value is pretty-printed and capped by format.js rather than
+// rendered as-is. `maxLength: null` removes the cap for the payloads the reader
+// came to read (see format.js). `toggle: false` makes the block follow the
+// `open` prop only, which lets a parent row own the expand/collapse (the trace
+// waterfall).
 import { computed, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import { formatJson } from '../format.js'
@@ -16,6 +18,11 @@ const props = defineProps({
   open: { type: Boolean, default: false },
   /** Render the expand/collapse control. */
   toggle: { type: Boolean, default: true },
+  /**
+   * Cap on the printed text; `null` prints the whole payload. The type stays
+   * Number because Vue skips the check for a null value on a non-required prop,
+   * so this passes `null` explicitly rather than widening the type.
+   */
   maxLength: { type: Number, default: 4000 },
 })
 

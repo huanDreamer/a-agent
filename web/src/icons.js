@@ -37,6 +37,9 @@ export const ICON_PATHS = {
   // 统计监控: Lucide bar-chart-3.
   'bar-chart': 'M3 3v18h18|M18 17V9|M13 17V5|M8 17v-3',
   cpu: 'M4 4h16v16H4z|M9 9h6v6H9z|M9 2v2|M15 2v2|M9 20v2|M15 20v2|M2 9h2|M2 15h2|M20 9h2|M20 15h2',
+  // 工作区: a folder, following Lucide's folder geometry. It marks the one
+  // control in 对话 that decides which directory the agent may touch.
+  folder: 'M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z',
   // 附件: attach (paperclip), the drop/upload glyph, an image and an audio cue.
   paperclip:
     'm16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551',
@@ -48,9 +51,29 @@ export const ICON_PATHS = {
   // 模型管理: 测试连接 (plug) and a positive test result (circle-check).
   plug: 'M12 22v-5|M9 8V2|M15 8V2|M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z',
   'circle-check': 'M21.801 10A10 10 0 1 1 17 3.335|m9 11 3 3L22 4',
+  // 长任务: a clock for "the turn stopped on its budget" and stacked layers for
+  // "the window was condensed to stay inside it". Both follow Lucide geometry,
+  // like every other icon here.
+  clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20|M12 6v6l4 2',
+  // 后台进程: a terminal window for the drawer a conversation's header opens —
+  // everything listed there was started as a shell command.
+  terminal: 'm4 17 6-6-6-6|M12 19h8',
+  layers:
+    'm12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z|m6.08 9.5-3.5 1.6a1 1 0 0 0 0 1.81l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9a1 1 0 0 0 0-1.83l-3.5-1.59|m6.08 14.5-3.5 1.6a1 1 0 0 0 0 1.81l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9a1 1 0 0 0 0-1.83l-3.5-1.59',
+  // 链路追踪: Lucide git-branch — one thing descending from another, which is
+  // what the link from an answer to its trace means.
+  'git-branch': 'M6 3v12|M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6|M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6|M18 9a9 9 0 0 1-9 9',
+  // ask_user 卡片: Lucide circle-help — the model is asking, not telling.
+  'help-circle': 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20|M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3|M12 17h.01',
+  // 配置助手: the AI-generation entry point of 设置 → MCP and 设置 → 技能.
+  // Lucide sparkles — a small burst plus two sparks.
+  sparkles:
+    'M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z|M20 3v4|M22 5h-4|M4 17v2|M5 18H3',
+  // 登录 / 退出登录. Lucide lock and log-out, drawn as plain paths: ICON_RECT_FIRST
+  // can only draw this set's one fixed square, while the lock body is 18×11.
+  lock: 'M7 11V7a5 5 0 0 1 10 0v4|M5 11h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2z',
+  'log-out': 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4|m16 17 5-5-5-5|M21 12H9',
 }
-
-/** Icons whose first segment is a rounded rect instead of a path. */
 
 /** Icons whose first segment is a rounded rect instead of a path. */
 export const ICON_RECT_FIRST = { 'panel-left': true, square: true, cpu: true }

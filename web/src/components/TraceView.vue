@@ -1,5 +1,5 @@
 <script setup>
-// 链路追踪 — Langfuse trace list + observation waterfall.
+// 链路追踪 — trace list + observation waterfall, read from the built-in store.
 //
 // Three independent panels, each with its own loading / empty / error state:
 // the delivery status strip, the trace list (with filters and paging) and the
@@ -15,6 +15,7 @@
 import { computed, reactive, ref } from 'vue'
 import AsyncBlock from './AsyncBlock.vue'
 import Icon from './Icon.vue'
+import JsonBlock from './JsonBlock.vue'
 import TraceWaterfall from './TraceWaterfall.vue'
 import { api } from '../api.js'
 import {
@@ -27,6 +28,7 @@ import {
   shortId,
   truncate,
 } from '../format.js'
+import { claimTraceFocus } from '../state.js'
 import { useResource } from '../useResource.js'
 
 const LIMITS = [20, 50, 100]
@@ -35,6 +37,17 @@ const filters = reactive({ session: '', name: '', user: '' })
 const limit = ref(50)
 const page = ref(1)
 const selectedId = ref('')
+
+// A view elsewhere in the console (an answer's 链路 button, or the conversation
+// header's) can ask for a specific trace or for a whole conversation's traces.
+// The request is consumed before the resources below are created, so the very
+// first load already asks for the right thing, and it is cleared as it is taken
+// — otherwise every later visit to this tab would force the same selection.
+const pendingFocus = claimTraceFocus()
+if (pendingFocus) {
+  if (pendingFocus.session) filters.session = pendingFocus.session
+  if (pendingFocus.id) selectedId.value = pendingFocus.id
+}
 
 /** A 502 means Langfuse itself is unreachable — not that tracing is off. */
 const listDown = ref(false)
@@ -102,7 +115,7 @@ const counters = computed(() => {
   const failure = Number(s.failed) || 0
   const dropped = Number(s.dropped) || 0
   return [
-    { key: 'sent', label: 'sent', value: formatCount(s.sent), tone: '' },
+    { key: 'sent', label: 'written', value: formatCount(s.sent), tone: '' },
     { key: 'failed', label: 'failed', value: formatCount(failure), tone: failure > 0 ? 'bad' : '' },
     {
       key: 'dropped',
@@ -132,13 +145,13 @@ const filterActive = computed(
 /** Distinct, explicit wording for the two failure modes. */
 const listError = computed(() => {
   const message = list.error.value || ''
-  if (listDown.value) return `Langfuse 后端不可达：${message || '无法读取链路数据'}`
+  if (listDown.value) return `链路后端不可达：${message || '无法读取链路数据'}`
   return message
 })
 
 const detailError = computed(() => {
   const message = detail.error.value || ''
-  if (detailDown.value) return `Langfuse 后端不可达：${message || '无法读取链路数据'}`
+  if (detailDown.value) return `链路后端不可达：${message || '无法读取链路数据'}`
   return message
 })
 
@@ -206,11 +219,8 @@ function refreshAll() {
   if (selectedId.value) detail.reload()
 }
 
-const CONFIG_SNIPPET = `langfuse:
-  enable: true
-  host: "https://cloud.langfuse.com"
-  public_key: "pk-lf-..."
-  secret_key: "sk-lf-..."`
+const CONFIG_SNIPPET = `tracing:
+  enable: true`
 
 function traceNameOf(trace) {
   return trace.name || '（未命名）'
@@ -403,16 +413,18 @@ function traceNameOf(trace) {
             {{ list.data.value.message }}
           </div>
           <div class="empty-hint">
-            在配置文件（configs/config.yaml）中打开 Langfuse 并填入凭证，然后重启 huan-agent
-            服务：
+            trace 记录在本机数据库里，无需外部服务。若确认已关闭，在
+            <code class="md-code">configs/config.yaml</code> 里打开它并重启 huan-agent 服务：
           </div>
           <pre class="json trace-config">{{ CONFIG_SNIPPET }}</pre>
           <div class="empty-hint">
-            至少需要 <code class="md-code">langfuse.enable</code>、<code class="md-code">langfuse.host</code>、<code class="md-code">langfuse.public_key</code>、
-            <code class="md-code">langfuse.secret_key</code> 四项；配置改动需要重启才会生效。
+            链路追踪默认开启，写入与会话同一个 SQLite 文件；外部 Langfuse 是可选镜像，
+            只影响它自己的 eval 与 prompt 管理，不影响这里。
           </div>
         </div>
 
+        <!-- A trace that is enabled but empty is a different situation from one
+             that was never switched on, and the wording says which. -->
         <div v-else-if="!rows.length" class="empty">
           <div class="empty-ico" aria-hidden="true">◍</div>
           <div class="empty-text">暂无数据</div>
@@ -539,8 +551,23 @@ function traceNameOf(trace) {
             v-if="detailTrace.input !== undefined || detailTrace.output !== undefined"
             class="grid-2"
           >
-            <JsonBlock :value="detailTrace.input" label="trace input" :open="true" :toggle="false" />
-            <JsonBlock :value="detailTrace.output" label="trace output" :open="true" :toggle="false" />
+            <!-- max-length null: the reader opened this view to read the prompt
+                 and the answer, and a silently shortened one is worse than a
+                 long one. The block scrolls inside a bounded height. -->
+            <JsonBlock
+              :value="detailTrace.input"
+              label="trace input"
+              :open="true"
+              :toggle="false"
+              :max-length="null"
+            />
+            <JsonBlock
+              :value="detailTrace.output"
+              label="trace output"
+              :open="true"
+              :toggle="false"
+              :max-length="null"
+            />
           </div>
 
           <TraceWaterfall :observations="observations" />

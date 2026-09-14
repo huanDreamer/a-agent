@@ -551,6 +551,42 @@ func TestToolsConfig_WorkspaceOrDefault(t *testing.T) {
 	})
 }
 
+func TestToolsConfig_BashMaxTimeout(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  ToolsConfig
+		want time.Duration
+	}{
+		{"default ceiling", ToolsConfig{}, 900 * time.Second},
+		{"explicit ceiling", ToolsConfig{BashTimeoutSeconds: 60, BashMaxTimeoutSeconds: 3600}, time.Hour},
+		// A ceiling under the default would make the default unreachable, so it
+		// is raised to it rather than honoured.
+		{"ceiling under the default", ToolsConfig{BashTimeoutSeconds: 300, BashMaxTimeoutSeconds: 10}, 300 * time.Second},
+		{"default timeout, default ceiling", ToolsConfig{BashTimeoutSeconds: 0}, 900 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cfg.BashMaxTimeout(); got != tc.want {
+				t.Errorf("BashMaxTimeout() = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestChatConfig_TurnBudgets(t *testing.T) {
+	// Unset means unlimited for both, which is what an existing deployment keeps
+	// after upgrading: the step cap was and remains the only default bound.
+	if got := (ChatConfig{}).TurnDeadline(); got != 0 {
+		t.Errorf("TurnDeadline() = %s, want 0 (unlimited)", got)
+	}
+	if got := (ChatConfig{TurnDeadlineSeconds: -5}).TurnDeadline(); got != 0 {
+		t.Errorf("negative TurnDeadline() = %s, want 0", got)
+	}
+	if got := (ChatConfig{TurnDeadlineSeconds: 1800}).TurnDeadline(); got != 30*time.Minute {
+		t.Errorf("TurnDeadline() = %s, want 30m", got)
+	}
+}
+
 func TestToolsConfig_BashTimeout(t *testing.T) {
 	if got := (ToolsConfig{}).BashTimeout(); got != 120*time.Second {
 		t.Errorf("default = %v, want 2m", got)
@@ -623,9 +659,26 @@ func TestConfig_ToolsDefaultsAndParsing(t *testing.T) {
 	if cfg.Tools.BashTimeout() != 120*time.Second {
 		t.Errorf("bash timeout = %v, want 2m", cfg.Tools.BashTimeout())
 	}
+	if !cfg.Tools.EnableBackground {
+		t.Error("enable_background should default to true")
+	}
+	if got := cfg.Tools.BackgroundMaxJobs; got != 8 {
+		t.Errorf("background_max_jobs = %d, want 8", got)
+	}
+	if got := cfg.Tools.BackgroundLogMaxMB; got != 8 {
+		t.Errorf("background_log_max_mb = %d, want 8", got)
+	}
+	if got := cfg.Tools.BackgroundWindowKB; got != 256 {
+		t.Errorf("background_window_kb = %d, want 256", got)
+	}
+	if cfg.Tools.BackgroundStopGrace() != 5*time.Second {
+		t.Errorf("stop grace = %v, want 5s", cfg.Tools.BackgroundStopGrace())
+	}
 
 	// And an explicit section must be honoured.
-	yaml2 := yaml + "tools:\n  workspace: \"/tmp/ws\"\n  read_only: true\n  enable_bash: false\n  bash_timeout_seconds: 5\n  max_read_kb: 8\n  max_write_mb: 1\n  max_list_entries: 3\n  deny_patterns: [\"boom\"]\n"
+	yaml2 := yaml + "tools:\n  workspace: \"/tmp/ws\"\n  read_only: true\n  enable_bash: false\n  bash_timeout_seconds: 5\n  max_read_kb: 8\n  max_write_mb: 1\n  max_list_entries: 3\n  deny_patterns: [\"boom\"]\n" +
+		"  enable_background: false\n  background_dir: \"/tmp/jobs\"\n  background_max_jobs: 2\n" +
+		"  background_log_max_mb: 1\n  background_window_kb: 64\n  background_stop_grace_seconds: 1\n"
 	path2 := filepath.Join(dir, "config2.yaml")
 	if err := os.WriteFile(path2, []byte(yaml2), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
@@ -646,6 +699,45 @@ func TestConfig_ToolsDefaultsAndParsing(t *testing.T) {
 	}
 	if got := cfg2.Tools.DenyOrDefault(); len(got) != 1 || got[0] != "boom" {
 		t.Errorf("deny = %v, want [boom]", got)
+	}
+	if cfg2.Tools.EnableBackground {
+		t.Error("enable_background: false was not parsed")
+	}
+	if cfg2.Tools.BackgroundDir != "/tmp/jobs" || cfg2.Tools.BackgroundMaxJobs != 2 ||
+		cfg2.Tools.BackgroundLogMaxMB != 1 || cfg2.Tools.BackgroundWindowKB != 64 {
+		t.Errorf("background settings not parsed: %+v", cfg2.Tools)
+	}
+	if cfg2.Tools.BackgroundStopGrace() != time.Second {
+		t.Errorf("stop grace = %v, want 1s", cfg2.Tools.BackgroundStopGrace())
+	}
+}
+
+// TestToolsConfig_JobsDirOrDefault covers where job logs are written: beside the
+// database by default, because a log dropped into a workspace would show up in
+// the model's own greps and in the user's git status.
+func TestToolsConfig_JobsDirOrDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  ToolsConfig
+		db   string
+		want string
+	}{
+		{"beside the database", ToolsConfig{}, "/var/db/huan.db", filepath.Join("/var/db", DefaultJobsSubdir)},
+		{"a bare database file", ToolsConfig{}, "huan.db", DefaultJobsSubdir},
+		{"no database path", ToolsConfig{}, "", filepath.Join("data", DefaultJobsSubdir)},
+		{"configured", ToolsConfig{BackgroundDir: "/tmp/logs"}, "/var/db/huan.db", "/tmp/logs"},
+		{"blank is unset", ToolsConfig{BackgroundDir: "  "}, "/var/db/huan.db", filepath.Join("/var/db", DefaultJobsSubdir)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := tc.cfg.JobsDirOrDefault(tc.db)
+			if !ok {
+				t.Fatal("no directory was resolved")
+			}
+			if got != tc.want {
+				t.Errorf("JobsDirOrDefault(%q) = %q, want %q", tc.db, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -682,6 +774,34 @@ func TestAdminConfig_LoginDefaults(t *testing.T) {
 	}
 	if cfg.Admin.AllowInsecureBind {
 		t.Error("allow_insecure_bind should default to false")
+	}
+	// Trusting loopback is what makes "require_login: true" mean "a password for
+	// everyone who is not at this machine"; the console on the desktop it runs on
+	// must not be asked.
+	if !cfg.Admin.TrustLoopback {
+		t.Error("trust_loopback should default to true")
+	}
+}
+
+func TestAdminConfig_TrustLoopbackCanBeTurnedOff(t *testing.T) {
+	// The deployment this matters for: a reverse proxy or an SSH tunnel on the
+	// same host, whose clients all arrive from 127.0.0.1. There the password has
+	// to apply to loopback too, so the flag has to reach the struct from the file
+	// (and, from there, the server).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("admin:\n  require_login: true\n  trust_loopback: false\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Admin.TrustLoopback {
+		t.Error("trust_loopback: false in the file should stay false")
+	}
+	if !cfg.Admin.RequireLogin {
+		t.Error("require_login: true in the file should stay true")
 	}
 }
 
@@ -734,5 +854,96 @@ func TestLLMConfig_ModelRefreshOverrides(t *testing.T) {
 	// "always stale", which would refetch on every start.
 	if got := (LLMConfig{}).ModelsCacheTTL(); got != DefaultModelsCacheTTLHours*time.Hour {
 		t.Errorf("unset TTL = %v, want the default", got)
+	}
+}
+
+// TestToolsConfig_WorkspacesDirOrDefault covers where named workspaces are
+// created: the default has to sit beside the database rather than in whatever
+// directory the process happened to be started from, because a workspace that
+// moved when the service was launched from a different cwd would be a support
+// case nobody could explain.
+func TestToolsConfig_WorkspacesDirOrDefault(t *testing.T) {
+	t.Run("configured value wins", func(t *testing.T) {
+		c := ToolsConfig{WorkspacesDir: "/tmp/ws"}
+		got, ok := c.WorkspacesDirOrDefault("/var/db/huan.db")
+		if !ok || got != "/tmp/ws" {
+			t.Errorf("got (%q, %v), want (/tmp/ws, true)", got, ok)
+		}
+	})
+	t.Run("default sits beside the database", func(t *testing.T) {
+		for _, tc := range []struct{ db, want string }{
+			{"/var/db/huan.db", "/var/db/" + DefaultWorkspacesSubdir},
+			{"data/huan.db", filepath.Join("data", DefaultWorkspacesSubdir)},
+			// A bare filename is a database in the current directory, so its
+			// workspaces directory is there too — the rule is "beside the
+			// database file", not "under ./data".
+			{"huan.db", DefaultWorkspacesSubdir},
+			{"", filepath.Join("data", DefaultWorkspacesSubdir)},
+		} {
+			got, ok := (ToolsConfig{}).WorkspacesDirOrDefault(tc.db)
+			if !ok || got != tc.want {
+				t.Errorf("db %q: got (%q, %v), want (%q, true)", tc.db, got, ok, tc.want)
+			}
+		}
+	})
+	t.Run("blank is treated as unset", func(t *testing.T) {
+		for _, blank := range []string{"", "   "} {
+			got, _ := (ToolsConfig{WorkspacesDir: blank}).WorkspacesDirOrDefault("/var/db/huan.db")
+			if got != "/var/db/"+DefaultWorkspacesSubdir {
+				t.Errorf("blank %q resolved to %q", blank, got)
+			}
+		}
+	})
+}
+
+// TestFeishu_EnableTools pins a security-relevant default rather than leaving it
+// to whatever a zero value means: the bot's tool access must be on for the
+// feature to work out of the box, and switchable off with one key.
+func TestFeishu_EnableTools(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+
+	if err := os.WriteFile(cfgFile, []byte("feishu:\n  app_id: \"cli_x\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Feishu.EnableTools {
+		t.Error("feishu.enable_tools defaults to false, so the bot would have no tools")
+	}
+
+	if err := os.WriteFile(cfgFile, []byte("feishu:\n  app_id: \"cli_x\"\n  enable_tools: false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Feishu.EnableTools {
+		t.Error("feishu.enable_tools: false did not turn the tools off")
+	}
+}
+
+// TestTools_WorkspacesDirYAML checks the new key is actually wired to the config
+// file (and not only to the struct), since a typo here would silently fall back
+// to the default directory.
+func TestTools_WorkspacesDirYAML(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	yaml := "tools:\n  workspaces_dir: \"/tmp/named-areas\"\n"
+	if err := os.WriteFile(cfgFile, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Tools.WorkspacesDir != "/tmp/named-areas" {
+		t.Errorf("workspaces_dir = %q, want /tmp/named-areas", cfg.Tools.WorkspacesDir)
+	}
+	if got, _ := cfg.Tools.WorkspacesDirOrDefault("/var/db/huan.db"); got != "/tmp/named-areas" {
+		t.Errorf("resolved to %q, want the configured value", got)
 	}
 }

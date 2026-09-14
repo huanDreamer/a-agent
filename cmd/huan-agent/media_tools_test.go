@@ -71,6 +71,20 @@ func mediaToolNamesIn(reg *tool.Registry) []string {
 	return out
 }
 
+// registerMediaForTest builds the media tools exactly as the production binder
+// does (`workspaceToolSet.mediaTools`) and registers them, so these tests cover
+// the real decision point instead of a parallel one.
+func registerMediaForTest(t *testing.T, reg *tool.Registry, cfg *config.Config, st store.Store,
+	ws *workspace.Workspace, logger *zap.Logger) {
+	t.Helper()
+	set := newWorkspaceToolSet(cfg, st, logger, toolSetOptions{})
+	for _, mt := range set.mediaTools(ws, cfg.Tools.ReadOnly) {
+		if err := reg.Register(mt); err != nil {
+			t.Fatalf("register media tool: %v", err)
+		}
+	}
+}
+
 func TestRegisterMediaTools_RegisterNothingWhenNothingIsBound(t *testing.T) {
 	// The fresh-install case: a catalog with no provider at all must still
 	// produce a working agent, and must not advertise tools it cannot run.
@@ -78,7 +92,7 @@ func TestRegisterMediaTools_RegisterNothingWhenNothingIsBound(t *testing.T) {
 	ws := newMediaTestWorkspace(t, workspace.Options{})
 	reg := tool.NewRegistry()
 
-	registerMediaTools(reg, &config.Config{}, st, ws, zap.NewNop())
+	registerMediaForTest(t, reg, &config.Config{}, st, ws, zap.NewNop())
 
 	if got := mediaToolNamesIn(reg); len(got) != 0 {
 		t.Errorf("registered %v, want no media tools", got)
@@ -99,7 +113,7 @@ func TestRegisterMediaTools_RegistersTheBoundCapabilitiesOnly(t *testing.T) {
 	ws := newMediaTestWorkspace(t, workspace.Options{})
 	reg := tool.NewRegistry()
 
-	registerMediaTools(reg, &config.Config{}, st, ws, zap.NewNop())
+	registerMediaForTest(t, reg, &config.Config{}, st, ws, zap.NewNop())
 
 	// The two capabilities with a single candidate resolve; image generation has
 	// no model at all, so the tool must not exist.
@@ -128,7 +142,7 @@ func TestRegisterMediaTools_GenerateImageIsAToolWrite(t *testing.T) {
 	ws := newMediaTestWorkspace(t, workspace.Options{})
 	reg := tool.NewRegistry()
 
-	registerMediaTools(reg, &config.Config{}, st, ws, zap.NewNop())
+	registerMediaForTest(t, reg, &config.Config{}, st, ws, zap.NewNop())
 
 	// It writes a file, so it must be tagged write rather than read.
 	if got := tool.CapabilityOf(mustTool(t, reg, "generate_image")); got != tool.CapWrite {
@@ -145,7 +159,7 @@ func TestRegisterMediaTools_ReadOnlyWorkspaceWithholdsTheWriteTool(t *testing.T)
 	ws := newMediaTestWorkspace(t, workspace.Options{ReadOnly: true})
 	reg := tool.NewRegistry()
 
-	registerMediaTools(reg, &config.Config{Tools: config.ToolsConfig{ReadOnly: true}}, st, ws, zap.NewNop())
+	registerMediaForTest(t, reg, &config.Config{Tools: config.ToolsConfig{ReadOnly: true}}, st, ws, zap.NewNop())
 
 	if _, ok := reg.Get("generate_image"); ok {
 		t.Error("generate_image must not be offered by a read-only workspace")
@@ -164,14 +178,14 @@ func TestRegisterMediaTools_NilWorkspaceOrStoreRegistersNothing(t *testing.T) {
 
 	t.Run("no workspace", func(t *testing.T) {
 		reg := tool.NewRegistry()
-		registerMediaTools(reg, &config.Config{}, st, nil, zap.NewNop())
+		registerMediaForTest(t, reg, &config.Config{}, st, nil, zap.NewNop())
 		if len(reg.Names()) != 0 {
 			t.Errorf("registered %v with no workspace, want nothing", reg.Names())
 		}
 	})
 	t.Run("no store", func(t *testing.T) {
 		reg := tool.NewRegistry()
-		registerMediaTools(reg, &config.Config{}, nil, newMediaTestWorkspace(t, workspace.Options{}), zap.NewNop())
+		registerMediaForTest(t, reg, &config.Config{}, nil, newMediaTestWorkspace(t, workspace.Options{}), zap.NewNop())
 		if len(reg.Names()) != 0 {
 			t.Errorf("registered %v with no catalog, want nothing", reg.Names())
 		}
@@ -187,7 +201,7 @@ func TestRegisterBuiltinTools_AddsMediaToolsAlongsideTheFileTools(t *testing.T) 
 	cfg.Tools.Workspace = t.TempDir()
 
 	reg := tool.NewRegistry()
-	if err := registerBuiltinTools(reg, cfg, st, zap.NewNop()); err != nil {
+	if err := registerBuiltinTools(reg, cfg, st, zap.NewNop(), nil, toolSetOptions{}); err != nil {
 		t.Fatalf("registerBuiltinTools: %v", err)
 	}
 
@@ -218,7 +232,7 @@ func TestBuildChatDeps_ExposesMediaToolsToTheChatModelsEndpoint(t *testing.T) {
 	}
 	cfg.Tools.Workspace = t.TempDir()
 
-	deps, _, _ := buildChatDeps(cfg, nil, st, nil, zap.NewNop())
+	deps, _, _ := buildChatDeps(cfg, nil, st, nil, zap.NewNop(), nil, nil)
 	if deps.Tools == nil {
 		t.Fatal("web chat has no tool registry")
 	}
@@ -232,7 +246,7 @@ func TestBuildChatDeps_NoProvidersStillBuildsWithoutMediaTools(t *testing.T) {
 	// disabled and nothing panics on the way there.
 	cfg := &config.Config{}
 	cfg.Chat.Enable = true
-	deps, _, _ := buildChatDeps(cfg, nil, newMediaTestStore(t), nil, zap.NewNop())
+	deps, _, _ := buildChatDeps(cfg, nil, newMediaTestStore(t), nil, zap.NewNop(), nil, nil)
 	if deps.Tools != nil {
 		t.Errorf("expected no chat deps, got tools %v", deps.Tools.Names())
 	}

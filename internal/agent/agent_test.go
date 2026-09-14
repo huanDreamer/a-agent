@@ -227,12 +227,35 @@ func TestAgent_NilModelErrors(t *testing.T) {
 func TestAgent_Defaults(t *testing.T) {
 	srv, _ := newMockChatServer(t, textResponse("ok"))
 	m := newTestModel(t, srv.URL)
-	// MaxSteps = 0 → default 12; pass nil logger to hit the default branch.
+
+	// A step budget a long task would ask for is honoured rather than clamped:
+	// 100 used to become 25, which silently made long CLI runs impossible.
 	a, err := New(context.Background(), Config{Model: m, Tools: tool.NewRegistry(), MaxSteps: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.maxStep != 25 {
-		t.Errorf("maxStep = %d, want 25 (capped)", a.maxStep)
+	if a.maxStep != 100 {
+		t.Errorf("maxStep = %d, want 100 (honoured below the ceiling)", a.maxStep)
+	}
+
+	// Above the ceiling it is clamped — and clamped loudly, since this loop has
+	// no token or deadline budget to catch a runaway model instead.
+	b, err := New(context.Background(), Config{
+		Model: m, Tools: tool.NewRegistry(), MaxSteps: MaxStepsCeiling + 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.maxStep != MaxStepsCeiling {
+		t.Errorf("maxStep = %d, want the ceiling %d", b.maxStep, MaxStepsCeiling)
+	}
+
+	// Unset still means the default.
+	c, err := New(context.Background(), Config{Model: m, Tools: tool.NewRegistry()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.maxStep != 12 {
+		t.Errorf("maxStep = %d, want the default 12", c.maxStep)
 	}
 }

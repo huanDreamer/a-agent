@@ -36,8 +36,19 @@ type Store interface {
 	GetModel(ctx context.Context, providerID, modelID string) (Model, error)
 	DeleteModel(ctx context.Context, providerID, modelID string) error
 
+	// LatestSessionModel reports the most recently used conversation's model.
+	LatestSessionModel(ctx context.Context) (provider, model string, ok bool)
+
 	SetBinding(ctx context.Context, b Binding) error
 	ListBindings(ctx context.Context) ([]Binding, error)
+
+	// MCP servers the console manages (设置 → MCP).
+	UpsertMCPServer(ctx context.Context, m MCPServer) error
+	GetMCPServer(ctx context.Context, id string) (MCPServer, error)
+	ListMCPServers(ctx context.Context) ([]MCPServer, error)
+	DeleteMCPServer(ctx context.Context, id string) error
+	SetMCPServerError(ctx context.Context, id, msg string) error
+
 	QueryUsage(ctx context.Context, f UsageFilter) ([]UsageRecord, error)
 
 	// Tool invocation audit log (Phase 2).
@@ -70,6 +81,29 @@ type Store interface {
 	GetMediaAsset(ctx context.Context, id string) (MediaAsset, error)
 	ListMediaAssets(ctx context.Context, sessionID string) ([]MediaAsset, error)
 	FindMediaAssetBySHA256(ctx context.Context, sessionID, digest string) (MediaAsset, error)
+
+	// Workspaces (Phase 9): the directories the agent can be pointed at, and
+	// which one each scope (a conversation, a Feishu user) is in.
+	UpsertWorkspace(ctx context.Context, w Workspace) error
+	ListWorkspaces(ctx context.Context) ([]Workspace, error)
+	GetWorkspace(ctx context.Context, name string) (Workspace, error)
+	RenameWorkspace(ctx context.Context, from, to string) error
+	DeleteWorkspace(ctx context.Context, name string) error
+	GetWorkspaceBinding(ctx context.Context, scope string) (string, error)
+	SetWorkspaceBinding(ctx context.Context, scope, name string) error
+	ClearWorkspaceBinding(ctx context.Context, scope string) error
+	MoveWorkspaceBindings(ctx context.Context, from, to string) (int, error)
+	ListScopesInWorkspace(ctx context.Context, name string) ([]string, error)
+	ListUnboundWebSessions(ctx context.Context) ([]string, error)
+
+	// Trace store (Phase 5c). An agent turn and its observation nodes, so the
+	// console can explain a turn without an external observability service.
+	RecordTrace(ctx context.Context, t TraceRow) error
+	RecordObservation(ctx context.Context, o ObservationRow) error
+	EndTrace(ctx context.Context, id, output string, endedAt time.Time) error
+	EndObservation(ctx context.Context, id string, end ObservationEnd) error
+	ListTraces(ctx context.Context, f TraceFilter) ([]TraceRow, error)
+	GetTrace(ctx context.Context, id string) (TraceRow, []ObservationRow, error)
 
 	// Underlying handle, used sparingly (e.g. health checks).
 	DB() *sql.DB
@@ -114,12 +148,21 @@ type UsageFilter struct {
 
 // InvocationEvent is the input shape for recording a tool call.
 type InvocationEvent struct {
-	SessionID  string
-	UserID     string // attributing end user; empty = unattributed
-	ToolName   string
-	Arguments  string
-	Result     string
-	Err        string
+	SessionID string
+	UserID    string // attributing end user; empty = unattributed
+	ToolName  string
+	Arguments string
+	Result    string
+	Err       string
+	// Workspace is the workspace the call ran in, by name. Empty means no named
+	// workspace was in play (a pre-workspace row, or a deployment using only the
+	// built-in default).
+	//
+	// It is recorded because the arguments cannot answer the question: a tool
+	// path is workspace-relative, so `write_file src/main.go` looks identical in
+	// every workspace, and the audit would be unable to say which project a
+	// change landed in.
+	Workspace  string
 	DurationMs int64
 }
 
@@ -133,6 +176,7 @@ type InvocationRecord struct {
 	Arguments  string `json:"arguments"`
 	Result     string `json:"result"`
 	Err        string `json:"err"`
+	Workspace  string `json:"workspace,omitempty"`
 	DurationMs int64  `json:"duration_ms"`
 	CreatedAt  string `json:"created_at"`
 }

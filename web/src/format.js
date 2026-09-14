@@ -202,12 +202,22 @@ export function truncate(text, max = 60) {
  *
  * Trace input/output and tool arguments are arbitrary JSON, and tool arguments
  * are usually a *string* that contains JSON, so a string is unwrapped once
- * before printing. Anything unparsable is printed as-is, and very long payloads
- * are truncated with an explicit note instead of freezing the browser.
+ * before printing. Anything unparsable is printed as-is.
+ *
+ * `maxLength` caps the printed text with an explicit note, defaulting to a
+ * preview-sized 4000 characters. Pass `null` for a payload the reader opened the
+ * view to actually read: a prompt that was silently shortened is worse than a
+ * long one, and the block it lands in already scrolls inside a bounded height.
+ * (A collapsed caller never pays for the text at all — the <pre> is not
+ * rendered until it is expanded.)
  */
 export function formatJson(value, maxLength = 4000) {
   const text = renderJson(value)
   if (text === '') return ''
+  // An explicit null is the only way to ask for the whole document; 0 and
+  // negatives keep the old meaning of "unset", so a stray value can never
+  // silently produce an unbounded render.
+  if (maxLength === null) return text
   const limit = toNumber(maxLength)
   const cap = limit && limit > 0 ? limit : 4000
   if (text.length <= cap) return text

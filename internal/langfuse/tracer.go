@@ -2,6 +2,7 @@ package langfuse
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/huan/huan-agent/internal/chat"
@@ -33,7 +34,7 @@ func (t *Tracer) StartTrace(ctx context.Context, info chat.TraceInfo) string {
 	if !t.Enabled() {
 		return ""
 	}
-	id := NewID()
+	id := orID(info.ID)
 	_ = t.client.Trace(ctx, TraceEvent{
 		ID:        id,
 		Name:      info.Name,
@@ -59,7 +60,7 @@ func (t *Tracer) StartSpan(ctx context.Context, info chat.SpanInfo) string {
 	if !t.Enabled() || info.TraceID == "" {
 		return ""
 	}
-	id := NewID()
+	id := orID(info.ID)
 	_ = t.client.Span(ctx, SpanEvent{
 		ID:      id,
 		TraceID: info.TraceID,
@@ -82,7 +83,7 @@ func (t *Tracer) StartGeneration(ctx context.Context, info chat.GenInfo) string 
 	if !t.Enabled() || info.TraceID == "" {
 		return ""
 	}
-	id := NewID()
+	id := orID(info.ID)
 	_ = t.client.Generation(ctx, GenerationEvent{
 		ID:      id,
 		TraceID: info.TraceID,
@@ -106,6 +107,15 @@ func (t *Tracer) EndGeneration(ctx context.Context, genID string, output any, us
 		Output: usage.CompletionTokens,
 		Total:  usage.TotalTokens,
 	}, errMsg, time.Now().UTC())
+}
+
+// orID honours a caller-supplied id and generates one otherwise, so a fan-out
+// can keep every backend on the same ids (see chat.TraceInfo.ID).
+func orID(id string) string {
+	if strings.TrimSpace(id) != "" {
+		return id
+	}
+	return NewID()
 }
 
 // compile-time check that the adapter satisfies the chat tracer contract.

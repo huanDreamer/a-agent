@@ -49,3 +49,4 @@ coverage.html
 
 # Build cache
 .cache/
+.gocache/

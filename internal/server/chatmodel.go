@@ -44,11 +44,21 @@ func (s *Server) runnerFor(ctx context.Context, sess store.ChatSession) (*chat.R
 	}
 
 	r, err := chat.New(chat.Config{
-		Model:    cm,
-		Tools:    s.chat.Tools,
+		Model: cm,
+		Tools: s.chat.Tools,
+		// The per-turn registry: with a workspace layer wired, the tool set a
+		// turn runs with is derived from its own workspace, so two conversations
+		// can work in two projects at once. Without one this is nil and the
+		// static registry above is used exactly as before.
+		ToolsFor: s.chat.ToolsFor,
 		Tracer:   s.tracer,
 		MaxSteps: s.chatMaxSteps(),
-		Logger:   s.logger,
+		// The other two budgets, and the condenser that keeps a turn long enough
+		// to need them from resending its whole history every step.
+		MaxTokens: s.chatMaxTokens(),
+		Deadline:  s.chatTurnDeadline(),
+		Condenser: s.chat.Condenser,
+		Logger:    s.logger,
 	})
 	if err != nil {
 		return nil, err
@@ -116,7 +126,10 @@ func (s *Server) buildHistory(ctx context.Context, sess store.ChatSession, newUs
 	}
 
 	msgs := make([]*schema.Message, 0, len(stored)+2)
-	msgs = append(msgs, &schema.Message{Role: schema.System, Content: s.chatPrompt()})
+	// The prompt is assembled per turn: it carries the section listing the
+	// skills currently enabled in 设置 → 技能, so toggling one takes effect on the
+	// next message rather than the next restart.
+	msgs = append(msgs, &schema.Message{Role: schema.System, Content: s.systemPrompt()})
 
 	for _, m := range stored {
 		switch m.Role {
