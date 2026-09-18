@@ -15,6 +15,7 @@ package workspace
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,6 +122,18 @@ func (w *Workspace) Limits() Limits { return w.limits }
 
 // Writes returns how many mutations this workspace has performed.
 func (w *Workspace) Writes() int64 { return w.writes.Load() }
+
+// RecordWrites counts successful mutations.
+//
+// It is exported for the batch editor: an atomic write goes through this package
+// rather than through the file tools, and without this its writes would be
+// invisible to the counter the metrics and tests read.
+func (w *Workspace) RecordWrites(n int64) {
+	if w == nil || n <= 0 {
+		return
+	}
+	w.writes.Add(n)
+}
 
 // Resolve turns a caller-supplied path into an absolute path guaranteed to be
 // inside the root.
@@ -249,6 +262,23 @@ func (w *Workspace) Rel(abs string) string {
 	return filepath.ToSlash(rel)
 }
 
+// RelWithin is Rel for a caller that has to know whether the path is inside.
+//
+// Rel falls back to the absolute path when the relative computation fails, which
+// is right for a display helper and wrong for a decision: "is this answer about a
+// file I am allowed to talk about" needs a yes or no, not a path that happens to
+// look absolute.
+func (w *Workspace) RelWithin(abs string) (string, error) {
+	if !w.contains(abs) {
+		return "", fmt.Errorf("workspace: %q is outside %s", abs, w.root)
+	}
+	rel, err := filepath.Rel(w.root, abs)
+	if err != nil {
+		return "", fmt.Errorf("workspace: %q relative to %s: %w", abs, w.root, err)
+	}
+	return filepath.ToSlash(rel), nil
+}
+
 // IsBinary reports whether a byte slice looks binary, judged by a NUL byte in
 // the sniff window. Text tools use it to refuse to dump a binary into the
 // model's context.
@@ -263,3 +293,65 @@ func IsBinary(b []byte) bool {
 	}
 	return false
 }
+
+// RealPath returns the path a mutation should actually target.
+//
+// Resolve confines the path but returns it literally, so writing to a symlink
+// inside the workspace would replace the link instead of the file it points at.
+// Resolve has already proven that following the link stays inside the workspace,
+// so evaluating it here cannot widen access.
+func RealPath(abs string) string {
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	// Not existing yet, or a dangling link: the literal path is the target.
+	return abs
+}
+
+// WriteFileAtomic replaces the file at abs with data, writing a temp file in the
+// same directory first and then renaming it over the target.
+//
+// Rename is atomic within a filesystem, so a reader never observes a half-written
+// file and an interrupted call leaves the original untouched. It is exported
+// because a batch edit needs exactly this guarantee per file: a batch that wrote
+// some files in place and then failed would leave a repository that compiles
+// nowhere.
+func WriteFileAtomic(abs string, data []byte, perm fs.FileMode) (int64, error) {
+	dir := filepath.Dir(abs)
+	tmp, err := os.CreateTemp(dir, tempFilePattern)
+	if err != nil {
+		return 0, fmt.Errorf("create temp file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup. After a successful rename there is nothing left at
+	// tmpName, so this only removes a file from a failed attempt.
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+
+	// The mode is applied to the temp file before the rename, which is how the
+	// overwritten file keeps its permissions.
+	if err := tmp.Chmod(perm); err != nil {
+		return 0, fmt.Errorf("set mode on temp file: %w", err)
+	}
+	n, err := tmp.Write(data)
+	if err != nil {
+		return 0, fmt.Errorf("write temp file: %w", err)
+	}
+	// Sync before rename so a crash cannot publish a name whose contents were
+	// never flushed.
+	if err := tmp.Sync(); err != nil {
+		return 0, fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return 0, fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, abs); err != nil {
+		return 0, fmt.Errorf("rename temp file over target: %w", err)
+	}
+	return int64(n), nil
+}
+
+// tempFilePattern names the temp files an atomic write creates.
+const tempFilePattern = ".huan-agent-write-*"

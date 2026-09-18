@@ -27,7 +27,7 @@ type CalcOutput struct {
 var calcFunctions = map[string]govaluate.ExpressionFunction{
 	"abs":   func(args ...any) (any, error) { return unaryFloat(args, math.Abs) },
 	"ceil":  func(args ...any) (any, error) { return unaryFloat(args, math.Ceil) },
-	"floor": func(args ...any) (any, error) { return unaryFloat(args, math.Floor)},
+	"floor": func(args ...any) (any, error) { return unaryFloat(args, math.Floor) },
 	"round": func(args ...any) (any, error) { return unaryFloat(args, math.Round) },
 	"sqrt":  func(args ...any) (any, error) { return unaryFloat(args, math.Sqrt) },
 	"log":   func(args ...any) (any, error) { return unaryFloat(args, math.Log) },

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+
+	"github.com/huan/huan-agent/internal/retry"
 )
 
 // EnvPrefix is prepended to environment variables that override config keys.
@@ -34,9 +36,70 @@ type Config struct {
 	Langfuse LangfuseConfig `mapstructure:"langfuse" json:"langfuse"`
 	Chat     ChatConfig     `mapstructure:"chat" json:"chat"`
 	Tools    ToolsConfig    `mapstructure:"tools" json:"tools"`
+	Run      RunConfig      `mapstructure:"run" json:"run"`
+	Subagent SubagentConfig `mapstructure:"subagent" json:"subagent"`
 	// OpenViking is the context database (long-term memory + documents) the
 	// agent mirrors into. Off unless configured; see ApplyOpenVikingMCP.
 	OpenViking OpenVikingConfig `mapstructure:"openviking" json:"openviking"`
+}
+
+// RunConfig configures the one-shot `huan-agent run` command: the entry point a
+// git hook, a CI job or cron uses.
+//
+// Everything here has a "the command still works unconfigured" default, because
+// a one-shot run is meant to be callable from a script without a config edit.
+type RunConfig struct {
+	// TimeoutSeconds bounds one run's wall-clock time. 0 (the default) means
+	// unlimited, matching chat.turn_deadline_seconds: a pipeline that wants a
+	// bound passes --timeout or sets this.
+	TimeoutSeconds int `mapstructure:"timeout_seconds" json:"timeout_seconds"`
+	// MaxSteps caps the tool-calling iterations. 0 means "inherit
+	// chat.max_steps", which is what keeps the one-shot command and the
+	// interactive one bounded the same way.
+	MaxSteps int `mapstructure:"max_steps" json:"max_steps"`
+	// DefaultOutput is the output format when --output is not passed: "text"
+	// (the answer alone on stdout) or "json" (one object).
+	DefaultOutput string `mapstructure:"default_output" json:"default_output"`
+}
+
+// The accepted values of run.default_output and of `run --output`.
+const (
+	RunOutputText = "text"
+	RunOutputJSON = "json"
+)
+
+// Timeout returns the one-shot wall-clock budget. Zero means unlimited, which is
+// the zero value's meaning everywhere else in this file.
+func (c RunConfig) Timeout() time.Duration {
+	if c.TimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.TimeoutSeconds) * time.Second
+}
+
+// MaxStepsOr falls back to the interactive step cap.
+//
+// The fallback is to chat.max_steps rather than to a constant of its own so the
+// two ways of running one turn cannot drift: raising the interactive cap also
+// raises the one-shot cap, which is what "the same agent, without a terminal"
+// should mean.
+func (c RunConfig) MaxStepsOr(chatMax int) int {
+	if c.MaxSteps > 0 {
+		return c.MaxSteps
+	}
+	return chatMax
+}
+
+// OutputOr returns the configured default output format, defaulting to text.
+//
+// An unparseable value falls back to the default rather than being refused: the
+// flag overrides it per invocation, and failing to start a pipeline over a
+// display preference is the wrong trade.
+func (c RunConfig) OutputOr() string {
+	if strings.EqualFold(strings.TrimSpace(c.DefaultOutput), RunOutputJSON) {
+		return RunOutputJSON
+	}
+	return RunOutputText
 }
 
 // ChatConfig configures the web chat feature.
@@ -75,7 +138,99 @@ type ChatConfig struct {
 	// the turn, so a limit larger than the deadline leaves the model with no
 	// budget left to act on the answer it just received.
 	AskUserTimeoutSeconds int `mapstructure:"ask_user_timeout_seconds" json:"ask_user_timeout_seconds"`
+	// StepRetry is how one *step* of a turn is retried when its model call
+	// fails — including when the stream died after the model had already started
+	// answering, which the llm layer deliberately does not retry (see
+	// llm.retry) because replaying it would show the reader the beginning of the
+	// answer twice.
+	StepRetry RetryConfig `mapstructure:"step_retry" json:"step_retry"`
+	// Plan configures the task plan the model maintains through the plan_*
+	// tools, and the 任务看板 that renders it above the composer.
+	Plan PlanConfig `mapstructure:"plan" json:"plan"`
 }
+
+// PlanConfig configures the visible task plan.
+type PlanConfig struct {
+	// Enable registers the plan_* tools for the web console and lets the turn
+	// publish plan updates. Turning it off removes the tools entirely rather
+	// than describing them in the prompt and refusing to run them.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// MaxTasks bounds how many tasks one plan may hold. A plan longer than this
+	// is not a plan but a transcript, and a board nobody can read is worse than
+	// a refused tool call.
+	MaxTasks int `mapstructure:"max_tasks" json:"max_tasks"`
+}
+
+// DefaultPlanMaxTasks bounds a plan when the config does not say.
+const DefaultPlanMaxTasks = 50
+
+// MaxTasksOr returns the configured plan size limit or the default.
+func (c PlanConfig) MaxTasksOr() int {
+	if c.MaxTasks <= 0 {
+		return DefaultPlanMaxTasks
+	}
+	return c.MaxTasks
+}
+
+// RetryConfig is the shared shape of every retry policy in this config tree: the
+// model-call one (llm.retry) and the step one (chat.step_retry).
+//
+// It is one struct rather than two identical ones because the two policies differ
+// only in their numbers, and a reader comparing them should be comparing values,
+// not field names.
+type RetryConfig struct {
+	// Enable turns retrying off entirely. It defaults to true: a long turn that
+	// dies on one dropped connection is the failure this exists to remove, and
+	// the cost of being wrong is one extra attempt after a backoff.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// MaxAttempts is the total number of attempts *including* the first.
+	MaxAttempts int `mapstructure:"max_attempts" json:"max_attempts"`
+	// BaseDelayMS is how long the first retry waits.
+	BaseDelayMS int `mapstructure:"base_delay_ms" json:"base_delay_ms"`
+	// MaxDelayMS caps the computed backoff.
+	MaxDelayMS int `mapstructure:"max_delay_ms" json:"max_delay_ms"`
+	// Multiplier grows the delay before each further attempt.
+	Multiplier float64 `mapstructure:"multiplier" json:"multiplier"`
+	// Jitter randomises each delay by +/-25%, so several turns that failed on the
+	// same outage do not retry in lockstep. Defaults to true.
+	Jitter *bool `mapstructure:"jitter" json:"jitter"`
+}
+
+// Policy renders the config as the backoff the retry package runs.
+//
+// A disabled retry becomes a policy of one attempt — "no retrying" is expressed
+// as an attempt count rather than as a flag, so there is exactly one place that
+// decides whether a second call happens.
+func (c RetryConfig) Policy() retry.Policy {
+	if !c.Enable {
+		return retry.Policy{MaxAttempts: 1}
+	}
+	attempts := c.MaxAttempts
+	if attempts <= 0 {
+		// An enabled block with no count gets the default rather than becoming
+		// "retry zero times": a configuration that says "retry" and silently does
+		// not is the kind of thing nobody reads back. Saying one attempt on
+		// purpose is what enable: false is for.
+		attempts = retry.DefaultMaxAttempts
+	}
+	jitter := true
+	if c.Jitter != nil {
+		jitter = *c.Jitter
+	}
+	return retry.Policy{
+		MaxAttempts: attempts,
+		BaseDelay:   time.Duration(c.BaseDelayMS) * time.Millisecond,
+		MaxDelay:    time.Duration(c.MaxDelayMS) * time.Millisecond,
+		Multiplier:  c.Multiplier,
+		Jitter:      jitter,
+	}
+}
+
+// RetryPolicy is the policy for one model call.
+func (c LLMConfig) RetryPolicy() retry.Policy { return c.Retry.Policy() }
+
+// StepRetryPolicy is the policy for one step of a turn.
+func (c ChatConfig) StepRetryPolicy() retry.Policy { return c.StepRetry.Policy() }
 
 // DefaultChatHistoryLimit bounds the replayed conversation when unset.
 const DefaultChatHistoryLimit = 40
@@ -254,6 +409,14 @@ type LLMConfig struct {
 	// it the list is "stale": the startup pass refetches it, and the console
 	// offers a refresh. Zero uses DefaultModelsCacheTTLHours.
 	ModelsCacheTTLHours int `mapstructure:"models_cache_ttl_hours" json:"models_cache_ttl_hours"`
+	// Retry is how a single model call is retried when it fails for a reason
+	// another attempt could survive (a dropped connection, a 429, a 5xx). A 400
+	// or a 401 is never retried: see llm.IsRetryable.
+	//
+	// It applies to every caller of a model in this process — the web chat, the
+	// Feishu bot, the CLI REPL, the context condenser, the title generator —
+	// because being interrupted mid-task is not specific to one surface.
+	Retry RetryConfig `mapstructure:"retry" json:"retry"`
 }
 
 // DefaultModelsCacheTTLHours is how long a fetched model list is trusted when
@@ -288,8 +451,10 @@ type LLMProvider struct {
 // AgentConfig configures the ReAct agent loop. Empty values fall back
 // to internal defaults at construction time.
 type AgentConfig struct {
-	// MaxSteps caps model→tool→model iterations. 0 means default (12);
-	// the agent package clamps the upper bound to 25.
+	// MaxSteps caps model→tool→model iterations. 0 means default (12); the
+	// agent package clamps the upper bound to agent.MaxStepsCeiling (200), which
+	// is deliberately lower than chat.MaxStepsCeiling because the agent carries
+	// a CLI's synchronous caller rather than one streaming turn.
 	MaxSteps int `mapstructure:"max_steps" json:"max_steps"`
 	// AllowedTools optionally restricts the registry to a subset. When
 	// empty, all registered tools are exposed to the LLM.
@@ -398,10 +563,354 @@ type ToolsConfig struct {
 	MaxWriteMB int `mapstructure:"max_write_mb" json:"max_write_mb"`
 	// MaxListEntries caps a listing or glob result. 0 uses the default (500).
 	MaxListEntries int `mapstructure:"max_list_entries" json:"max_list_entries"`
+	// MaxParallel is how many parallel-safe tool calls from one model reply may
+	// run at once. 0 or 1 means one at a time, which is what every deployment got
+	// before this option existed.
+	//
+	// Only tools that declared themselves ParallelSafe may overlap at all, and
+	// writes and commands are barriers, so this is a bound on I/O concurrency
+	// rather than on what the model can do at once.
+	MaxParallel int `mapstructure:"max_parallel" json:"max_parallel"`
 	// DenyPatterns are RE2 regexes that refuse a matching command. A speed bump
 	// for obviously destructive commands, NOT a security boundary: an LLM can
 	// trivially write an equivalent command that does not match.
 	DenyPatterns []string `mapstructure:"deny_patterns" json:"deny_patterns"`
+	// LSP configures the language servers behind the code-intelligence tools
+	// (diagnostics, go-to-definition, references, workspace symbols) and the
+	// diagnostics that are attached to what the editing tools return.
+	LSP LSPConfig `mapstructure:"lsp" json:"lsp"`
+	// Approval gates write and exec tool calls behind a decision by a person.
+	Approval ApprovalConfig `mapstructure:"approval" json:"approval"`
+	// Web configures reading pages from the internet.
+	Web WebConfig `mapstructure:"web" json:"web"`
+	// Checkpoint keeps the pre-image of every file a turn changes, so a turn can
+	// be undone without git.
+	Checkpoint CheckpointConfig `mapstructure:"checkpoint" json:"checkpoint"`
+}
+
+// WebConfig configures the fetch_url tool.
+type WebConfig struct {
+	// Enable registers fetch_url.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// AllowPrivate permits loopback, private and link-local addresses.
+	//
+	// Off by default, and the default is the security-relevant choice: the
+	// addresses it permits include the cloud metadata endpoint (169.254.169.254,
+	// which hands out instance credentials) and whatever else is listening on the
+	// host — including this agent's own console and its MCP servers.
+	AllowPrivate bool `mapstructure:"allow_private" json:"allow_private"`
+	// TimeoutSeconds bounds one request.
+	TimeoutSeconds int `mapstructure:"timeout_seconds" json:"timeout_seconds"`
+	// MaxKB bounds the response body.
+	MaxKB int `mapstructure:"max_kb" json:"max_kb"`
+	// MaxChars bounds how much of one page a single call returns.
+	MaxChars int `mapstructure:"max_chars" json:"max_chars"`
+	// CacheTTLSeconds bounds the in-process cache. 0 disables it.
+	CacheTTLSeconds int `mapstructure:"cache_ttl_seconds" json:"cache_ttl_seconds"`
+	// UserAgent identifies this client.
+	UserAgent string `mapstructure:"user_agent" json:"user_agent"`
+}
+
+// Defaults for the web section.
+const (
+	DefaultWebTimeoutSeconds = 20
+	DefaultWebMaxKB          = 2048
+	DefaultWebMaxChars       = 20000
+	DefaultWebCacheTTL       = 300
+)
+
+// Timeout returns the request timeout.
+func (c WebConfig) Timeout() time.Duration {
+	secs := c.TimeoutSeconds
+	if secs <= 0 {
+		secs = DefaultWebTimeoutSeconds
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// MaxBytes returns the body limit.
+func (c WebConfig) MaxBytes() int64 {
+	kb := c.MaxKB
+	if kb <= 0 {
+		kb = DefaultWebMaxKB
+	}
+	return int64(kb) << 10
+}
+
+// MaxCharsOr returns the per-call window.
+func (c WebConfig) MaxCharsOr() int {
+	if c.MaxChars > 0 {
+		return c.MaxChars
+	}
+	return DefaultWebMaxChars
+}
+
+// CacheTTL returns the cache lifetime; a negative configured value disables it.
+func (c WebConfig) CacheTTL() time.Duration {
+	if c.CacheTTLSeconds < 0 {
+		return 0
+	}
+	secs := c.CacheTTLSeconds
+	if secs == 0 {
+		secs = DefaultWebCacheTTL
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// SubagentConfig configures the subagents a turn may spawn.
+//
+// Everything here is a bound on cost rather than a feature switch, because the
+// feature is the risk: a subagent is a nested model call sequence that the parent
+// pays for, and an unbounded one is a budget landmine rather than a convenience.
+type SubagentConfig struct {
+	// Enable registers spawn_agent. Off means the tool is not on the menu at all.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// MaxSteps bounds a nested run's iterations. 0 uses the default (8).
+	MaxSteps int `mapstructure:"max_steps" json:"max_steps"`
+	// MaxConcurrent bounds how many subagents run at once across the whole
+	// process. 0 uses the default (2).
+	//
+	// Process-wide on purpose: "spawn three explorations" is the intended use, and
+	// four parents each spawning four is how a fan-out becomes a bill.
+	MaxConcurrent int `mapstructure:"max_concurrent" json:"max_concurrent"`
+	// MaxReportChars truncates a report. 0 uses the default (8000).
+	MaxReportChars int `mapstructure:"max_report_chars" json:"max_report_chars"`
+}
+
+// Defaults for the subagent section.
+const (
+	DefaultSubagentMaxSteps       = 8
+	DefaultSubagentMaxConcurrent  = 2
+	DefaultSubagentMaxReportChars = 8000
+)
+
+// MaxStepsOr returns the nested step cap.
+func (c SubagentConfig) MaxStepsOr() int {
+	if c.MaxSteps > 0 {
+		return c.MaxSteps
+	}
+	return DefaultSubagentMaxSteps
+}
+
+// MaxConcurrentOr returns the process-wide concurrency bound.
+func (c SubagentConfig) MaxConcurrentOr() int {
+	if c.MaxConcurrent > 0 {
+		return c.MaxConcurrent
+	}
+	return DefaultSubagentMaxConcurrent
+}
+
+// MaxReportCharsOr returns the report truncation limit.
+func (c SubagentConfig) MaxReportCharsOr() int {
+	if c.MaxReportChars > 0 {
+		return c.MaxReportChars
+	}
+	return DefaultSubagentMaxReportChars
+}
+
+// CheckpointConfig configures the file-level checkpoints.
+type CheckpointConfig struct {
+	// Enable turns checkpointing on. It defaults to on: the cost is a copy of
+	// each file a turn touches, and the benefit is that a wrong turn is one click
+	// away from being undone rather than one `git` command the model had to
+	// remember to run first.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// Dir is where checkpoints are written. Empty puts a "checkpoints" directory
+	// beside the database file (see CheckpointDirOrDefault).
+	Dir string `mapstructure:"dir" json:"dir"`
+	// KeepTurns bounds how many turns per conversation are kept. 0 uses the
+	// default (20).
+	KeepTurns int `mapstructure:"keep_turns" json:"keep_turns"`
+	// MaxTotalMB bounds the whole checkpoint directory. 0 uses the default (512).
+	MaxTotalMB int `mapstructure:"max_total_mb" json:"max_total_mb"`
+}
+
+// DefaultCheckpointSubdir is where checkpoints are written, relative to the
+// database file, when tools.checkpoint.dir is empty.
+const DefaultCheckpointSubdir = "checkpoints"
+
+// Defaults for the checkpoint section.
+const (
+	DefaultCheckpointKeepTurns  = 20
+	DefaultCheckpointMaxTotalMB = 512
+)
+
+// CheckpointDirOrDefault resolves where checkpoints are written.
+//
+// Beside the database for the same reason job logs are: a checkpoint written into
+// the workspace would show up in the model's own greps and in the user's git
+// status, and it is the deployment's data rather than the project's.
+func (c ToolsConfig) CheckpointDirOrDefault(databasePath string) (string, bool) {
+	if dir := strings.TrimSpace(c.Checkpoint.Dir); dir != "" {
+		return dir, true
+	}
+	return dirBesideDatabase(databasePath, DefaultCheckpointSubdir), true
+}
+
+// KeepTurnsOr returns the per-conversation turn cap.
+func (c CheckpointConfig) KeepTurnsOr() int {
+	if c.KeepTurns > 0 {
+		return c.KeepTurns
+	}
+	return DefaultCheckpointKeepTurns
+}
+
+// MaxTotalMBOr returns the directory size cap.
+func (c CheckpointConfig) MaxTotalMBOr() int {
+	if c.MaxTotalMB > 0 {
+		return c.MaxTotalMB
+	}
+	return DefaultCheckpointMaxTotalMB
+}
+
+// ApprovalConfig configures the approval gate.
+//
+// The default is off, and that is a deliberate choice rather than an unfinished
+// one: turning a gate on by default would take write access away from the
+// deployments nobody is watching (a CI run, the bot, a cron job), which is a
+// worse surprise than not having a gate. Turning it on is a decision an operator
+// makes once, in the knowledge that some surfaces then lose their write tools.
+type ApprovalConfig struct {
+	// Mode selects what needs approval: "off" (the default), "writes",
+	// "writes+exec" or "all".
+	Mode string `mapstructure:"mode" json:"mode"`
+	// Allow is a list of RE2 patterns matched against a request's summary; a match
+	// means the call runs without asking. Like tools.deny_patterns it is a
+	// convenience, not a boundary — but here the default is to ask, so a missed
+	// pattern costs a prompt instead of a disaster.
+	Allow []string `mapstructure:"allow" json:"allow"`
+	// TimeoutSeconds bounds one request. 0 uses the default (300). A timeout is a
+	// refusal: the gate holds when nobody is watching, which is when it matters.
+	TimeoutSeconds int `mapstructure:"timeout_seconds" json:"timeout_seconds"`
+}
+
+// DefaultApprovalTimeout is how long one request waits for a decision.
+//
+// Five minutes is shorter than the ask_user timeout on purpose: a question is the
+// model gathering information, while an approval is a decision about an action
+// that is otherwise blocked — leaving that hanging for ten minutes holds a turn
+// and a half-finished tool call for no benefit.
+const DefaultApprovalTimeout = 5 * time.Minute
+
+// ModeOr returns the configured mode, defaulting to off.
+func (c ApprovalConfig) ModeOr() string {
+	if strings.TrimSpace(c.Mode) == "" {
+		return "off"
+	}
+	return strings.ToLower(strings.TrimSpace(c.Mode))
+}
+
+// Timeout returns how long one request waits.
+func (c ApprovalConfig) Timeout() time.Duration {
+	if c.TimeoutSeconds <= 0 {
+		return DefaultApprovalTimeout
+	}
+	return time.Duration(c.TimeoutSeconds) * time.Second
+}
+
+// LSPConfig configures code intelligence.
+//
+// Every field has a default that makes the feature work unconfigured on a Go
+// repository, and every failure it can produce is non-fatal by design: a language
+// server is an external binary that may not be installed, and the agent has to
+// keep working without one.
+type LSPConfig struct {
+	// Enable turns the whole capability on. With it off, no process is started,
+	// no code-intelligence tool is registered, and the editing tools return
+	// exactly what they returned before this feature existed.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// AttachDiagnostics appends the diagnostics for a file to the result of the
+	// write or edit that changed it. This is the half of the feature that
+	// shortens the fix-a-type-error loop, so it defaults on.
+	AttachDiagnostics bool `mapstructure:"attach_diagnostics" json:"attach_diagnostics"`
+	// DiagnosticsWaitMS bounds how long an edit waits for the server to catch up.
+	// The edit itself never depends on it: on timeout the result says the
+	// diagnostics were not ready. 0 uses the default (2000).
+	DiagnosticsWaitMS int `mapstructure:"diagnostics_wait_ms" json:"diagnostics_wait_ms"`
+	// IdleTimeoutSeconds reaps a language server that has not been used for this
+	// long. 0 uses the default (600). A negative value disables reaping, which is
+	// only sensible for a short-lived process.
+	IdleTimeoutSeconds int `mapstructure:"idle_timeout_seconds" json:"idle_timeout_seconds"`
+	// MaxDiagnostics caps how many diagnostics are attached to an edit result.
+	// The total is always reported, so truncation is never silent. 0 uses the
+	// default (20).
+	MaxDiagnostics int `mapstructure:"max_diagnostics" json:"max_diagnostics"`
+	// Servers declares the language servers. Empty uses the built-in table
+	// (gopls for Go), which is what makes `tools.lsp.enable: true` do the obvious
+	// thing on a Go repository.
+	Servers []LSPServerConfig `mapstructure:"servers" json:"servers"`
+}
+
+// LSPServerConfig is one language server.
+type LSPServerConfig struct {
+	Name    string   `mapstructure:"name" json:"name"`
+	Command string   `mapstructure:"command" json:"command"`
+	Args    []string `mapstructure:"args" json:"args"`
+	Env     []string `mapstructure:"env" json:"env"`
+	// Languages are the file extensions or language ids this server handles
+	// (".go", "go", "typescript"). Both spellings work.
+	Languages []string `mapstructure:"languages" json:"languages"`
+	// RootMarkers are the files whose nearest ancestor becomes the server's root
+	// ("go.mod", "package.json"). This decides which project gets indexed.
+	RootMarkers []string `mapstructure:"root_markers" json:"root_markers"`
+	// InitOptions is passed through as initializationOptions.
+	InitOptions map[string]any `mapstructure:"init_options" json:"init_options"`
+	// Enabled defaults to true when absent.
+	Enabled *bool `mapstructure:"enabled" json:"enabled,omitempty"`
+}
+
+// Defaults for the LSP section.
+const (
+	DefaultLSPDiagnosticsWaitMS = 2000
+	DefaultLSPIdleTimeoutSecs   = 600
+	DefaultLSPMaxDiagnostics    = 20
+	// DisableLSPReaping is the IdleTimeoutSeconds value that turns reaping off.
+	DisableLSPReaping = -1
+)
+
+// DiagnosticsWait returns how long an edit waits for diagnostics.
+func (c LSPConfig) DiagnosticsWait() time.Duration {
+	ms := c.DiagnosticsWaitMS
+	if ms <= 0 {
+		ms = DefaultLSPDiagnosticsWaitMS
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// IdleTimeout returns how long a server may sit unused, or 0 for "never reap".
+func (c LSPConfig) IdleTimeout() time.Duration {
+	if c.IdleTimeoutSeconds == DisableLSPReaping {
+		return 0
+	}
+	secs := c.IdleTimeoutSeconds
+	if secs <= 0 {
+		secs = DefaultLSPIdleTimeoutSecs
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// MaxDiagnosticsOr returns the attachment cap.
+func (c LSPConfig) MaxDiagnosticsOr() int {
+	if c.MaxDiagnostics > 0 {
+		return c.MaxDiagnostics
+	}
+	return DefaultLSPMaxDiagnostics
+}
+
+// DefaultMaxParallel is how many parallel-safe tool calls run at once when the
+// deployment does not say otherwise.
+//
+// Four is a guess with a reason: a step that reads five files is the common case
+// this exists for, and four overlapping reads already collapse the latency to one
+// read plus a little. Higher would mostly open more file descriptors at once.
+const DefaultMaxParallel = 4
+
+// MaxParallelOr returns the configured bound, or the default.
+func (c ToolsConfig) MaxParallelOr() int {
+	if c.MaxParallel > 0 {
+		return c.MaxParallel
+	}
+	return DefaultMaxParallel
 }
 
 // DefaultDenyPatterns are refuse-on-match patterns for commands that are almost
@@ -901,12 +1410,44 @@ func SetDefaults(v *viper.Viper) {
 	// providers' lists at startup when they are older than the TTL.
 	v.SetDefault("llm.auto_refresh_models", true)
 	v.SetDefault("llm.models_cache_ttl_hours", DefaultModelsCacheTTLHours)
+	// Retrying a failed model call: 3 attempts (the first try plus two retries),
+	// 800ms before the first retry, doubling to a 30s cap, jittered. The numbers
+	// are deliberately modest — a failure that survives three spaced attempts is
+	// usually not a blip, and an unbounded retry loop on a paid endpoint is worse
+	// than an honest error.
+	v.SetDefault("llm.retry.enable", true)
+	v.SetDefault("llm.retry.max_attempts", retry.DefaultMaxAttempts)
+	v.SetDefault("llm.retry.base_delay_ms", retry.DefaultBaseDelay.Milliseconds())
+	v.SetDefault("llm.retry.max_delay_ms", retry.DefaultMaxDelay.Milliseconds())
+	v.SetDefault("llm.retry.multiplier", retry.DefaultMultiplier)
+	v.SetDefault("llm.retry.jitter", true)
 	v.SetDefault("chat.enable", true)
 	v.SetDefault("chat.max_steps", 12)
 	v.SetDefault("chat.turn_max_tokens", 0)
 	v.SetDefault("chat.turn_deadline_seconds", 0)
 	v.SetDefault("chat.history_limit", DefaultChatHistoryLimit)
 	v.SetDefault("chat.system_prompt", "")
+	// One step's own retry, for the failure the llm layer cannot take back: the
+	// stream died after it had already delivered text, so the step is re-run from
+	// the same history and the client is told to drop the half-answer it received.
+	// The wait is longer than the model-call one because the step re-runs real
+	// work (a tool round trip is about to follow it).
+	v.SetDefault("chat.step_retry.enable", true)
+	v.SetDefault("chat.step_retry.max_attempts", 3)
+	v.SetDefault("chat.step_retry.base_delay_ms", 1500)
+	v.SetDefault("chat.step_retry.max_delay_ms", 20000)
+	v.SetDefault("chat.step_retry.multiplier", retry.DefaultMultiplier)
+	v.SetDefault("chat.step_retry.jitter", true)
+	// The task plan behind 任务看板. On by default: it is what makes a long turn
+	// legible while it runs and resumable after it dies.
+	v.SetDefault("chat.plan.enable", true)
+	v.SetDefault("chat.plan.max_tasks", DefaultPlanMaxTasks)
+	// One-shot runs (`huan-agent run`) are callable from a script with no
+	// config at all: no timeout unless asked for, the interactive step cap, and
+	// the answer alone on stdout.
+	v.SetDefault("run.timeout_seconds", 0)
+	v.SetDefault("run.max_steps", 0)
+	v.SetDefault("run.default_output", RunOutputText)
 	v.SetDefault("langfuse.enable", false)
 	v.SetDefault("langfuse.host", "")
 	v.SetDefault("langfuse.public_key", "")
@@ -928,6 +1469,37 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("tools.max_read_kb", 512)
 	v.SetDefault("tools.max_write_mb", 4)
 	v.SetDefault("tools.max_list_entries", 500)
+	v.SetDefault("tools.max_parallel", DefaultMaxParallel)
+	// Code intelligence. `enable: true` registers the tools when a language
+	// server covers the workspace, and starts one lazily on first use — so a
+	// deployment that never asks a semantic question never pays for a server.
+	v.SetDefault("tools.lsp.enable", true)
+	v.SetDefault("tools.lsp.attach_diagnostics", true)
+	v.SetDefault("tools.lsp.diagnostics_wait_ms", DefaultLSPDiagnosticsWaitMS)
+	v.SetDefault("tools.lsp.idle_timeout_seconds", DefaultLSPIdleTimeoutSecs)
+	v.SetDefault("tools.lsp.max_diagnostics", DefaultLSPMaxDiagnostics)
+	// The approval gate is off by default: see ApprovalConfig.
+	v.SetDefault("tools.approval.mode", "off")
+	v.SetDefault("tools.approval.allow", []string{})
+	v.SetDefault("tools.approval.timeout_seconds", int(DefaultApprovalTimeout.Seconds()))
+	// Checkpoints default on: a wrong turn being one click from undone is worth a
+	// copy of the files it touched.
+	v.SetDefault("tools.checkpoint.enable", true)
+	v.SetDefault("tools.checkpoint.dir", "")
+	v.SetDefault("tools.checkpoint.keep_turns", DefaultCheckpointKeepTurns)
+	v.SetDefault("tools.checkpoint.max_total_mb", DefaultCheckpointMaxTotalMB)
+	// Subagents are on by default (the tool is useful and bounded); the bounds are
+	// what make that safe.
+	v.SetDefault("tools.web.enable", true)
+	v.SetDefault("tools.web.allow_private", false)
+	v.SetDefault("tools.web.timeout_seconds", DefaultWebTimeoutSeconds)
+	v.SetDefault("tools.web.max_kb", DefaultWebMaxKB)
+	v.SetDefault("tools.web.max_chars", DefaultWebMaxChars)
+	v.SetDefault("tools.web.cache_ttl_seconds", DefaultWebCacheTTL)
+	v.SetDefault("subagent.enable", true)
+	v.SetDefault("subagent.max_steps", DefaultSubagentMaxSteps)
+	v.SetDefault("subagent.max_concurrent", DefaultSubagentMaxConcurrent)
+	v.SetDefault("subagent.max_report_chars", DefaultSubagentMaxReportChars)
 	v.SetDefault("admin.require_login", false)
 	v.SetDefault("admin.allow_insecure_bind", false)
 	// Loopback callers are not asked for the password, so a deployment that

@@ -276,9 +276,28 @@ chat:
   enable: true             # off hides the 对话 tab
   max_steps: 12            # tool-calling iterations per turn
   history_limit: 40        # stored messages replayed to the model
-  system_prompt: ""        # empty = built-in default
+  system_prompt: ""        # empty = the built-in Chinese general-purpose agent
+                           # prompt in internal/prompt (see docs/prompt.md)
   ask_user_timeout_seconds: 600   # how long an ask_user card waits (see below)
+  step_retry:               # retry ONE step whose model call died mid-stream
+    enable: true
+    max_attempts: 3
+  plan:                     # the plan behind 任务看板 (and 继续执行)
+    enable: true
+    max_tasks: 50
 ```
+
+Model-call retrying lives under `llm.retry` (it applies to every surface, not
+just this one), and the whole recovery story — backoff, step retry, 继续执行,
+the plan tools — is in `docs/long-tasks.md`.
+
+`system_prompt` replaces the built-in prompt — here **and in the Feishu bot**,
+which reads the same field — and only when it is not blank: a value that is all
+whitespace falls back to the default. Whatever it says, the per-turn **可用技能**
+section is appended to it, so a custom prompt that forgets about skills still
+gets the list of names. It is read at startup from `configs/config.yaml`: unlike
+the three budget fields, 设置 → 对话预算 cannot change it at runtime. See
+`docs/prompt.md` for what the default says and how the surfaces differ.
 
 Endpoints (session cookie required):
 
@@ -288,33 +307,77 @@ Endpoints (session cookie required):
 | `GET/POST /api/chat/sessions` | list / create |
 | `GET/PATCH/DELETE /api/chat/sessions/{id}` | fetch / rename or change model / delete |
 | `POST /api/chat/sessions/{id}/clear` | empty the history, keep the session |
-| `POST /api/chat/sessions/{id}/messages` | **SSE** stream for one turn |
+| `POST /api/chat/sessions/{id}/messages` | **start** one turn (202; the turn then belongs to the conversation) |
+| `GET /api/chat/sessions/{id}/turn` | **attach**: replay the running turn, then follow it live (SSE) |
+| `POST /api/chat/sessions/{id}/turn/stop` | stop the running turn |
+| `POST /api/chat/sessions/{id}/resume` | **continue** the last turn from where it stopped (202 / 409 busy / 400 nothing to continue) |
+| `POST /api/chat/sessions/{id}/attachments` | upload a file for a message |
+| `GET /api/chat/attachments/{id}` | download it again |
 | `POST /api/chat/sessions/{id}/questions/{qid}/answer` | answer an `ask_user` card |
 
-`POST .../messages` returns `text/event-stream`. Each frame is
-`data: {json}\n\n`, with a `type` of `step_start`, `reasoning_delta`,
-`text_delta`, `tool_call`, `tool_result`, `ask_user`, `usage`, `done`, `error`,
-or `stream_end` (always last). A `: ping` comment is sent periodically so an
-idle stream is not mistaken for a dead one.
+`GET .../turn` returns `text/event-stream`. Each frame is `data: {json}\n\n`, with
+a `type` of `step_start`, `reasoning_delta`, `text_delta`, `step_end`,
+`tool_call`, `tool_result`, `ask_user`, `plan`, `step_retry`, `usage`,
+`context_compressed`, `budget_stop`, `done`, `error`, or `stream_end` (always
+last). A `: ping` comment
+is sent periodically so an idle stream is not mistaken for a dead one. It answers
+`{"streaming": false}` — not a stream — when nothing is running.
 
 Because `EventSource` cannot POST, the UI reads the body with `fetch` +
 `ReadableStream` and parses the framing itself.
 
+Every event carries the `step` it belongs to, which is what lets a reader put the
+model's thinking next to the tool call it prompted.
+
 Behaviour worth knowing:
 
+- **A finished turn shows one line of process and then its answer.** Once a turn
+  is over, everything it did before answering — every step's thinking and the
+  tools it ran — is folded behind a single line reading
+  `执行过程 · N 次工具调用 · M 条消息` (M is the number of ReAct iterations, i.e.
+  the assistant messages the turn exchanged with the model), with the answer
+  directly under it. Clicking that line brings the steps back as one row each;
+  a step's tool cards still fold on their own, because the cards are the bulky
+  half. While a turn is running the process stays open — it is what there is to
+  watch. Nothing about the fold is stored: it is derived from "the turn is over",
+  so a reload shows the folded state again.
+  `step_end` is what marks a step's text as process rather than answer.
 - **Reasoning is separate from the answer.** Reasoning models stream their
-  thinking in a distinct field; it is shown in a collapsible 思考过程 panel and
-  stored separately, never mixed into the answer.
+  thinking in a distinct field; it is kept out of the answer text, and stored both
+  per step (`steps`) and as the turn's whole thinking (`reasoning`).
 - **A failing tool does not fail the turn.** The error is shown, recorded in the
   audit log, and handed back to the model so it can adapt.
+- **A failing model call does not either, up to a point.** A transient call
+  failure (a dropped connection, a 429, a 5xx) is retried with exponential
+  backoff — see `llm.retry`. If the stream dies *after* the model started
+  answering, the retry happens one level up, at the step (`chat.step_retry`),
+  and the console is told to drop the half-answer it received via `step_retry`.
+- **A plan belongs to one request.** When every task is done (or skipped) and the
+  user sends the next message, the finished plan is deleted before the new turn
+  runs and an empty plan is published, so the board disappears from every open
+  page. A plan with unfinished work is kept — it is what 继续执行 continues from.
+- **A turn that dies can be continued.** The plan the model maintains
+  (`plan_create` / `plan_add` / `plan_update` / `plan_read`) is stored per
+  conversation and rendered above the composer as 任务看板 (执行中 / 待执行 /
+  已完成); `POST .../resume` starts a new turn carrying that plan, the previous
+  turn's steps and its tool observations, so the model continues instead of
+  starting over. See `docs/long-tasks.md`.
 - **Stopping a turn keeps what was produced.** Cancelling the request persists
-  the partial answer, so it is still there after a reload.
+  the partial answer and the steps already taken, so it is still there after a
+  reload.
 - **Disconnecting does not lose the answer.** Persistence runs on its own
   context, not the request's.
 - **Reasoning and tool metadata are never replayed to the model** on later
   turns — they are display-only. Replaying an assistant tool call without its
   paired result is what makes providers reject a request.
 - The first message auto-titles an untitled session.
+
+Stored assistant rows carry `content` (the answer), `reasoning` (the turn's whole
+thinking), `tool_calls` (a flat list of every call, for the audit and the
+statistics) and `steps` — a JSON array of `{index, reasoning, text, tools[]}`
+where `text` of the last step is the answer and every earlier one is process. A
+row written before `steps` existed reads back with it empty, and the console
+rebuilds a single process block from `reasoning` + `tool_calls`.
 
 ### Asking the user (the `ask_user` card)
 
@@ -749,6 +812,13 @@ exist for a script, but the console has no control for them.
 - **Token counts show 0 in chat** — usage must be requested on the stream
   (`stream_options.include_usage`); the shipped provider sets it, so a provider
   that ignores it will report none.
+- **任务看板 never appears** — no plan exists yet (the model only creates one for
+  a task it judges multi-step), or `chat.plan.enable` is false. A model that
+  narrates a plan in prose instead of calling `plan_create` is a prompt problem,
+  not a console one.
+- **继续执行 answers 400** — the last turn finished normally *and* the plan has no
+  unfinished task (`skipped` counts as finished). The response says so; it is not
+  a failure.
 - **链路追踪 says disabled** — tracing is on by default, so this means the store
   was not wired; check the server log for `trace store enabled`.
 - **A message has no 链路 button** — that turn recorded no trace (the answer is

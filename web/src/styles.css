@@ -417,6 +417,22 @@ samp {
   color: var(--muted-foreground);
 }
 
+/* 生成中 — a turn running in a conversation the reader is not looking at. It
+   replaces the timestamp while it lasts: "just now" and "generating" describe
+   the same moment, and only one of them is worth reading. */
+.session-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--foreground);
+}
+.session-live .spin {
+  width: 10px;
+  height: 10px;
+  border-width: 1.5px;
+  vertical-align: 0;
+}
+
 /* Row actions (重命名 / 清空 / 删除) are overlays, so revealing them never
    reflows the list. They are hidden with `visibility: hidden` — not merely
    transparent, so a click cannot land on an invisible button and
@@ -1385,6 +1401,12 @@ table.data tbody tr.selected {
   min-height: 0;
   height: 100%;
   min-width: 0;
+  /* One column width for everything that reads as "the conversation": the
+     messages, the plan dock above the composer and the composer itself. They
+     used to be capped at 900px each, which left a third of a wide window empty
+     on both sides; the column now follows the window up to a readable ceiling,
+     so the answer, its tool rows and the input box share the same edges. */
+  --chat-col: 1180px;
 }
 
 .chat-head {
@@ -1399,6 +1421,18 @@ table.data tbody tr.selected {
 
 .chat-title-wrap {
   flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* The conversation's totals in the header (轮数 / 模型调用 / 工具调用 / token).
+   A flex row rather than one string so each number keeps its own hover
+   explanation, and it wraps between segments — never inside one — on a narrow
+   window. */
+.chat-stats {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 6px;
   min-width: 0;
 }
 
@@ -1462,7 +1496,7 @@ table.data tbody tr.selected {
   flex-direction: column;
   gap: 18px;
   width: 100%;
-  max-width: 900px;
+  max-width: var(--chat-col);
   margin: 0 auto;
 }
 
@@ -1562,33 +1596,193 @@ table.data tbody tr.selected {
   overflow-wrap: anywhere;
 }
 
-/* 思考过程 panel: a quiet hairline, scrolls on its own. */
-.reason {
-  margin: 2px 0 8px;
-  padding-left: 10px;
-  border-left: 2px solid var(--border);
+/* 步骤级重试（第 2/3 次尝试…）: 同一份列表里的一句话，但语气不同——它要解释
+   刚才那段文字为什么变短了。--warning 而不是 --warning-soft：后者只给边框和
+   图标用，小字正文在气泡底色上不保证对比度。 */
+.turn-notices li.note-retry {
+  color: var(--warning);
 }
 
-.reason-head {
+/* ------------------------------------------------------- turn steps -- */
+/* 处理过程: one block per iteration of a turn, drawn above the answer. A step is
+   the unit a reader thinks in ("what did it want to do here"), so the block holds
+   that step's thinking and the tools it ran, and the whole run of blocks folds
+   away once the answer lands.
+
+   The sequence is carried by each step's own #N label; there is deliberately no
+   rule down the left of the list or of a step, because both of them only took
+   width away from the reasoning and the tool rows. */
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0 10px;
+}
+
+/* 执行过程 的折叠头：一行数字，收起时它就是整个过程。
+   它是这一块唯一的入口，所以形状像 .step-head（同一个视觉语言：文字高度的行、
+   悬停染色、不换行），但比它重一点——它代表整轮工作，而且折叠后是答案上方唯一
+   的一行。 */
+.steps-head {
   appearance: none;
   border: none;
   background: none;
-  display: inline-flex;
+  width: 100%;
+  display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 0;
+  gap: 7px;
+  min-height: 24px;
+  padding: 2px 4px 2px 2px;
+  border-radius: var(--radius-xs);
   font-size: 12.5px;
   color: var(--muted-strong);
   text-align: left;
+  min-width: 0;
+  overflow: hidden;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
 }
 
-.reason-head:hover {
+.steps-head:hover {
+  background: var(--muted);
   color: var(--foreground);
 }
 
-/* 思考过程 panel body: rendered markdown (MarkdownText, .md.reason-body), so it
-   is a block of HTML — no white-space: pre-wrap here, the renderer's breaks:true
-   already turns single newlines into <br>. */
+.steps-head:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+/* 展开时把标题压成次级色：那一刻读者的注意力该在下面的过程上，而不是这行控制
+   上——收起时才反过来。 */
+.steps-head-open .steps-title {
+  color: var(--muted-strong);
+}
+
+.steps-title {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+/* 两个计数：等宽 + 表格数字，所以模型每次改动数字时这一行不会左右抖。 */
+.steps-count {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-foreground);
+}
+
+.steps-count:first-of-type {
+  margin-left: 2px;
+}
+
+/* 展开后的过程本体。它自己不再有边框：折叠头已经界定了这一块，内外两条线只会
+   把过程挤窄。 */
+.steps-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.step {
+  min-width: 0;
+}
+
+/* The header is the only thing visible about a folded step, so it is a text-height
+   row that never wraps: the tool names ellipsize instead of growing the block. */
+.step-head {
+  appearance: none;
+  border: none;
+  background: none;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 22px;
+  padding: 2px 4px 2px 2px;
+  border-radius: var(--radius-xs);
+  font-size: 12.5px;
+  color: var(--muted-strong);
+  text-align: left;
+  min-width: 0;
+  overflow: hidden;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.step-head:hover {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+.step-head:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+/* A step that ran no tools has nothing to fold — the answering step, usually —
+   so its header is a label rather than a control: it keeps the row's geometry so
+   the steps still line up, and drops the affordances that promise a click. */
+.step-head-plain {
+  cursor: default;
+}
+
+.step-head-plain:hover {
+  background: none;
+  color: var(--muted-strong);
+}
+
+/* The step's number, as `#1` rather than "步骤 1": the word said nothing the
+   number does not, and it was the widest thing in every step row. Mono and
+   tabular so the numbers still line up down the column, quiet enough not to
+   compete with the tool summary beside it. */
+.step-no {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.step-what {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The step's contents, indented just enough to read as belonging to the header
+   above them. No rule down the left any more: the #N label already says which
+   step this is, and two vertical lines (one per step, one around all of them)
+   only ate the width the thinking and the tool rows need. */
+.step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 2px 0 6px;
+  padding-left: 2px;
+}
+
+/* What the step said before acting: the model's own words, kept out of the answer
+   because they were a preamble to the tool call below them. Smaller and quieter
+   than the answer, which is what a reader is here for. */
+.step-said {
+  color: var(--muted-strong);
+  font-size: 12.5px;
+}
+
+/* 思考过程 body: rendered markdown (MarkdownText, .md.reason-body), so it is a
+   block of HTML — no white-space: pre-wrap here, the renderer's breaks:true
+   already turns single newlines into <br>. It is capped and scrolls: a reasoning
+   model can think for pages, and the step around it must not become the page. */
 .reason-body {
   margin-top: 5px;
   padding: 9px 11px;
@@ -1903,6 +2097,193 @@ table.data tbody tr.selected {
   font-weight: 600;
 }
 
+/* --------------------------------------------------------- 任务看板 --- */
+
+/* 模型执行长任务时的计划，贴在输入框正上方（也就是 .chat-scroll 与 .composer
+   之间）。它和输入框用同一套宽度与内边距，于是两块的左边缘对齐，读起来是同一个
+   "输入区"——看板唯一的操作（继续执行）也就在手边。
+
+   高度是这里最要紧的约束：看板是常驻的，它高一点，消息区就少一点。所以整块默认
+   不超过约 180px，条目多了在组列表内部滚动。 */
+.plan-dock {
+  flex: 0 0 auto;
+  padding: 8px 18px 0;
+  background: var(--background);
+}
+
+/* 借用 .card 的观感（这个文件里 .card 的 padding 太大，这里收紧成一行头部的高度）。 */
+.plan {
+  width: 100%;
+  max-width: var(--chat-col);
+  margin: 0 auto;
+  padding: 8px 12px;
+}
+
+.plan-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+.plan-head > .ico {
+  flex: 0 0 auto;
+  color: var(--muted-foreground);
+}
+
+/* 目标只有一行且会被省略：一个很长的目标不该把看板撑高。完整文本在 title 里。
+   min-width 是"再窄也要留几个字"的下限，否则窄屏上目标会被进度条和按钮挤没。 */
+.plan-goal {
+  flex: 0 1 auto;
+  min-width: 48px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.plan-count {
+  flex: 0 0 auto;
+  color: var(--muted-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 细进度条：4px 高，比头部文字还矮，它只是"还剩多少"的一个视觉锚点。 */
+.plan-bar {
+  flex: 0 1 96px;
+  min-width: 40px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--muted);
+  overflow: hidden;
+}
+
+.plan-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--success);
+  transition: width 0.2s ease;
+}
+
+/* 折叠态：这一行就是全部信息，所以摘要占掉弹性的空间并省略。 */
+.plan-headline {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted-foreground);
+}
+
+/* 三个分组。这里的高度上限加上头部一行，决定了整块看板的高度：8(dock) + 8 + 约 27
+   (头部，由 .btn.sm 撑起) + 6 + 120 + 8 ≈ 177px，留在"约 180px"以内。 */
+.plan-groups {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.plan-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--muted-foreground);
+}
+
+.plan-group-count {
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-list {
+  list-style: none;
+  margin: 3px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+}
+
+/* 一条任务：色点 + 标题 +（失败标记）+（备注）。整条一行，长的部分省略——看板的
+   每一行都不该因为一句很长的备注变成两行。 */
+.plan-item {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+.plan-dot {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+}
+
+.plan-dot.done {
+  border-color: var(--success);
+  background: var(--success);
+}
+
+/* 正在做的那一项：亮一点、呼吸一下。动效只为了让"它在动"这件事看得出来，
+   所以幅度极小，并且在 prefers-reduced-motion 下会被全站那条规则关掉。 */
+.plan-dot.doing {
+  border-color: var(--info);
+  background: var(--info);
+  animation: plan-pulse 1.4s ease-in-out infinite;
+}
+
+.plan-dot.failed {
+  border-color: var(--destructive);
+  background: var(--destructive);
+}
+
+@keyframes plan-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.plan-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 已跳过的任务不删掉，只是划掉：它还是"计划里曾经有这件事"的证据。 */
+.plan-item.skipped .plan-title {
+  color: var(--muted-foreground);
+  text-decoration: line-through;
+}
+
+/* 备注（多半是失败原因）是次级信息，但失败的备注本身就是要看的东西，所以用
+   destructive 色；其余状态用次级文字色。 */
+.plan-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+
+.plan-item.failed .plan-note {
+  color: var(--destructive);
+}
+
 /* Composer: one integrated container — textarea on top, model picker at the
    bottom-left, send button at the bottom-right — pinned at the bottom of the
    chat column and never scrolled away. */
@@ -1917,7 +2298,7 @@ table.data tbody tr.selected {
   flex-direction: column;
   gap: 4px;
   width: 100%;
-  max-width: 900px;
+  max-width: var(--chat-col);
   margin: 0 auto;
   padding: 8px 8px 7px 12px;
   background: var(--card);
@@ -3707,6 +4088,7 @@ table.data tbody tr.row-click:focus-visible {
   }
 
   .chat-scroll,
+  .plan-dock,
   .composer {
     padding-left: 12px;
     padding-right: 12px;
@@ -4380,4 +4762,179 @@ table.data tbody tr.row-click:focus-visible {
   .jobs-backdrop {
     display: none;
   }
+}
+
+/* ------------------------------------------------------------ approval card -- */
+
+/* The approval gate's card. It sits directly above the composer, because the turn
+   is blocked on it: a decision that had to be scrolled to delays the turn. */
+.approval-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
+.approval-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+/* What the card is about to do decides its colour: a command can do anything the
+   process user can, a write is narrower, and a settled card stops shouting. */
+.approval-card.tone-warn {
+  border-color: var(--warning, var(--border-strong));
+}
+
+.approval-card.tone-blue {
+  border-color: var(--primary);
+}
+
+.approval-card.tone-ok,
+.approval-card.tone-warn:has(.approval-outcome) {
+  border-color: var(--border);
+}
+
+.approval-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted-strong);
+  min-height: 20px;
+}
+
+.approval-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+/* The summary keeps its own line breaks: a command is shown as the model wrote
+   it, because wrapping rules must not be what hides an argument. */
+.approval-summary {
+  font-size: 13.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* The preview is bounded by the server, so it can be shown without a scroller of
+   its own: a card that scrolls is a card nobody reads. */
+.approval-preview {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--code-bg, var(--muted));
+  border-radius: calc(var(--radius) - 2px);
+}
+
+.approval-line {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.approval-line.kind-add {
+  color: var(--ok, inherit);
+}
+
+.approval-line.kind-del {
+  color: var(--danger, inherit);
+}
+
+.approval-line.kind-meta {
+  color: var(--muted-foreground);
+}
+
+.approval-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.approval-reason {
+  flex: 1 1 260px;
+  min-width: 200px;
+}
+
+.approval-outcome {
+  font-size: 12.5px;
+  color: var(--muted-foreground);
+}
+
+.approval-outcome.refused {
+  color: var(--danger, inherit);
+}
+
+.approval-error {
+  font-size: 12.5px;
+  color: var(--danger, inherit);
+}
+
+/* ---------------------------------------------------- nested subagent work -- */
+
+/* What a spawned agent did, listed on the card of the call that spawned it. It is
+   deliberately a plain list rather than a second conversation: the card exists to
+   stop looking like a hang, and a subagent's full transcript belongs in its own
+   trace. */
+.tool-nested {
+  margin: 4px 0 6px 20px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--border-strong);
+  background: var(--muted);
+  border-radius: 0 calc(var(--radius) - 2px) calc(var(--radius) - 2px) 0;
+}
+
+.tool-nested-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+  margin-bottom: 4px;
+}
+
+.tool-nested-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tool-nested-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.tool-nested-kind {
+  flex: 0 0 auto;
+  min-width: 28px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.tool-nested-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-nested-line.kind-tool .tool-nested-text {
+  color: var(--foreground);
+}
+
+.tool-nested-line.kind-reasoning .tool-nested-text {
+  color: var(--muted-foreground);
+  font-style: italic;
 }

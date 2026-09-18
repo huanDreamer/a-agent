@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -82,37 +83,83 @@ func newChatHarness(t *testing.T, turns [][]*schema.Message, tools *tool.Registr
 // sseEvent is one decoded SSE data frame.
 type sseEvent map[string]any
 
-// readSSE performs the streaming POST and returns every decoded event.
+// readSSE sends a message and returns the whole event stream of the turn it
+// starts.
+//
+// Sending and watching are two requests: POST hands the message to the turn hub
+// and returns, and GET attaches to the running turn. This does both, which is
+// what the console does — and because the attached stream replays the turn from
+// its first event, the events a caller sees here are exactly the ones the old
+// single-POST stream produced.
 func readSSE(t *testing.T, client *http.Client, url string, body any) []sseEvent {
 	t.Helper()
 
-	payload, err := json.Marshal(body)
-	if err != nil {
-		t.Fatalf("marshal body: %v", err)
+	resp := startTurn(t, client, url, body)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		t.Fatalf("start turn status = %d, want 202 (body: %s)", resp.StatusCode, buf.String())
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	return readTurnStream(t, client, strings.TrimSuffix(url, "/messages")+"/turn")
+}
+
+// startTurn posts a message and returns the response (body left open).
+func startTurn(t *testing.T, client *http.Client, url string, body any) *http.Response {
+	t.Helper()
+
+	var reader io.Reader
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+		reader = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, reader)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-
 	resp, err := client.Do(req)
 	if err != nil {
-		t.Fatalf("stream request: %v", err)
+		t.Fatalf("start turn: %v", err)
+	}
+	return resp
+}
+
+// readTurnStream attaches to a conversation's running turn and returns every
+// event until the turn ends.
+func readTurnStream(t *testing.T, client *http.Client, turnURL string) []sseEvent {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, turnURL, nil)
+	if err != nil {
+		t.Fatalf("new attach request: %v", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("attach request: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(resp.Body)
-		t.Fatalf("stream status = %d, want 200 (body: %s)", resp.StatusCode, buf.String())
+		t.Fatalf("attach status = %d, want 200 (body: %s)", resp.StatusCode, buf.String())
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
+	return scanSSE(t, resp.Body)
+}
+
+// scanSSE decodes data frames until the body ends.
+func scanSSE(t *testing.T, body io.Reader) []sseEvent {
+	t.Helper()
 
 	events := make([]sseEvent, 0, 16)
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -451,6 +498,142 @@ func TestChatStream_ToolCallAndResult(t *testing.T) {
 	stored := got.Messages[1].ToolCalls
 	if !strings.Contains(stored, "clock") {
 		t.Errorf("stored tool_calls = %q, want it to record the tool", stored)
+	}
+}
+
+// TestChatStream_PersistsSteps is the contract the console renders from: each
+// step's thinking has to come back next to the tool call it asked for, or a
+// reloaded conversation is once again a pile of cards above an unsegmented blob
+// of thought.
+func TestChatStream_PersistsSteps(t *testing.T) {
+	reg := tool.NewRegistry()
+	if err := reg.Register(&stubTool{name: "read", desc: "reads", run: func(context.Context, string) (string, error) {
+		return "file contents", nil
+	}}); err != nil {
+		t.Fatalf("register tool: %v", err)
+	}
+
+	h := newChatHarness(t, [][]*schema.Message{
+		{{Role: schema.Assistant,
+			ReasoningContent: "先看看文件",
+			Content:          "我先读一下这个文件。",
+			ToolCalls: []schema.ToolCall{{
+				ID: "c1", Type: "function",
+				Function: schema.FunctionCall{Name: "read", Arguments: `{"path":"a.txt"}`},
+			}}}},
+		{{Role: schema.Assistant, ReasoningContent: "看完了", Content: "文件里写着 hello"}},
+	}, reg)
+	h.login(t)
+	id := createSession(t, h)
+
+	events := readSSE(t, h.client, h.base+"/api/chat/sessions/"+id+"/messages",
+		map[string]string{"content": "a.txt 里是什么"})
+
+	// The boundary event is what lets a client keep the preamble out of the
+	// answer; without it the "我先读一下这个文件。" above would be glued onto the
+	// real answer.
+	boundary, ok := findEvent(events, "step_end")
+	if !ok {
+		t.Fatal("no step_end event; a client cannot tell process text from the answer")
+	}
+	if boundary["step"] != float64(1) || boundary["text"] != "我先读一下这个文件。" {
+		t.Errorf("step_end = %v, want step 1 carrying that step's text", boundary)
+	}
+
+	var got struct {
+		Messages []struct {
+			Role      string `json:"role"`
+			Content   string `json:"content"`
+			Reasoning string `json:"reasoning"`
+			ToolCalls string `json:"tool_calls"`
+			Steps     string `json:"steps"`
+		} `json:"messages"`
+	}
+	h.getJSON(t, "/api/chat/sessions/"+id, http.StatusOK, &got)
+	if len(got.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(got.Messages))
+	}
+	asst := got.Messages[1]
+	if asst.Content != "文件里写着 hello" {
+		t.Errorf("stored answer = %q, want the model's own answer", asst.Content)
+	}
+	if asst.Steps == "" {
+		t.Fatal("no steps stored; the console cannot show the process step by step")
+	}
+
+	var steps []chat.Step
+	if err := json.Unmarshal([]byte(asst.Steps), &steps); err != nil {
+		t.Fatalf("steps is not valid JSON (%v): %s", err, asst.Steps)
+	}
+	if len(steps) != 2 {
+		t.Fatalf("steps = %d, want 2 (tool round + answer): %s", len(steps), asst.Steps)
+	}
+	first := steps[0]
+	if first.Index != 1 || first.Reasoning != "先看看文件" || first.Text != "我先读一下这个文件。" {
+		t.Errorf("step 1 = %+v", first)
+	}
+	if len(first.Tools) != 1 || first.Tools[0].Name != "read" || first.Tools[0].Result != "file contents" {
+		t.Errorf("step 1 tools = %+v, want the read call with its result", first.Tools)
+	}
+	if first.Tools[0].Step != 1 {
+		t.Errorf("step 1 tool carries step %d, want 1", first.Tools[0].Step)
+	}
+	second := steps[1]
+	if second.Index != 2 || second.Reasoning != "看完了" || second.Text != "文件里写着 hello" {
+		t.Errorf("step 2 = %+v", second)
+	}
+	if len(second.Tools) != 0 {
+		t.Errorf("step 2 tools = %+v, want none (it answered)", second.Tools)
+	}
+
+	// The old columns are still written: the audit view, the session statistics
+	// and older clients read them.
+	if !strings.Contains(asst.ToolCalls, "read") {
+		t.Errorf("tool_calls = %q, want the flat list kept", asst.ToolCalls)
+	}
+	if asst.Reasoning != "先看看文件看完了" {
+		t.Errorf("reasoning = %q, want the whole turn's thinking kept", asst.Reasoning)
+	}
+}
+
+// TestTurnAccumulator_KeepsStepsWhenTheTurnEndsEarly: a turn that was stopped or
+// that failed mid-flight is exactly the turn whose process a reader wants, so the
+// steps already taken must survive without the runner's own plan.
+func TestTurnAccumulator_KeepsStepsWhenTheTurnEndsEarly(t *testing.T) {
+	acc := &turnAccumulator{}
+	for _, e := range []chat.Event{
+		{Type: chat.EventStepStart, Step: 1},
+		{Type: chat.EventReasoningDelta, Step: 1, Text: "想想"},
+		{Type: chat.EventTextDelta, Step: 1, Text: "先跑一下"},
+		{Type: chat.EventToolCall, Step: 1, ToolCallID: "c1", ToolName: "bash", ToolArgs: `{"cmd":"ls"}`},
+		{Type: chat.EventStepEnd, Step: 1, Text: "先跑一下"},
+		{Type: chat.EventToolResult, Step: 1, ToolCallID: "c1", ToolResult: "a.txt", DurationMs: 5},
+		{Type: chat.EventError, Error: "本轮已被停止，回答不完整"},
+	} {
+		acc.add(e)
+	}
+
+	got := acc.summary(nil)
+	if len(got.plan) != 1 {
+		t.Fatalf("plan = %+v, want the one step that ran", got.plan)
+	}
+	step := got.plan[0]
+	if step.Reasoning != "想想" || step.Text != "先跑一下" {
+		t.Errorf("step = %+v", step)
+	}
+	if len(step.Tools) != 1 {
+		t.Fatalf("step tools = %+v, want the tool call", step.Tools)
+	}
+	// The result has to be folded into the step, not only into the flat list:
+	// otherwise a stopped turn shows a tool card with no output.
+	if step.Tools[0].Result != "a.txt" || step.Tools[0].DurationMs != 5 {
+		t.Errorf("step tool = %+v, want its result and duration", step.Tools[0])
+	}
+	// A step that names no step index still belongs to the newest step rather
+	// than opening a phantom one ahead of it.
+	acc.add(chat.Event{Type: chat.EventTextDelta, Text: "没有 step 字段"})
+	if got := acc.summary(nil); len(got.plan) != 1 {
+		t.Errorf("plan grew to %d steps for a stepless delta", len(got.plan))
 	}
 }
 

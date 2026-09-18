@@ -54,6 +54,17 @@ type ChatMessage struct {
 	Reasoning string `json:"reasoning,omitempty"`
 	// ToolCalls is the raw JSON array of tool calls the assistant requested.
 	ToolCalls string `json:"tool_calls,omitempty"`
+	// Steps is the raw JSON array of the turn's iterations — each one's
+	// reasoning, the text it produced, and the tool calls it asked for (added in
+	// migration 13).
+	//
+	// It is what the console renders, because it is the only field that says
+	// which thought belongs to which tool call. It is carried as a JSON string
+	// like its siblings (the column is text, and a client parses it
+	// defensively), and an empty value means "no step information": a row written
+	// before the column existed, which the console rebuilds from Reasoning and
+	// ToolCalls.
+	Steps string `json:"steps,omitempty"`
 	// ToolCallID and ToolName identify a tool-result message.
 	ToolCallID string `json:"tool_call_id,omitempty"`
 	ToolName   string `json:"tool_name,omitempty"`
@@ -282,9 +293,9 @@ func (s *sqliteStore) AppendChatMessage(ctx context.Context, sessionID string, m
 	}
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO chat_messages
-		  (session_id, role, content, reasoning, tool_calls, tool_call_id, tool_name, usage_json, error, attachments, trace_id, stop_reason, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, m.Role, m.Content, m.Reasoning, m.ToolCalls,
+		  (session_id, role, content, reasoning, tool_calls, steps, tool_call_id, tool_name, usage_json, error, attachments, trace_id, stop_reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sessionID, m.Role, m.Content, m.Reasoning, m.ToolCalls, m.Steps,
 		m.ToolCallID, m.ToolName, m.UsageJSON, m.Error, m.Attachments, m.TraceID, m.StopReason, m.CreatedAt)
 	if err != nil {
 		return 0, fmt.Errorf("insert chat message: %w", err)
@@ -299,7 +310,7 @@ func (s *sqliteStore) AppendChatMessage(ctx context.Context, sessionID string, m
 // ListChatMessages returns a session's messages oldest first. limit <= 0 means
 // no limit.
 func (s *sqliteStore) ListChatMessages(ctx context.Context, sessionID string, limit int) ([]ChatMessage, error) {
-	q := `SELECT id, role, content, reasoning, tool_calls, tool_call_id, tool_name,
+	q := `SELECT id, role, content, reasoning, tool_calls, steps, tool_call_id, tool_name,
 	             usage_json, error, attachments, trace_id, stop_reason, created_at
 	      FROM chat_messages WHERE session_id = ? ORDER BY id ASC`
 	args := []any{sessionID}
@@ -318,7 +329,7 @@ func (s *sqliteStore) ListChatMessages(ctx context.Context, sessionID string, li
 	for rows.Next() {
 		var m ChatMessage
 		var created sql.NullTime
-		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.Reasoning, &m.ToolCalls,
+		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.Reasoning, &m.ToolCalls, &m.Steps,
 			&m.ToolCallID, &m.ToolName, &m.UsageJSON, &m.Error, &m.Attachments, &m.TraceID,
 			&m.StopReason, &created); err != nil {
 			return nil, fmt.Errorf("scan chat message: %w", err)

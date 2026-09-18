@@ -83,6 +83,26 @@ func (b turnBudget) expired(started time.Time, res *Result) string {
 	return ""
 }
 
+// retryShare is the longest a retry wait may be, given what is left of the
+// turn's wall clock: a step that has 4s of budget left must not sleep out a 20s
+// backoff and hand back a turn that is minutes past its deadline.
+//
+// The wait is measured from the moment the step started rather than from each
+// retry, which is deliberate: the budget is enforced between steps (see expired),
+// so the honest bound is "what was left when this step began", not a number that
+// shrinks as attempts of unknown length consume it. An unlimited turn (deadline
+// 0) gets 0, which means "the policy's own cap".
+func (b turnBudget) retryShare(started time.Time) time.Duration {
+	if b.deadline <= 0 {
+		return 0
+	}
+	left := b.deadline - time.Since(started)
+	if left < 0 {
+		return 0
+	}
+	return left
+}
+
 // stopNote is the sentence that explains a budget stop: what was hit, what it
 // cost, and what the user can do about it. It is deliberately specific — "the
 // answer may be incomplete" without "you hit the 12-step cap" leaves the reader

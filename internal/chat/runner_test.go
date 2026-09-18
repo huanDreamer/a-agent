@@ -1089,6 +1089,200 @@ func TestRun_ReasoningAccumulatesAcrossSteps(t *testing.T) {
 	}
 }
 
+// TestRun_PlanPairsEachThoughtWithItsTools is the whole point of the plan: a
+// reader must be able to say which reasoning asked for which tool call, which a
+// flat list of tool runs and one concatenated block of reasoning cannot express.
+func TestRun_PlanPairsEachThoughtWithItsTools(t *testing.T) {
+	ran := []string{}
+	tl := &fakeTool{name: "read", desc: "d", run: func(ctx context.Context, args string) (string, error) {
+		ran = append(ran, args)
+		return "content of " + args, nil
+	}}
+	m := &fakeModel{turns: []*schema.Message{
+		{Role: schema.Assistant,
+			ReasoningContent: "先看 a", Content: "我先读一下 a。",
+			ToolCalls: []schema.ToolCall{{ID: "c1", Type: "function",
+				Function: schema.FunctionCall{Name: "read", Arguments: "a.txt"}}}},
+		{Role: schema.Assistant,
+			ReasoningContent: "再看 b",
+			ToolCalls: []schema.ToolCall{{ID: "c2", Type: "function",
+				Function: schema.FunctionCall{Name: "read", Arguments: "b.txt"}}}},
+		{Role: schema.Assistant, ReasoningContent: "可以答了", Content: "答案是 42"},
+	}}
+	r, _ := New(Config{Model: m, Tools: newRegistry(t, tl), Logger: zap.NewNop()})
+
+	_, emit := collect()
+	res, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "go"}},
+	}, emit)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(res.Plan) != 3 {
+		t.Fatalf("Plan has %d steps, want 3: %+v", len(res.Plan), res.Plan)
+	}
+	want := []struct {
+		index     int
+		reasoning string
+		text      string
+		tool      string
+	}{
+		{1, "先看 a", "我先读一下 a。", "a.txt"},
+		{2, "再看 b", "", "b.txt"},
+		{3, "可以答了", "答案是 42", ""},
+	}
+	for i, w := range want {
+		got := res.Plan[i]
+		if got.Index != w.index {
+			t.Errorf("step %d Index = %d, want %d", i, got.Index, w.index)
+		}
+		if got.Reasoning != w.reasoning {
+			t.Errorf("step %d Reasoning = %q, want %q", w.index, got.Reasoning, w.reasoning)
+		}
+		if got.Text != w.text {
+			t.Errorf("step %d Text = %q, want %q", w.index, got.Text, w.text)
+		}
+		if w.tool == "" {
+			if len(got.Tools) != 0 {
+				t.Errorf("step %d has %d tools, want none (it answered)", w.index, len(got.Tools))
+			}
+			continue
+		}
+		if len(got.Tools) != 1 || got.Tools[0].Args != w.tool {
+			t.Fatalf("step %d tools = %+v, want the call with args %q", w.index, got.Tools, w.tool)
+		}
+		if got.Tools[0].Step != w.index {
+			t.Errorf("tool in step %d carries Step = %d", w.index, got.Tools[0].Step)
+		}
+		if !strings.Contains(got.Tools[0].Result, w.tool) {
+			t.Errorf("step %d tool result = %q, want the tool's output", w.index, got.Tools[0].Result)
+		}
+	}
+	// The flat list is still filled, and now says which step each run came from.
+	if len(res.Tools) != 2 || res.Tools[0].Step != 1 || res.Tools[1].Step != 2 {
+		t.Errorf("Tools = %+v, want two runs tagged 1 and 2", res.Tools)
+	}
+	if len(ran) != 2 {
+		t.Errorf("the tool ran %d times, want 2", len(ran))
+	}
+}
+
+// TestRun_StepEndAnnouncesTheActionBoundary pins the event a client needs in
+// order to keep a preamble out of the answer: it has to arrive after that step's
+// text and before the tool call, and it must not mark the answering step.
+func TestRun_StepEndAnnouncesTheActionBoundary(t *testing.T) {
+	tl := &fakeTool{name: "act", desc: "d", run: func(context.Context, string) (string, error) {
+		return "ok", nil
+	}}
+	m := &fakeModel{turns: []*schema.Message{
+		{Role: schema.Assistant, Content: "我先动手。", ToolCalls: []schema.ToolCall{{
+			ID: "c1", Function: schema.FunctionCall{Name: "act", Arguments: "{}"},
+		}}},
+		{Role: schema.Assistant, Content: "做完了"},
+	}}
+	r, _ := New(Config{Model: m, Tools: newRegistry(t, tl), Logger: zap.NewNop()})
+
+	events, emit := collect()
+	if _, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "go"}},
+	}, emit); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var ends []Event
+	var callIdx = -1
+	for i, e := range *events {
+		switch e.Type {
+		case EventStepEnd:
+			ends = append(ends, e)
+		case EventToolCall:
+			callIdx = i
+		}
+	}
+	if len(ends) != 1 {
+		t.Fatalf("step_end emitted %d times, want once (the answering step must not emit it)", len(ends))
+	}
+	if ends[0].Step != 1 || ends[0].Text != "我先动手。" {
+		t.Errorf("step_end = %+v, want step 1 carrying its text", ends[0])
+	}
+	if stepEndIdx := indexOfType(*events, EventStepEnd); stepEndIdx > callIdx {
+		t.Errorf("step_end at %d came after the tool call at %d", stepEndIdx, callIdx)
+	}
+}
+
+// indexOfType returns the index of the first event of that type, or -1.
+func indexOfType(events []Event, t EventType) int {
+	for i, e := range events {
+		if e.Type == t {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestRun_DirectAnswerHasOneStepAndNoStepEnd: a model that just answers has no
+// process to fold up, and nothing to announce as an action boundary.
+func TestRun_DirectAnswerHasOneStepAndNoStepEnd(t *testing.T) {
+	m := &fakeModel{turns: []*schema.Message{{Role: schema.Assistant, Content: "hi"}}}
+	r, _ := New(Config{Model: m, Logger: zap.NewNop()})
+
+	events, emit := collect()
+	res, err := r.Run(context.Background(), Request{
+		Messages: []*schema.Message{{Role: schema.User, Content: "x"}},
+	}, emit)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if indexOfType(*events, EventStepEnd) >= 0 {
+		t.Error("a direct answer emitted step_end; there is no action to announce")
+	}
+	if len(res.Plan) != 1 || res.Plan[0].Text != "hi" || len(res.Plan[0].Tools) != 0 {
+		t.Errorf("Plan = %+v, want one step holding the answer", res.Plan)
+	}
+}
+
+// TestStepsHaveTools: the fold-up affordance exists only when something ran.
+func TestStepsHaveTools(t *testing.T) {
+	if StepsHaveTools(nil) {
+		t.Error("no steps have tools")
+	}
+	if StepsHaveTools([]Step{{Index: 1, Reasoning: "thought"}}) {
+		t.Error("a step that only thought has no tools")
+	}
+	if !StepsHaveTools([]Step{{Index: 1}, {Index: 2, Tools: []ToolRun{{ID: "c", Name: "t"}}}}) {
+		t.Error("a step with a tool call must be reported")
+	}
+}
+
+// TestStep_JSONShapeIsSnakeCase: the plan is stored with the answer and served
+// to the UI, so its field names are part of the API.
+func TestStep_JSONShapeIsSnakeCase(t *testing.T) {
+	b, err := json.Marshal([]Step{{
+		Index: 2, Reasoning: "why", Text: "doing it",
+		Tools: []ToolRun{{ID: "c1", Name: "t", Args: "{}", Result: "ok", Step: 2}},
+	}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(b)
+	for _, want := range []string{`"index":2`, `"reasoning":"why"`, `"text":"doing it"`,
+		`"tools":[`, `"step":2`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("JSON %s is missing %s", got, want)
+		}
+	}
+	// A step with nothing to say is still a step: index is never omitted, or a
+	// client could not order what it received.
+	b2, err := json.Marshal([]Step{{Index: 1}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b2) != `[{"index":1}]` {
+		t.Errorf("empty step = %s, want just its index", b2)
+	}
+}
+
 func TestRun_TracerRecordsToolSpans(t *testing.T) {
 	tl := &fakeTool{name: "spanned", desc: "d", run: func(context.Context, string) (string, error) {
 		return "out", nil

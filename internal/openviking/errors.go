@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 )
 
@@ -93,6 +94,43 @@ func IsUnavailable(err error) bool {
 	// A transport error wrapped with a status (rare) is still a transport error.
 	var netErr net.Error
 	return errors.As(apiErr.cause, &netErr)
+}
+
+// IsIndexWaitTimeout reports whether err means "the content was accepted, but
+// the asynchronous index queue did not drain inside the budget we allowed".
+//
+// It exists because OpenViking writes the file *before* it waits for indexing,
+// so a waited write that runs out of time is not a lost write: the document is
+// there and searchable a moment later. Two shapes reach here, and they are not
+// equally certain:
+//
+//   - The server's own 504 DEADLINE_EXCEEDED. Definitive — it only answers
+//     that after the content is already on disk.
+//   - A client-side transport timeout. Ambiguous: the request may not have
+//     been seen at all, so a caller that cares must confirm with a read rather
+//     than trust this.
+//
+// Callers must therefore treat a true result as "maybe saved", never as
+// "saved". IsUnavailable also reports true for both shapes; this is the
+// narrower question.
+func IsIndexWaitTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return errors.Is(err, context.DeadlineExceeded)
+	}
+	if apiErr.Status == http.StatusGatewayTimeout || apiErr.Status == http.StatusRequestTimeout {
+		return true
+	}
+	if strings.EqualFold(strings.ReplaceAll(apiErr.Code, "_", ""), "deadlineexceeded") {
+		return true
+	}
+	// url.Error (and most transport errors) implement net.Error; only the
+	// timeout flavour means "we stopped waiting", which is what matters here.
+	var netErr net.Error
+	return errors.As(apiErr.cause, &netErr) && netErr.Timeout()
 }
 
 // IsNotFound reports whether err is OpenViking saying the resource does not

@@ -8,7 +8,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check:ui": "node scripts/check-component-bindings.mjs && vite build --config ssr-probe/vite.config.js && node ssr-probe/run.mjs"
+    "check:ui": "node scripts/check-component-bindings.mjs && node scripts/check-budget.mjs && node scripts/check-stats.mjs && vite build --config ssr-probe/vite.config.js && node ssr-probe/run.mjs",
+    "check:budget": "node scripts/check-budget.mjs",
+    "check:stats": "node scripts/check-stats.mjs"
   },
   "dependencies": {
     "dompurify": "^3.4.15",

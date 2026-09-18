@@ -21,7 +21,7 @@ Vue 3 + Vite 单页应用，构建产物由 Go 服务端通过 `//go:embed` 嵌�
   会话结束后页面上的会话列表、SSE 流和缓存都不该留下）；本机免登录的访问者没有会话，所以也
   没有这个按钮。会话存在服务端内存里，**服务重启会清空会话**：此时任意请求返回 401，控制台
   回到登录页并说明是会话过期，而不是当成首次访问。
-- **对话**：会话列表 + 流式回答 + 工具卡片 + 附件（图片 / 音频）。
+- **对话**：会话列表 + 流式回答 + 工具卡片 + 附件（图片 / 音频）+ 输入框上方的**任务看板**。
 - **统计监控**：总览 / 按模型 / 按用户 / 调用记录 / 审计日志 / 链路追踪，六个 sub-tab。
 - **设置**：外观 / 模型 / MCP / OpenViking / 技能 / 服务与工具，六个 sub-tab —— 与
   统计监控同一套骨架（页头 + `.subtabs` + 单个滚动面板，当前分区存在
@@ -74,16 +74,25 @@ npm run check:ui      # 组件绑定守卫 + 渲染探针（见下）
   曾经因此一进页面就弹出来、并且关不掉。同一个陷阱的另一半是模板把 Boolean prop 当函数调用
   （`@click="open(...)"`），只在点击时才炸。两者都在这里静态检查。
 - `ssr-probe/`：把组件渲染成 HTML 并断言，例如「`open=false` 时不应该有对话框」「免登录的
-  侧栏不该出现『退出』」「首次访问不应自称会话过期」。它只覆盖首帧；**点击之后**的行为要靠
-  下面的浏览器验证。屏门的三个分支（免登录 / 需要登录 / 已登录 / 探针未返回）在这里按
-  `needsLogin` 的真值表断言 —— 这是整个控制台唯一一处「画哪个屏幕」的判断。
+  侧栏不该出现『退出』」「首次访问不应自称会话过期」「助手气泡默认把过程折叠成一行、答案在过程之下、老数据退化成
+  一个块」。它只覆盖首帧；**点击之后**的行为要靠下面的浏览器验证。屏门的三个分支（免登录 /
+  需要登录 / 已登录 / 探针未返回）在这里按 `needsLogin` 的真值表断言 —— 这是整个控制台唯一
+  一处「画哪个屏幕」的判断。
 
 更完整的浏览器验证（真实 Chrome + CDP，驱动真实服务端）：
 
 ```bash
+bash web/.verify/step-run.sh    # 一轮回答的步骤展示（24 项流程断言 + 21 项布局断言）
 bash web/.verify/ws-run.sh     # 工作区文件夹与目录选择器（26 项断言）
 bash web/.verify/mm-run.sh     # 模型管理与对话（既有）
 ```
+
+`step-run.sh` 值得单独说明一句：它跑一个脚本化的 OpenAI mock（`step-mock.mjs`，两步：
+思考 → 说明 → `list_dir`，再思考 → 回答），并且**把每段文字放慢到 200ms 以上**，因为
+「过程在生成时就是展开的」这条只能在一轮还没结束时看；只看结束态的话，「一边生成一边展示」
+和「结束后补渲染」长得一模一样。它之后还会跑 `step-layout.mjs`，用浏览器里的几何量断言
+折叠后的步骤标题是一行文字高、正文缩进在标题之下、答案始终在过程之下、暗色主题下颜色都
+解析得出来（用 canvas 采样，因为色值是 `oklch()`，正则会把 alpha 当成颜色分量）。
 
 `web/.verify/` 是本地验证脚本（已 gitignore），不参与构建。
 
@@ -173,6 +182,7 @@ internal/server/webui/dist/assets/index-<hash>.css
 | DELETE | `/api/chat/sessions/{id}`       | 删除会话                               |
 | POST   | `/api/chat/sessions/{id}/clear` | 清空消息（保留会话）                   |
 | POST   | `/api/chat/sessions/{id}/messages` | **SSE** 流式对话（见下）            |
+| POST   | `/api/chat/sessions/{id}/resume` | 接着上一轮的中断处续跑（202 + 与 messages 同形状的 turn；409 已有一轮在跑，400 没有可接续的东西） |
 | POST   | `/api/chat/sessions/{id}/questions/{qid}/answer` | 回答 `ask_user` 卡片 `{selected,text}` |
 | GET    | `/api/traces/status`            | 追踪开关 + 上报计数器                  |
 | GET    | `/api/traces`                   | trace 列表，`limit` / `page` / `session` / `user` / `name` |
@@ -195,13 +205,21 @@ internal/server/webui/dist/assets/index-<hash>.css
 停止按钮用 `AbortController` 中断请求，服务端仍会保存已经产出的内容，
 因此中断后重新加载依然能看到这一轮。
 
-**提问卡片（`ask_user` 事件）**：模型调用 `ask_user` 工具时会发出该事件，本轮**挂起**等待回答。
-事件有两种形态，用字段区分：带 `ask` 的是新问题（`ask_status: "pending"`，卡片出现，选项/自定义输入可用），
+**提问卡片（`ask_user` 事件）**：模型调用 `ask_user` 工具时会发出该事件，本轮**挂起**等待回答。事件有两种形态，用字段区分：带 `ask` 的是新问题（`ask_status: "pending"`，卡片出现，选项/自定义输入可用），
 带 `ask_id` 的是结局（`ask_status` 为 `answered` / `timeout` / `cancelled`，`answered` 时另有 `ask_answer`）。
 提交走上面那条独立的 POST —— 流式响应已经被这一轮的事件流占用，提交只能另开一个请求，问题 id 是两者的连接点。
 超时或本轮被中断（停止 / 刷新 / 关标签页）时模型收到「用户没有回答」并自行收口，卡片会显示对应说明；
 已经结束的问题再提交会得到 404，卡片据此改为「已取消」而不是反复失败。刷新后卡片由该轮 assistant 消息里
 持久化的工具调用（参数=问题、结果=答案）复原（`src/ask.js` 的 `askFromTool`）。
+
+**计划与重试（`plan` / `step_retry` 事件）**：`{"type":"plan","step":n,"plan":{…}|null}` 每次计划变更
+发一次，客户端把它归一化后放进 `chat.plan`，看板据此重画（计划不属于某一轮，所以事件落在 store
+上而不是这个 turn 上；刷新后由 `GET /api/chat/sessions/{id}` 的 `plan` 字段复原）。
+`{"type":"step_retry","step":n,"attempt":2,"max_attempts":3,"delay_ms":1600,"error":"unexpected EOF"}`
+表示**这一步**的模型调用失败、服务端马上重跑它：客户端必须把该 step 已经收到的 `text` / `reasoning`
+清空（本地 reducer 里 `turn.text` 也要回退，`turn.reasoning` 只回退被丢弃的那一段——前面几步的思考
+是真的发生过的事），并显示一行「第 2/3 次尝试，1.6s 后重试（unexpected EOF）」。不清空的话，重试后
+的答案会接在失败的那半截后面，看起来像模型自己重复了一遍。
 
 ### 链路追踪
 
@@ -242,6 +260,21 @@ trace 由服务端代理读取，浏览器不会拿到 Langfuse 的 secret key�
   96px 起，长到 260px 后内部滚动），下面一行左侧是 `provider / model` 下拉 chip、右侧是
   圆形 `--primary` 发送按钮（流式期间换成「停止」）。容器 `:focus-within` 时出现焦点环。
   输入框回车发送、Shift+Enter 换行，中文输入法组字期间回车不发送。
+- **任务看板贴在输入框正上方**（`TaskBoard.vue` + `src/plan.js`）：模型执行长任务时会用
+  `plan_create` / `plan_update` 建立并推进一份清单，看板把它实时画出来——目标（单行省略）+
+  进度 `n/m` + 细进度条 + 三组：**执行中**（`in_progress`）、**待执行**（`pending`，`failed`
+  也在这一组且标红并写出原因，`skipped` 划掉）、**已完成**（`done`）。没有计划（`plan` 为
+  `null`，含"计划里没有任务"）时整个组件不渲染。
+  它的位置是刻意的：计划属于"这一轮还没做完的事"，不属于消息历史——放进消息流会被新消息
+  推走。高度有上限（约 180px，条目多了组列表内部滚动），因为它是常驻的。分组顺序、进度、
+  一行摘要都是 `plan.js` 的纯函数（`normalizePlan` 容忍脏数据：未知 status 当待执行、缺 id
+  按序号补 `t1/t2`、没标题的整条丢掉），所以它们能在没有浏览器时被断言。
+  折叠状态（`chat.planCollapsed`）在 store 里，切标签页不会丢。
+- **「继续执行」出现在两个地方，条件是同一个**（计划还有未完成项、并且没有轮次在跑）：
+  看板头部右侧，以及**失败**的助手气泡上（与「重试」并列——重试是重发原话，继续执行是
+  接着上一轮的中断处跑，已经做完的步骤不会重做）。点击走 `POST .../resume`，与发消息同一
+  流程：先出现用户气泡「继续执行」，被拒绝（409 / 400）就把气泡撤掉并写出原因，绝不留下
+  一条其实没有发出去的消息。
 - **对话里不展示工具清单**：可用工具只在 设置 → 服务与工具 里作为只读信息列出，
   并且那是模型**真正**能调用的集合（内置 + MCP 服务器提供的 + `skill`）。
 - **助手回答的 Markdown**：`src/markdown.js` 的 `renderMarkdown()` 用 `marked`（GFM）解析、
@@ -261,10 +294,31 @@ trace 由服务端代理读取，浏览器不会拿到 Langfuse 的 secret key�
   输入串记忆化（`Map`，LRU 上限 80）。实测 5.6 KB 消息：冷渲染中位 0.9ms、p95 1.2ms，
   命中缓存 0.013ms（约 70 倍）。
 - **提问卡片（`AskUserCard.vue`）不经过 MarkdownText**：问题按纯文本插值（`white-space: pre-wrap`
-  保留换行）。这既是「唯一 `v-html` 出口」的收紧，也让卡片能被 SSR 探针渲染 —— `markdown.js` 在
-  import 阶段就调用 DOMPurify 的 DOM hook，没有 DOM 的 Node 环境会直接抛错，所以引用 `MarkdownText`
-  的组件（例如 `ChatMessage.vue`）无法被探针渲染，而这张卡片是覆盖到的（见 `ssr-probe/run.mjs`）。
+  保留换行）。这既是「唯一 `v-html` 出口」的收紧，也让卡片能被 SSR 探针渲染。步骤块里的
+  思考 / 过程文字走 MarkdownText，因此探针构建 `ssr-probe/` 时把 `MarkdownText.vue` 换成
+  `ssr-probe/markdowntext-stub.js`（纯文本渲染）—— 否则 `markdown.js` 会因为没有 DOM 在
+  import 阶段就抛错（见下条）。
   卡片的两种来源（实时事件、刷新后的工具调用）在 `src/ask.js` 里归一成同一个模型，组件只认这一个输入。
+- **`MarkdownText.vue` 在探针里被替换**：`src/markdown.js` 的 `renderMarkdown()` 会在净化之后
+  用 `document.createElement` 给代码块和表格加装饰，所以它无法在 Node 里渲染。探针要断言
+  的正是「一轮回答的结构」（`ChatMessage.vue` 的所有者），于是 `ssr-probe/vite.config.js`
+  把该组件别名到 `ssr-probe/markdowntext-stub.js`：同样的 props，纯文本渲染。全站唯一的
+  `v-html` 出口、净化规则和浏览器构建都不受影响。
+- **一轮回答按步骤渲染**（`ChatMessage.vue` + `src/steps.js`）：助手气泡 = 上面折叠起来的
+  「执行过程」+ 下面独立的答案。
+  - 折叠时只有一行：`执行过程 · N 次工具调用 · M 条消息`（外加失败标记与工具合计耗时）。
+    「M 条消息」就是这一轮的 ReAct 迭代数 —— 每次迭代对应一条 assistant 消息；两个计数与
+    下面能展开的内容同口径（`ask_user` 不算工具调用，它是卡片）。
+  - 展开后是每个 ReAct 步骤一块：标题是摘要行（跑了哪些工具、耗时），里面是该步的思考与
+    它说的话，工具卡片再各有一层折叠（长任务里卡片才是体积的大头）。
+  - 折叠规则在 `steps.js` 的 `processShouldBeOpen()`：跑着时展开、结束后折叠，读者点过之后
+    由读者说了算（`pinned`，只记这一次挂载）。所以「执行结束就把步骤和思考收起来、只看结果」
+    是默认行为，而不是需要点一下的状态。`step_end` 把该步文字标记为过程（不进入答案）。
+  - 步骤自身的状态（`open` / `touched`）挂在步骤对象上，所以 `steps.js` 的 `visibleSteps()`
+    返回的是调用方自己的对象、只派生「这一步显示哪些工具」，绝不复制 —— 复制会让点击落在
+    一次性的拷贝上（这个 bug 在浏览器验证里被发现过）。
+  老数据（migration 13 之前没有 `steps` 列）退化成「整轮一个块」：那份「哪句话促成了哪个
+  调用」的配对信息当时没有写下来，退化是如实陈述而不是渲染器的缺陷。
 - trace 瀑布流由 `src/components/TraceWaterfall.vue` 用普通 DOM + 百分比定位手写，
   缺失时间戳 / 时长为 0 / 父节点成环都退化为满宽或根节点，不会出现 NaN 宽度。
 - **不留白面板**：每个数据视图都有骨架屏、错误重试条和「暂无数据」空状态
@@ -291,6 +345,8 @@ web/
     ├── icons.js                   # 图标几何数据（Icon.vue 与代码块复制按钮共用）
     ├── chatStore.js               # 对话状态：会话列表、消息、流式一轮的生命周期
     ├── ask.js                     # ask_user 卡片模型（实时事件与历史工具调用归一）
+    ├── plan.js                    # 任务看板模型（计划归一化 / 分组 / 进度 / 摘要，纯函数）
+    ├── steps.js                   # 一轮回答的步骤模型（持久化 JSON / 实时事件归一 + 摘要与折叠规则）
     ├── theme.js                   # 跟随系统 / 亮色 / 暗色（localStorage + <html> 开关）
     ├── ui.js                      # 壳层 UI 状态（移动端抽屉）
     ├── styles.css                 # 全站设计令牌 + 样式（亮/暗两套，无字面色值）
@@ -315,9 +371,10 @@ web/
         ├── ByUserView.vue         # 按用户（子页）
         ├── RecentView.vue         # 调用记录（子页）
         ├── AuditView.vue          # 审计日志（子页）
-        ├── ChatView.vue           # 对话（细头部 + 满高消息区 + 固定输入框）
-        ├── ChatMessage.vue        # 消息气泡：思考过程 / 工具卡片 / 用量 / 复制
+        ├── ChatView.vue           # 对话（细头部 + 满高消息区 + 任务看板 + 固定输入框）
+        ├── ChatMessage.vue        # 消息气泡：步骤块（思考 + 工具卡片）/ 答案 / 用量 / 复制
         ├── ChatComposer.vue       # 一体化输入区（textarea + 模型下拉 + 发送/停止）
+        ├── TaskBoard.vue          # 任务看板（输入框上方：目标 + 进度 + 执行中/待执行/已完成 + 继续执行）
         ├── AskUserCard.vue        # 模型的提问卡片（选项 / 多选 / 自定义输入 / 提交 / 已答 / 超时）
         ├── MarkdownText.vue       # markdown 渲染（v-html 唯一出口 + 代码块复制委托）
         ├── JsonBlock.vue          # 可折叠 JSON（null 安全 + 截断）

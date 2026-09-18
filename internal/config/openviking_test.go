@@ -4,7 +4,42 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// The HTTP client timeout and the server-side index wait are not independent
+// knobs. When they were equal, every waited write on a machine where indexing
+// took longer than the budget failed with "context deadline exceeded
+// (Client.Timeout exceeded while awaiting headers)" instead of the server's own
+// 504 — the caller could not tell "saved but still indexing" from "never
+// arrived". No configuration may recreate that.
+func TestOpenVikingTimeoutAlwaysExceedsIndexWait(t *testing.T) {
+	cases := map[string]OpenVikingConfig{
+		"defaults":              {},
+		"legacy 15s timeout":    {TimeoutSeconds: 15, IndexWaitSeconds: 30},
+		"timeout below margin":  {TimeoutSeconds: 1, IndexWaitSeconds: 30},
+		"both explicit":         {TimeoutSeconds: 90, IndexWaitSeconds: 20},
+		"wait off, timeout set": {TimeoutSeconds: 5},
+	}
+	for name, ov := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got, floor := ov.Timeout(), ov.IndexWait(); got <= floor {
+				t.Errorf("Timeout() = %v, IndexWait() = %v; the client must outlast the server's wait", got, floor)
+			}
+		})
+	}
+}
+
+func TestOpenVikingIndexWaitDefault(t *testing.T) {
+	var ov OpenVikingConfig
+	if got, want := ov.IndexWait(), DefaultOpenVikingIndexWaitSeconds*time.Second; got != want {
+		t.Errorf("IndexWait() = %v, want %v", got, want)
+	}
+	ov.IndexWaitSeconds = 45
+	if got, want := ov.IndexWait(), 45*time.Second; got != want {
+		t.Errorf("IndexWait() = %v, want %v", got, want)
+	}
+}
 
 func TestOpenVikingDisabledByDefault(t *testing.T) {
 	cfg := Default()

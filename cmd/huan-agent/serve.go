@@ -25,6 +25,7 @@ import (
 	"github.com/huan/huan-agent/internal/metrics"
 	"github.com/huan/huan-agent/internal/obs"
 	"github.com/huan/huan-agent/internal/platform/feishu"
+	"github.com/huan/huan-agent/internal/prompt"
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/usage"
 	"github.com/huan/huan-agent/internal/workspaces"
@@ -561,12 +562,21 @@ func (h *botHandler) sendContinuations(ctx context.Context, in feishu.Inbound, r
 	return nil
 }
 
-// systemPrompt returns the default system prompt.
+// systemPrompt returns the system prompt for one Feishu conversation: the
+// operator's `chat.system_prompt` when it is set, otherwise the default — the
+// general-purpose agent prompt plus the Feishu section, which is where the model
+// is told that answers arrive as interactive cards, that an over-wide table is
+// split across messages, and that this chat has no ask_user card.
+//
+// The precedence lives in prompt.Effective so this bot and the console cannot
+// drift apart on it: an override replaces the built-in prompt (the Feishu
+// section included), and a blank one is the absence of an override.
 func (h *botHandler) systemPrompt() string {
-	return "You are huan-agent, a helpful personal AI assistant. Answer concisely. " +
-		"Commands run with no terminal and with standard input at /dev/null, so use the " +
-		"non-interactive flag a tool offers (-y, --yes, --no-input, CI=1) instead of a " +
-		"command that waits for input."
+	override := ""
+	if h.cfg != nil {
+		override = h.cfg.Chat.SystemPrompt
+	}
+	return prompt.Effective(override, prompt.SurfaceFeishu)
 }
 
 // reply sends text back to the user.
@@ -660,7 +670,11 @@ func runServe(cmd *cobra.Command, _ []string) error {
 			DisableUsageRequest: p.DisableUsageRequest,
 		}
 	}
-	reg := llm.NewRegistry(providers, cfg.LLM.DefaultProvider)
+	reg := llm.NewRegistry(providers, cfg.LLM.DefaultProvider).
+		// A transient model failure interrupts a Feishu conversation exactly as it
+		// does a web one; the retry is applied where providers are built so the
+		// bot gets it without a second implementation.
+		WithOptions(llm.WithRetry(cfg.LLM.RetryPolicy(), logger))
 	cm, err := reg.Get(cfg.LLM.DefaultProvider)
 	if err != nil {
 		return err
@@ -741,14 +755,16 @@ func runServe(cmd *cobra.Command, _ []string) error {
 			logger.Warn("feishu: in-turn context compression disabled", zap.Error(cErr))
 		}
 		runner, rerr := chat.New(chat.Config{
-			Model:     cm,
-			Tools:     tooling.base,
-			ToolsFor:  tooling.bindings.forScope,
-			MaxSteps:  cfg.Chat.MaxSteps,
-			MaxTokens: cfg.Chat.TurnMaxTokens,
-			Deadline:  cfg.Chat.TurnDeadline(),
-			Condenser: condenser,
-			Logger:    logger,
+			Model:       cm,
+			Tools:       tooling.base,
+			ToolsFor:    tooling.bindings.forScope,
+			MaxSteps:    cfg.Chat.MaxSteps,
+			MaxParallel: cfg.Tools.MaxParallelOr(),
+			MaxTokens:   cfg.Chat.TurnMaxTokens,
+			Deadline:    cfg.Chat.TurnDeadline(),
+			StepRetry:   cfg.Chat.StepRetryPolicy(),
+			Condenser:   condenser,
+			Logger:      logger,
 		})
 		if rerr != nil {
 			return fmt.Errorf("feishu agent runner: %w", rerr)

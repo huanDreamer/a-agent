@@ -13,6 +13,7 @@ import (
 	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/langfuse"
 	"github.com/huan/huan-agent/internal/llm"
+	"github.com/huan/huan-agent/internal/prompt"
 	"github.com/huan/huan-agent/internal/store"
 )
 
@@ -101,7 +102,7 @@ func TestRunnerFor_UsesSessionModel(t *testing.T) {
 	}
 
 	s := &Server{
-		cfg:    Config{ChatMaxSteps: 3},
+		cfg:    Config{DefaultChatMaxSteps: 3},
 		logger: zap.NewNop(),
 		chat:   ChatDeps{Runner: base, Builder: builder},
 		tracer: nopTracer{},
@@ -172,9 +173,13 @@ func TestRunnerCache_EvictsWhenFull(t *testing.T) {
 // ---- defaults and helpers ----
 
 func TestChatPromptAndLimits(t *testing.T) {
+	// The console's default comes from internal/prompt rather than being spelled
+	// out here: the prompt is prose that changes, and a copy of it in a test
+	// would only ever disagree with what the model is actually sent.
+	consoleDefault := prompt.For(prompt.SurfaceWeb)
 	t.Run("default prompt", func(t *testing.T) {
 		s := &Server{cfg: Config{}}
-		if got := s.chatPrompt(); got != defaultSystemPrompt {
+		if got := s.chatPrompt(); got != consoleDefault {
 			t.Errorf("chatPrompt = %q, want the default", got)
 		}
 	})
@@ -186,7 +191,7 @@ func TestChatPromptAndLimits(t *testing.T) {
 	})
 	t.Run("whitespace prompt falls back", func(t *testing.T) {
 		s := &Server{cfg: Config{}, chat: ChatDeps{SystemPrompt: "   "}}
-		if got := s.chatPrompt(); got != defaultSystemPrompt {
+		if got := s.chatPrompt(); got != consoleDefault {
 			t.Errorf("chatPrompt = %q, want the default", got)
 		}
 	})
@@ -194,18 +199,45 @@ func TestChatPromptAndLimits(t *testing.T) {
 	// and name the way out: a model that only learns this by failing burns a turn
 	// on a prompt nobody can answer.
 	t.Run("default prompt covers the missing terminal", func(t *testing.T) {
-		for _, want := range []string{"/dev/null", "non-interactively", "-y", "CI=1"} {
-			if !strings.Contains(defaultSystemPrompt, want) {
-				t.Errorf("defaultSystemPrompt is missing %q: %s", want, defaultSystemPrompt)
+		for _, want := range []string{"/dev/null", "非交互", "-y", "CI=1", "git commit -m"} {
+			if !strings.Contains(consoleDefault, want) {
+				t.Errorf("the console default is missing %q: %s", want, consoleDefault)
+			}
+		}
+	})
+	// The console's default is the general-purpose prompt in Chinese, plus the
+	// web section. Both halves are load-bearing: the language because every
+	// other instruction the model reads here (tool descriptions, the skills
+	// section) is Chinese, and the section because ask_user only exists on this
+	// surface — a prompt that never mentions it leaves the card unused.
+	t.Run("default prompt is the Chinese web prompt", func(t *testing.T) {
+		if !strings.Contains(consoleDefault, "默认用中文回答") {
+			t.Errorf("the console default is not the Chinese prompt: %s", consoleDefault)
+		}
+		if !strings.Contains(consoleDefault, "ask_user") {
+			t.Errorf("the console default does not mention the ask_user card: %s", consoleDefault)
+		}
+	})
+	t.Run("the other surfaces get their own sections", func(t *testing.T) {
+		// A Feishu answer arrives as a card and the CLI has no cards at all, so
+		// neither may be handed the console's prompt: what differs between the
+		// surfaces is exactly what those sections say.
+		for _, surface := range []string{prompt.SurfaceFeishu, prompt.SurfaceCLI} {
+			other := prompt.For(surface)
+			if other == consoleDefault {
+				t.Errorf("prompt.For(%q) is the console prompt", surface)
+			}
+			if !strings.HasPrefix(other, prompt.Base()) {
+				t.Errorf("prompt.For(%q) does not build on the base prompt", surface)
 			}
 		}
 	})
 	t.Run("max steps", func(t *testing.T) {
-		if got := (&Server{cfg: Config{}}).chatMaxSteps(); got != chat.DefaultMaxSteps {
-			t.Errorf("chatMaxSteps = %d, want the default", got)
+		if got := (&Server{cfg: Config{}}).effectiveBudget(context.Background()).maxSteps; got != chat.DefaultMaxSteps {
+			t.Errorf("maxSteps = %d, want the default", got)
 		}
-		if got := (&Server{cfg: Config{ChatMaxSteps: 7}}).chatMaxSteps(); got != 7 {
-			t.Errorf("chatMaxSteps = %d, want 7", got)
+		if got := (&Server{cfg: Config{DefaultChatMaxSteps: 7}}).effectiveBudget(context.Background()).maxSteps; got != 7 {
+			t.Errorf("maxSteps = %d, want 7", got)
 		}
 	})
 	t.Run("history limit", func(t *testing.T) {

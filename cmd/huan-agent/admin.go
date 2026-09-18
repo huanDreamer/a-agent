@@ -67,9 +67,15 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 			DisableUsageRequest: p.DisableUsageRequest,
 		}
 	}
-	reg := llm.NewRegistry(providers, cfg.LLM.DefaultProvider)
+	reg := llm.NewRegistry(providers, cfg.LLM.DefaultProvider).
+		WithOptions(llm.WithRetry(cfg.LLM.RetryPolicy(), logger))
 	builder := server.NewCatalogModelBuilder(st, reg, server.ModelBuilderOptions{
-		TTL:    cfg.LLM.ModelsCacheTTL(),
+		TTL: cfg.LLM.ModelsCacheTTL(),
+		// Every model a conversation can pick retries a transient call failure,
+		// so a 429 or a dropped socket costs a wait rather than the turn. The
+		// builder passes it to llm.New; the registry is given the same option so
+		// the config-only fallback path behaves identically.
+		Retry:  cfg.LLM.RetryPolicy(),
 		Logger: logger,
 	})
 
@@ -97,10 +103,23 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 		return server.ChatDeps{}, "", ""
 	}
 
+	// Subagents: one spawner per process, because the concurrency gate inside it
+	// is what bounds how many nested runs happen at once. Built before the
+	// registry so the tool can be registered into it below.
+	spawner, spawnErr := spawnerFor(cfg, tracer, logger)
+	if spawnErr != nil {
+		logger.Warn("web chat: subagents disabled", zap.Error(spawnErr))
+	}
+
 	// Tools are shared with the chat REPL so the web UI can do what the CLI can.
 	registry := tool.NewRegistry()
 	if err := registerBuiltinTools(registry, cfg, st, logger, vikingSvc,
-		toolSetOptions{Jobs: jobMgr, Surface: "web"}); err != nil {
+		toolSetOptions{
+			Jobs:         jobMgr,
+			Surface:      "web",
+			SpawnAgent:   spawner,
+			ResolveModel: modelResolverFor(builder, cfg),
+		}); err != nil {
 		logger.Warn("web chat: builtin tools unavailable", zap.Error(err))
 	}
 
@@ -158,14 +177,16 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 		logger.Warn("web chat: in-turn context compression disabled", zap.Error(err))
 	}
 	runner, err := chat.New(chat.Config{
-		Model:     chatModel,
-		Tools:     registry,
-		Tracer:    tracer,
-		MaxSteps:  maxSteps,
-		MaxTokens: cfg.Chat.TurnMaxTokens,
-		Deadline:  cfg.Chat.TurnDeadline(),
-		Condenser: condenser,
-		Logger:    logger,
+		Model:       chatModel,
+		Tools:       registry,
+		Tracer:      tracer,
+		MaxSteps:    maxSteps,
+		MaxParallel: cfg.Tools.MaxParallelOr(),
+		MaxTokens:   cfg.Chat.TurnMaxTokens,
+		Deadline:    cfg.Chat.TurnDeadline(),
+		StepRetry:   cfg.Chat.StepRetryPolicy(),
+		Condenser:   condenser,
+		Logger:      logger,
 	})
 	if err != nil {
 		logger.Warn("web chat disabled: cannot build the runner", zap.Error(err))
@@ -181,6 +202,8 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 		zap.Duration("turn_deadline", cfg.Chat.TurnDeadline()),
 		zap.Bool("in_turn_compression", condenser != nil),
 		zap.Duration("ask_user_timeout", cfg.Chat.AskUserTimeout()),
+		zap.String("approval_mode", cfg.Tools.Approval.ModeOr()),
+		zap.Duration("approval_timeout", cfg.Tools.Approval.Timeout()),
 	)
 	return server.ChatDeps{
 		Runner:       runner,
@@ -197,6 +220,26 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 		Usage:     usageSink{rec: rec},
 		// How long an ask_user card waits for an answer.
 		AskTimeout: cfg.Chat.AskUserTimeout(),
+		// The subagents this conversation delegated, for the header chip. Nil when
+		// the feature is off, which is what keeps the endpoint (and the chip) absent
+		// rather than permanently empty.
+		Subagents:             subagentTrackerFor(cfg),
+		SubagentMaxConcurrent: cfg.Subagent.MaxConcurrentOr(),
+		// How long a write or exec waits for a person's decision. It is shorter
+		// than the ask timeout on purpose: an approval blocks an action, and what
+		// happens at zero differs — a question that times out is an answer, an
+		// approval that times out is a refusal.
+		ApprovalTimeout: cfg.Tools.Approval.Timeout(),
+		// How one step of a turn is retried when its model call dies after it had
+		// already started answering. It travels on the deps rather than being
+		// baked into the runner above because every conversation gets a runner of
+		// its own (one per model choice), and they must all retry the same way.
+		StepRetry: cfg.Chat.StepRetryPolicy(),
+		// The task plan behind 任务看板: the plan_* tools write to the per-turn
+		// planner, the console renders it above the composer, and a resumed turn
+		// reads it so it does not start the work over.
+		PlanEnable:   cfg.Chat.Plan.Enable,
+		PlanMaxTasks: cfg.Chat.Plan.MaxTasksOr(),
 	}, defProvider, defModel
 }
 
@@ -426,21 +469,25 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	}
 
 	srv, err := server.New(server.Config{
-		Host:             cfg.Server.Host,
-		Port:             cfg.Server.Port,
-		SessionTTL:       cfg.Server.SessionTTL(),
-		MetricsPath:      cfg.Server.MetricsPath,
-		MetricsEnable:    cfg.Server.MetricsEnable,
-		Metrics:          m,
-		Version:          version.String(),
-		Provider:         metaProvider,
-		Model:            metaModel,
-		FeishuEnabled:    cfg.Feishu.Enabled(),
-		SkillsDir:        cfg.Skills.Dir,
-		StatePath:        server.StatePathFor(cfg.Database.Path),
-		ChatMaxSteps:     cfg.Chat.MaxSteps,
-		ChatMaxTokens:    cfg.Chat.TurnMaxTokens,
-		ChatTurnDeadline: cfg.Chat.TurnDeadline(),
+		Host:                    cfg.Server.Host,
+		Port:                    cfg.Server.Port,
+		SessionTTL:              cfg.Server.SessionTTL(),
+		MetricsPath:             cfg.Server.MetricsPath,
+		MetricsEnable:           cfg.Server.MetricsEnable,
+		Metrics:                 m,
+		Version:                 version.String(),
+		Provider:                metaProvider,
+		Model:                   metaModel,
+		FeishuEnabled:           cfg.Feishu.Enabled(),
+		SkillsDir:               cfg.Skills.Dir,
+		StatePath:               server.StatePathFor(cfg.Database.Path),
+		DefaultChatMaxSteps:     cfg.Chat.MaxSteps,
+		DefaultChatMaxTokens:    cfg.Chat.TurnMaxTokens,
+		DefaultChatTurnDeadline: cfg.Chat.TurnDeadline(),
+		// The in-turn window the condenser was built with, so 设置 → 对话预算 can
+		// warn that a raised step cap without compression is the combination that
+		// turns a long task into a context-limit error partway through.
+		ContextMaxTokens: cfg.Context.MaxTokens,
 		ChatHistoryLimit: cfg.Chat.HistoryLimitOr(),
 		ChatEnable:       cfg.Chat.Enable,
 		Chat:             chatDeps,
@@ -448,7 +495,16 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 		OpenViking:       vikingConsole(vikingSvc),
 		Tracer:           tracer,
 		Traces:           rec,
-		Logger:           logger,
+		// Checkpoints: where they live, and how many turns to keep. The
+		// per-workspace checkpointer is built by the server, because this process
+		// serves several workspaces.
+		Checkpoints: server.CheckpointSettings{
+			Enable:     cfg.Tools.Checkpoint.Enable,
+			Dir:        checkpointDir(cfg),
+			KeepTurns:  cfg.Tools.Checkpoint.KeepTurnsOr(),
+			MaxTotalMB: cfg.Tools.Checkpoint.MaxTotalMBOr(),
+		},
+		Logger: logger,
 	}, st, pricingTable(cfg), cfg.Admin)
 	if err != nil {
 		return err

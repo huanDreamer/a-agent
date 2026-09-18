@@ -183,6 +183,15 @@ func (m *Manager) CompressKeeping(ctx context.Context, msgs []*schema.Message, h
 // precedes the assistant message which asked for it, so pinned and kept messages
 // may only ever be reordered by removing what sits between them, never by
 // swapping.
+//
+// The kept tail is widened when the KeepRecent boundary would otherwise cut a
+// tool exchange in half, because the summary is a system message and cannot
+// stand in as the assistant message a kept tool result answers. The result is
+// that the returned window always satisfies what providers require: every
+// `role: "tool"` message has the assistant message carrying its tool_call_id
+// somewhere before it. The cost is that a boundary landing on a tool result can
+// fold one exchange less than asked, and in the tightest case returns msgs
+// unchanged — the caller's over-budget window is the better failure.
 func (m *Manager) CompressWith(ctx context.Context, msgs []*schema.Message, pin Pin) ([]*schema.Message, string, error) {
 	// A nil receiver means "no compression configured", which is a supported
 	// state rather than a bug: see ShouldCompress.
@@ -215,6 +224,19 @@ func (m *Manager) CompressWith(ctx context.Context, msgs []*schema.Message, pin 
 
 	keep := rest[len(rest)-m.budget.KeepRecent:]
 	middle := rest[:len(rest)-m.budget.KeepRecent]
+
+	// The split above is a plain slice boundary, and it can land in the middle
+	// of a tool exchange: the assistant message that carried tool_calls falls
+	// into the foldable middle and is rolled into the summary, while the tool
+	// results it asked for stay in the kept tail. The window then opens with an
+	// orphan "role: tool" message, which providers reject outright — DeepSeek
+	// returns 400 "Messages with role 'tool' must be a response to a preceding
+	// message with 'tool_calls'". Walk the boundary back until the kept window
+	// still opens with the message that asked for what follows.
+	for len(middle) > 0 && orphanedToolHead(msgs[:head], keep) {
+		keep = append([]*schema.Message{middle[len(middle)-1]}, keep...)
+		middle = middle[:len(middle)-1]
+	}
 
 	// Pull the pinned user message out of the foldable middle rather than out of
 	// the kept tail: the tail is the most recent work, the pinned message is the
@@ -268,6 +290,29 @@ func (m *Manager) CompressWith(ctx context.Context, msgs []*schema.Message, pin 
 	}
 	out = append(out, keep...)
 	return out, summary, nil
+}
+
+// orphanedToolHead reports whether the kept window opens with a tool result
+// whose requesting assistant message is not among the messages that precede it.
+//
+// Only the head of the window needs checking: a tool result further in is
+// preceded by whatever came with it, and the foldable middle is behind both.
+func orphanedToolHead(prefix, keep []*schema.Message) bool {
+	if len(keep) == 0 || keep[0].Role != schema.Tool {
+		return false
+	}
+	want := keep[0].ToolCallID
+	for _, m := range prefix {
+		if m.Role != schema.Assistant {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if tc.ID == want {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // pinnedCount is the number of messages a pinned pointer stands for, for the

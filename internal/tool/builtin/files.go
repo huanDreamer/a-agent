@@ -573,56 +573,11 @@ func fileEntryRank(entryType string) int {
 	}
 }
 
-// fileRealPath returns the path a mutation should actually target. Workspace
-// Resolve confines the path but returns it literally, so writing to a symlink
-// that lives inside the workspace would replace the link instead of the file it
-// points at. Resolve has already proven that following the link stays inside the
-// workspace, so evaluating it here cannot widen access.
-func fileRealPath(abs string) string {
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return resolved
-	}
-	// Not existing yet, or a dangling link: the literal path is the target.
-	return abs
-}
+// fileRealPath and fileWriteAtomic now live in internal/workspace: the atomic
+// write is what a batch edit needs too, and internal/edit cannot import this
+// package (this package imports it for the apply_patch tool).
+func fileRealPath(abs string) string { return workspace.RealPath(abs) }
 
-// fileWriteAtomic replaces the file at abs with data, writing a temp file in the
-// same directory first and then renaming it over the target. Rename is atomic
-// within a filesystem, so a reader never observes a half-written file and an
-// interrupted call leaves the original untouched.
 func fileWriteAtomic(abs string, data []byte, perm fs.FileMode) (int64, error) {
-	dir := filepath.Dir(abs)
-	tmp, err := os.CreateTemp(dir, fileTempPattern)
-	if err != nil {
-		return 0, fmt.Errorf("create temp file in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	// Best-effort cleanup. After a successful rename there is nothing left at
-	// tmpName, so this only removes a file from a failed attempt.
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-	}()
-
-	// The mode is applied to the temp file before the rename, which is how the
-	// overwritten file keeps its permissions.
-	if err := tmp.Chmod(perm); err != nil {
-		return 0, fmt.Errorf("set mode on temp file: %w", err)
-	}
-	n, err := tmp.Write(data)
-	if err != nil {
-		return 0, fmt.Errorf("write temp file: %w", err)
-	}
-	// Sync before rename so a crash cannot publish a name whose contents were
-	// never flushed.
-	if err := tmp.Sync(); err != nil {
-		return 0, fmt.Errorf("sync temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return 0, fmt.Errorf("close temp file: %w", err)
-	}
-	if err := os.Rename(tmpName, abs); err != nil {
-		return 0, fmt.Errorf("rename temp file over target: %w", err)
-	}
-	return int64(n), nil
+	return workspace.WriteFileAtomic(abs, data, perm)
 }

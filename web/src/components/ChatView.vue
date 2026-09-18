@@ -2,7 +2,9 @@
 // 对话 — the primary surface: a streaming conversation that owns the full
 // height of the main area. The session list lives in the app sidebar
 // (AppSidebar.vue), so the chat pane has nothing above it but a thin context
-// header: the session title (click to rename), 清空, and the message count.
+// header: the session title (click to rename), 清空, the conversation's totals
+// (turns / model calls / tool calls / tokens, from the server's aggregate) and
+// the message count.
 // The model picker is inside the composer, and the available tools are not
 // listed anywhere in the chat.
 //
@@ -21,6 +23,9 @@ import ChatMessage from './ChatMessage.vue'
 import DrawerButton from './DrawerButton.vue'
 import Icon from './Icon.vue'
 import JobsDrawer from './JobsDrawer.vue'
+import SubagentsDrawer from './SubagentsDrawer.vue'
+import TaskBoard from './TaskBoard.vue'
+import ApprovalCard from './ApprovalCard.vue'
 import {
   chat,
   clearSession,
@@ -29,12 +34,25 @@ import {
   dismissActionError,
   ensureLoaded,
   renameSession,
+  resumeTurn,
   selectSession,
   sendMessage,
   stopStreaming,
+  submitApproval,
   submitAsk,
 } from '../chatStore.js'
+import { pendingApprovals } from '../approval.js'
 import { formatCount } from '../format.js'
+import { planResumable } from '../plan.js'
+import { subagentChipLabel, subagentHintText } from '../subagentsChip.js'
+import {
+  loadSubagentsFor,
+  refreshSubagents,
+  subagentsMaxConcurrent,
+  subagentsRunning,
+  subagentsTotal,
+} from '../subagentsStore.js'
+import { statsSegments, statsTitle } from '../sessionStats.js'
 import {
   loadForSession,
   otherRunning,
@@ -60,6 +78,18 @@ const session = computed(() => chat.session)
 const items = computed(() => chat.items)
 
 /**
+ * The header's statistics line: 轮数 · 模型调用 · 工具调用 · token.
+ *
+ * The values are the server's aggregate (chat.stats), which the authoritative
+ * reload at the end of every turn refreshes — so they are already current by the
+ * time a turn's output stops moving, and they are the same numbers after a
+ * reload. A conversation that has not run anything yet renders the turn count
+ * alone rather than a row of zeros.
+ */
+const statSegments = computed(() => statsSegments(chat.stats))
+const statsDetail = computed(() => statsTitle(chat.stats))
+
+/**
  * The background-process chip in the header.
  *
  * It appears only when it has something to say — this conversation has started a
@@ -71,6 +101,23 @@ const items = computed(() => chat.items)
 const jobsCount = computed(() => sessionJobs.value.length)
 const jobsRunning = computed(() => sessionRunning.value)
 const jobsVisible = computed(() => jobsCount.value > 0 || otherRunning.value > 0 || jobsOpen.value)
+
+/**
+ * What this conversation delegated.
+ *
+ * Same reasoning as the jobs chip next to it: it renders only once there is
+ * something to count, and the label leads with liveness — "2 个子 agent 运行中" is
+ * the fact worth putting in a header, and a finished record is worth keeping but
+ * not worth shouting about.
+ */
+const subagentsOpen = ref(false)
+const subagentsVisible = computed(() => subagentsTotal.value > 0 || subagentsOpen.value)
+const subagentsTone = computed(() => (subagentsRunning.value > 0 ? 'ok' : ''))
+// The wording lives in subagentsChip.js so it can be tested without rendering the
+// view — a chip that reports a stale count under the wrong conversation's title is
+// the failure this seam exists to catch.
+const subagentsLabel = computed(() => subagentChipLabel())
+const subagentsHint = computed(() => subagentHintText())
 const jobsTone = computed(() => (jobsRunning.value > 0 ? 'ok' : ''))
 const jobsLabel = computed(() => {
   if (jobsRunning.value > 0) return `${jobsRunning.value} 个后台进程`
@@ -92,9 +139,35 @@ const jobsHint = computed(() => {
 watch(
   () => chat.activeId,
   (id) => {
-    if (id) loadForSession(id)
+    if (!id) return
+    loadForSession(id)
+    // The same rule for the subagent list: it belongs to the conversation on
+    // screen, and a run left over from the previous one would be attributed to the
+    // wrong reader.
+    loadSubagentsFor(id)
   },
   { immediate: true },
+)
+
+// A turn that delegates must update the chip while it runs, and the only signal the
+// client gets is the tool call itself. Watching the streaming turn's tool runs is
+// what turns "spawn_agent appeared" into "the chip is now live" — the same trigger
+// the background-process chip uses, for the same reason.
+watch(
+  () => chat.streamTick,
+  () => {
+    if (!chat.activeId) return
+    const turn = chat.items[chat.items.length - 1]
+    const tools = turn && Array.isArray(turn.tools) ? turn.tools : []
+    // A run is worth a reload when a spawn appeared or one just finished; polling
+    // then takes over while anything is live.
+    for (const tool of tools) {
+      if (tool.name === 'spawn_agent') {
+        refreshSubagents()
+        return
+      }
+    }
+  },
 )
 
 // The store's interval keeps running while any job is alive; leaving the view is
@@ -102,6 +175,20 @@ watch(
 onBeforeUnmount(stopJobPolling)
 
 const streaming = computed(() => chat.streaming)
+
+/**
+ * The write and exec requests the running turn is blocked on.
+ *
+ * They are rendered above the composer rather than inside the message flow: the
+ * turn is *waiting* on them, so they belong where the reader is already looking,
+ * next to the 停止 button. A decision that had to be scrolled to is a decision
+ * that delays the turn.
+ */
+const approvals = computed(() => pendingApprovals(chat.items[chat.items.length - 1]))
+
+function onApprovalDecide(card, decision) {
+  submitApproval(card.id, decision)
+}
 
 /** Only surfaced when the session's model cannot be called at all. */
 const missingKey = computed(
@@ -321,6 +408,42 @@ function onSend(text, attachments) {
   sendMessage(text, { attachments: attachments || [] })
 }
 
+/**
+ * 接着上一轮的中断处继续跑。
+ *
+ * 它**不经过输入框**：这不是"再发一句话"，而是让服务端带着上一轮的计划与已完成
+ * 的步骤新开一轮（气泡由 store 自己补上）。所以看板和失败气泡上的按钮共用这一个
+ * 入口。
+ */
+function onResume() {
+  confirmClear.value = false
+  resumeTurn()
+}
+
+/**
+ * 最新一条助手回答的下标，没有则 -1。
+ *
+ * "继续执行"只出现在它上面：中断的接续点只能是**最后**一轮（更早的失败早已被后
+ * 面的回合带过），在同一段对话里给出两个接续点只会让人不知道哪个才算数。
+ */
+const lastAssistantIndex = computed(() => {
+  for (let i = chat.items.length - 1; i >= 0; i -= 1) {
+    const item = chat.items[i]
+    if (item && item.role === 'assistant') return i
+  }
+  return -1
+})
+
+/**
+ * 这一条助手气泡要不要给「继续执行」。
+ *
+ * 三个条件缺一不可：它是最后一条回答、计划里还有没做完的事、当前没有轮次在跑
+ * （有一轮在跑时服务端会拒 409，而按钮摆在"停止"旁边会显得能插队）。
+ */
+function canResumeAt(index) {
+  return index === lastAssistantIndex.value && planResumable(chat.plan) && !chat.streaming
+}
+
 function reloadMessages() {
   if (chat.activeId) selectSession(chat.activeId)
 }
@@ -436,6 +559,19 @@ onBeforeUnmount(stopSettling)
              folder, and repeating it in the header only took room from what the
              header is actually for. A conversation is now placed in a workspace
              when it is created (the folder's + button) and stays there. -->
+        <!-- The conversation's totals, in front of the message count because they
+             are what a long conversation is actually judged by: how many turns
+             went into it, what the model cost, what the tools cost, and how many
+             tokens it all came to. Each segment carries its own explanation on
+             hover, including the one caveat that matters — neither duration is
+             the conversation's wall-clock length. -->
+        <span class="muted-note nowrap chat-stats" :title="statsDetail">
+          <template v-for="(segment, index) in statSegments" :key="segment.key">
+            <span v-if="index > 0" class="dimmer" aria-hidden="true">·</span>
+            <span>{{ segment.text }}</span>
+          </template>
+        </span>
+        <span class="dimmer nowrap" aria-hidden="true">·</span>
         <span class="muted-note nowrap">共 {{ formatCount(session.message_count) }} 条消息</span>
 
         <!-- This conversation's background processes. The count is conversation
@@ -454,6 +590,23 @@ onBeforeUnmount(stopSettling)
         >
           <Icon name="terminal" :size="13" />
           {{ jobsLabel }}
+        </button>
+
+        <!-- What this conversation delegated to subagents. It sits beside the
+             background-process chip because it answers the same question — what is
+             running under this conversation — and a reader who has learned one has
+             learned the other. -->
+        <button
+          v-if="subagentsVisible"
+          type="button"
+          class="chip chip-btn"
+          :class="subagentsTone"
+          :title="subagentsHint"
+          :aria-expanded="subagentsOpen"
+          @click="subagentsOpen = !subagentsOpen"
+        >
+          <Icon name="git-branch" :size="13" />
+          {{ subagentsLabel }}
         </button>
 
         <!-- The session-level way in: every turn this conversation recorded,
@@ -509,7 +662,9 @@ onBeforeUnmount(stopSettling)
               :key="item.key"
               :item="item"
               :retry-text="previousUserText(index)"
+              :can-resume="canResumeAt(index)"
               @retry="onSend"
+              @resume="onResume"
               @open-trace="openTraceForTurn"
               @submit-ask="submitAsk"
             />
@@ -528,6 +683,22 @@ onBeforeUnmount(stopSettling)
         </button>
       </div>
 
+      <!-- 任务看板贴在输入框正上方：计划属于"这一轮还没做完的事"，不属于消息
+           历史（放进消息流会被新消息推走）。没有计划时它自己渲染成空，所以这里
+           不需要额外的 v-if。 -->
+      <!-- 审批卡片贴在输入框上方：这一轮正卡在这个决定上，所以它属于读者正在看的
+           位置（输入框上方），不属于消息历史。 -->
+      <div v-if="approvals.length" class="approval-stack">
+        <ApprovalCard
+          v-for="card in approvals"
+          :key="card.id"
+          :card="card"
+          @decide="(decision) => onApprovalDecide(card, decision)"
+        />
+      </div>
+
+      <TaskBoard @resume="onResume" />
+
       <ChatComposer
         ref="composer"
         :streaming="streaming"
@@ -542,6 +713,7 @@ onBeforeUnmount(stopSettling)
            cannot be a card in the transcript. -->
       <div v-if="jobsOpen" class="jobs-backdrop" @click="jobsOpen = false" />
       <JobsDrawer v-if="jobsOpen" @close="jobsOpen = false" />
+      <SubagentsDrawer v-if="subagentsOpen" @close="subagentsOpen = false" />
     </template>
 
     <!-- no conversation selected yet -->

@@ -46,6 +46,15 @@ type CapabilityFunc struct {
 // Capability implements Capable.
 func (c CapabilityFunc) Capability() Capability { return c.Cap }
 
+// Concurrency forwards the wrapped tool's declaration.
+//
+// Forwarding has to be explicit on every decorator: embedding the Tool interface
+// promotes only that interface's methods, so without this line a wrapped tool
+// would look undeclared and be treated as a barrier — or, worse, the default would
+// be reversed by someone "fixing" it and a parallel-safe tool would lose its
+// declaration.
+func (c CapabilityFunc) Concurrency() Concurrency { return ConcurrencyOf(c.Tool) }
+
 // WithCapability tags a tool with a capability. It returns the tool unchanged
 // when cap is empty.
 func WithCapability(t Tool, cap Capability) Tool {

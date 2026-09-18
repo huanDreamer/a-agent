@@ -114,22 +114,18 @@ function messageOf(data, fallback) {
 }
 
 /**
- * POST a chat message and consume the Server-Sent Events reply.
+ * Send one message, starting a turn for that conversation.
  *
- * `EventSource` cannot be used here: it only issues GET requests, while the
- * endpoint is a POST that starts a turn. So the request is a plain `fetch`
- * whose body stream is read and framed by hand (see `sse.js`). Every parsed
- * event object is handed to `onEvent` in arrival order; returning `false` from
- * `onEvent` stops reading (used for the terminal `stream_end`/`error` events).
+ * This returns as soon as the server has accepted the message. The answer is
+ * *not* read here: the turn belongs to the conversation, not to this request, so
+ * it keeps running whether or not this tab stays around — and it is read with
+ * `attachChatTurn`, which is also how a tab that was reloaded, or that was
+ * looking at another conversation, gets back to it.
  *
- * Resolves when the turn is over — including the case where the server closed
- * the stream without a terminating frame — as
- * `{ aborted, stopped, ended }`: `aborted` means the caller's AbortController
- * fired (the 停止 button), which is not an error. Rejects with ApiError when the
- * request itself fails, including a non-200 JSON error before any event.
+ * Rejects with ApiError carrying the status: 409 means the conversation already
+ * has a turn in flight.
  */
-export async function streamChatTurn(sessionId, content, { signal, onEvent, attachments } = {}) {
-  const url = buildUrl(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`)
+export async function startChatTurn(sessionId, content, { attachments } = {}) {
   const body = { content }
   // Omitted entirely when there is nothing attached, so the request body keeps
   // the shape the pre-attachment server expects.
@@ -137,15 +133,13 @@ export async function streamChatTurn(sessionId, content, { signal, onEvent, atta
 
   let response
   try {
-    response = await fetch(url, {
+    response = await fetch(buildUrl(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`), {
       method: 'POST',
       credentials: 'same-origin',
-      headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal,
     })
   } catch (cause) {
-    if (isAbort(cause)) return { aborted: true, stopped: false, ended: false }
     throw new ApiError('无法连接到服务器，请确认服务正在运行', 0, null)
   }
 
@@ -154,17 +148,81 @@ export async function streamChatTurn(sessionId, content, { signal, onEvent, atta
     throw new ApiError('服务端要求登录（HTTP 401）', 401, null)
   }
 
-  if (!response.ok) {
-    // A misconfiguration (unknown session, missing API key, chat disabled) is
-    // reported as a normal JSON error instead of a broken stream.
-    let data = null
+  let data = null
+  const text = await response.text()
+  if (text) {
     try {
-      const text = await response.text()
-      data = text ? JSON.parse(text) : null
+      data = JSON.parse(text)
     } catch (err) {
       data = null
     }
+  }
+  if (!response.ok) {
     throw new ApiError(messageOf(data, `发送失败（HTTP ${response.status}）`), response.status, data)
+  }
+  return data
+}
+
+/**
+ * Stop a conversation's running turn.
+ *
+ * Stopping is a request of its own rather than a client-side abort, because the
+ * turn is not this connection's to end: every reader attached to it sees it
+ * stop, and what it produced is kept.
+ */
+export async function stopChatTurn(sessionId) {
+  return request(`/api/chat/sessions/${encodeURIComponent(sessionId)}/turn/stop`, {
+    method: 'POST',
+    body: {},
+  })
+}
+
+/**
+ * Attach to a conversation's running turn and consume its Server-Sent Events.
+ *
+ * `EventSource` cannot be used here: it sends no credentials policy of its own
+ * and cannot be aborted the way this needs. So the response body is read as a
+ * stream and framed by hand (see `sse.js`).
+ *
+ * The server replays the turn from its first event, so attaching late — another
+ * page, another conversation, a reloaded browser — shows the answer so far and
+ * then the rest of it, exactly as if this reader had been there from the start.
+ * Every parsed event is handed to `onEvent` in arrival order; returning `false`
+ * stops reading (used for the terminal `stream_end`).
+ *
+ * Resolves as `{ aborted, ended, idle }`. `idle` means the conversation had no
+ * turn in flight, which the server answers as a small JSON body rather than
+ * holding a connection open — the stored messages are then the whole truth.
+ * `aborted` means the caller's AbortController fired, which is what detaching
+ * looks like and is not an error.
+ */
+export async function attachChatTurn(sessionId, { signal, onEvent } = {}) {
+  const url = buildUrl(`/api/chat/sessions/${encodeURIComponent(sessionId)}/turn`)
+
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { Accept: 'text/event-stream' },
+      signal,
+    })
+  } catch (cause) {
+    if (isAbort(cause)) return { aborted: true, ended: false, idle: false }
+    throw new ApiError('无法连接到服务器，请确认服务正在运行', 0, null)
+  }
+
+  if (response.status === 401) {
+    notifyUnauthorized()
+    throw new ApiError('服务端要求登录（HTTP 401）', 401, null)
+  }
+  if (!response.ok) {
+    throw new ApiError(`读取实时输出失败（HTTP ${response.status}）`, response.status, null)
+  }
+  // Nothing running: the endpoint answers JSON instead of an event stream.
+  const contentType = response.headers.get('Content-Type') || ''
+  if (!contentType.includes('text/event-stream')) {
+    return { aborted: false, ended: false, idle: true }
   }
 
   if (!response.body || typeof response.body.getReader !== 'function') {
@@ -211,7 +269,7 @@ export async function streamChatTurn(sessionId, content, { signal, onEvent, atta
       }
     }
   } catch (cause) {
-    if (isAbort(cause)) return { aborted: true, stopped, ended }
+    if (isAbort(cause)) return { aborted: true, ended, idle: false }
     throw new ApiError('读取流式响应失败，请重试', 0, null)
   } finally {
     if (stopped || signal?.aborted) {
@@ -226,7 +284,7 @@ export async function streamChatTurn(sessionId, content, { signal, onEvent, atta
   if (events === 0 && invalid > 0) {
     throw new ApiError('流式响应解析失败，请重试', 0, null)
   }
-  return { aborted: false, stopped, ended }
+  return { aborted: false, ended, idle: false }
 }
 
 function isAbort(cause) {
@@ -397,6 +455,19 @@ export const api = {
     request(`/api/chat/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   clearChatSession: (id) =>
     request(`/api/chat/sessions/${encodeURIComponent(id)}/clear`, { method: 'POST' }),
+  // The per-turn budget (设置 → 对话预算). GET reports the effective values, where
+  // each one came from, and the defaults 恢复默认 restores; PUT stores an override
+  // that the next message uses, with no restart.
+  chatBudget: () => request('/api/chat/budget'),
+  saveChatBudget: (body) => request('/api/chat/budget', { method: 'PUT', body }),
+  // 继续执行：接着上一轮的中断处再跑一轮（上一轮的计划与已完成步骤由服务端读出来
+  // 作为接续简报注入）。成功与 POST /messages 同一形状（202 + turn），随后照常
+  // attach；409 表示这个会话已经有一轮在跑，400 表示没有可接续的东西。
+  resumeChatTurn: (sessionId) =>
+    request(`/api/chat/sessions/${encodeURIComponent(sessionId)}/resume`, {
+      method: 'POST',
+      body: {},
+    }),
   // The answer to an ask_user card. It is a second request on purpose: the
   // streaming response for this turn is already committed to its event stream,
   // so the question id is the only thing that can join the two.
@@ -405,6 +476,22 @@ export const api = {
       `/api/chat/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(questionId)}/answer`,
       { method: 'POST', body },
     ),
+
+  // The decision on a write or exec that is waiting for one. A second request for
+  // the same reason the answer to a question is: the streaming response for this
+  // turn is already committed to its event stream, so the request id is the only
+  // thing that can join the two.
+  answerApproval: (sessionId, approvalId, body) =>
+    request(
+      `/api/chat/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(approvalId)}`,
+      { method: 'POST', body },
+    ),
+
+  // The subagents a conversation delegated, for the header chip. It is the same
+  // shape as listJobs on purpose: both answer "what is this conversation running",
+  // and a reader who has learned one chip has learned the other.
+  listSubagents: (sessionId) =>
+    request(`/api/chat/sessions/${encodeURIComponent(sessionId)}/subagents`),
 
   // --- traces (Langfuse) ------------------------------------------------
   traceStatus: () => request('/api/traces/status'),

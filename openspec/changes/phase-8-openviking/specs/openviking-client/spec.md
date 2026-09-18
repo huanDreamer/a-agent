@@ -26,9 +26,14 @@
    非 2xx 但不是该信封时 MUST 也返回 `*APIError`（带原始摘要）。
 5. **可用性判定。** 提供 `IsUnavailable(err)`：网络错误、超时、连接被拒、5xx MUST
    判定为不可用（调用方据此降级）；4xx 语义错误（如 URI 非法、模型未开通）MUST NOT
-   被当作不可用。
+   被当作不可用。另提供 `IsIndexWaitTimeout(err)` 回答更窄的问题：这是「内容已被受理、
+   但索引队列没在预算内跑完」吗？它 MUST 覆盖服务端的 504 / `DEADLINE_EXCEEDED` 与
+   客户端传输层超时两种形态，MUST NOT 把 4xx 拒绝或 `context.Canceled` 算进去；
+   调用方 MUST 将其当作「可能已保存」而非「已保存」，需要确定性时 MUST 再用读取确认。
 6. **超时。** 每个请求 MUST 受 `context` 与客户端超时双重约束；`content/write` 与
    `resources` 这类可能触发后台处理的调用 MUST 允许调用方显式指定更长的等待。
+   服务端等待预算 MUST 严格小于客户端超时，否则服务端自己的 504 永远送不出来，
+   调用方只会看到无法分类的传输层超时。
 7. **API 面。** MUST 提供 `Health`、`Find`、`Remember`（批量消息 + 可选 commit）、
    `WriteContent`、`ReadContent`、`Stat`、`UploadTemp`、`AddResource`、`TaskStatus`。
 8. **凭据不外泄。** APIKey MUST NOT 出现在任何错误信息、日志或返回给前端的结构里。

@@ -34,40 +34,73 @@ func (a *mcpAdapter) InvokableRun(ctx context.Context, args string, _ ...einotoo
 	return a.client.CallTool(ctx, a.spec.Name, args)
 }
 
-// RegisterMCPTools walks the tools exposed by c and registers one
-// adapter per tool into reg. Returns the number of tools
-// registered.
+// RegisterMCPTools walks the tools exposed by c and registers one adapter per
+// tool into reg.
+//
+// It returns the names it registered and one message per tool it could not
+// register; the error is reserved for a failure to list tools at all (a
+// disconnected client, an unreachable server), where there is nothing to bridge.
 //
 // This is one-shot bridge glue for a caller that connects a server and keeps it
-// for the life of the process (the CLI's `chat --tools`). A runtime that adds
+// for the life of the process (the CLI and the Feishu bot). A runtime that adds
 // and removes servers while running uses Manager, which tracks which names it
 // registered so it can unregister exactly those.
 //
-// Tools are registered sequentially, and a failure rolls back the ones already
-// added: leaving them behind would offer the model tools pointing at a server
-// the caller then abandons.
-func RegisterMCPTools(ctx context.Context, reg *tool.Registry, c *Client, logger *zap.Logger) (int, error) {
+// A name that is already taken is a skip, not a failure — see registerToolSpecs.
+func RegisterMCPTools(ctx context.Context, reg *tool.Registry, c *Client, logger *zap.Logger) ([]string, []string, error) {
 	specs, err := c.ListTools(ctx)
 	if err != nil {
-		return 0, err
+		return nil, nil, err
 	}
-	registered := 0
+	names, skipped := registerToolSpecs(reg, c, specs, logger)
+	return names, skipped, nil
+}
+
+// registerToolSpecs registers one adapter per spec into reg, returning the names
+// it added and one message per spec it could not add.
+//
+// A name that is already taken — by a builtin, or by another MCP server — is
+// reported and skipped rather than failing the whole server: the registry
+// refuses duplicate names, and a server with one colliding tool is still worth
+// connecting. Rolling back the rest and aborting is the tempting alternative,
+// and it is wrong: a single colliding name (OpenViking exposes one called
+// "grep") would make `chat --tools` refuse to start at all.
+//
+// This is the single implementation of "bridge this server's tools into the
+// registry". The lifecycle manager (manager.go) and the one-shot bridge above
+// both go through it, because they once disagreed: the console connected a
+// server whose tool collided and kept going, while the CLI aborted the whole
+// agent build. Two implementations of one rule is how that happens.
+func registerToolSpecs(reg *tool.Registry, c *Client, specs []*tool.Spec, logger *zap.Logger) ([]string, []string) {
+	if reg == nil {
+		return nil, nil
+	}
+
+	var (
+		names   = make([]string, 0, len(specs))
+		skipped []string
+	)
 	for _, s := range specs {
 		adapter := &mcpAdapter{client: c, name: s.Name, spec: s}
 		if err := reg.Register(adapter); err != nil {
-			for _, prev := range specs[:registered] {
-				reg.Unregister(prev.Name)
+			msg := fmt.Sprintf("tool %q not registered: %v", s.Name, err)
+			skipped = append(skipped, msg)
+			if logger != nil {
+				logger.Warn("mcp tool not registered",
+					zap.String("server", c.Name()),
+					zap.String("tool", s.Name),
+					zap.Error(err))
 			}
-			return registered, fmt.Errorf("mcp: register %s/%s: %w", c.Name(), s.Name, err)
+			continue
 		}
-		registered++
+		names = append(names, s.Name)
 		if logger != nil {
 			logger.Debug("mcp tool registered",
 				zap.String("server", c.Name()),
 				zap.String("tool", s.Name))
 		}
 	}
-	return registered, nil
+	return names, skipped
 }
 
 // toolInputSchemaJSON returns the JSON representation of an MCP

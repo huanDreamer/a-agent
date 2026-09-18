@@ -19,6 +19,21 @@ make run
 go run ./cmd/huan-agent chat
 ```
 
+## 非交互式运行（git hook / CI / cron）
+
+`huan-agent run` 给一个任务、跑完、把答案打到 stdout 并退出。答案走 stdout、日志与进度走
+stderr，所以可以直接接管道：
+
+```bash
+huan-agent run "读一下 README.md，用一句话说这个项目是什么"
+git diff --cached | huan-agent run - "审一遍下面这段 diff，只报 must-fix"
+huan-agent run "找出 npm test 的根因" --output json | jq -r .answer
+```
+
+退出码是稳定契约：`0` 跑完 / `1` 模型或循环失败 / `2` 用法错误 / `3` 超时 / `4` 预算耗尽 /
+`5` 工具失败（配合 `--fail-on-tool-error`）/ `6` 配置问题。详见
+[docs/run.md](./docs/run.md)，其中有 pre-commit、GitHub Actions 与 cron 的可复制示例。
+
 ## 功能特性
 
 - 多 LLM provider（DeepSeek / Qwen / GLM / OpenAI / Ollama）

@@ -50,6 +50,13 @@ openviking:
 - `documents.sync_on_exit`：交互式 `chat` 结束时做一次增量同步（默认开）。
 - `documents.sync_interval_seconds`：`serve` 的后台定时同步（默认 0 = 关）。
 - `documents.wait_index`：批量同步是否等待索引完成（默认关；显式保存的文档总是等）。
+- `index_wait_seconds`：写操作允许服务端索引队列跑多久（默认 30）。服务端在
+  `content/write` 的 `wait=true` 时按这个预算等待，**实测本机一篇小文档约需
+  15–17 秒**（语义抽取 + embedding），所以 30 秒够覆盖一个慢周期。
+- `timeout_seconds`：HTTP 客户端单次请求超时（`0` = 自动 = `index_wait_seconds + 15s`）。
+  它**永远不会低于** `index_wait_seconds + 15s`：客户端必须先于服务端放弃，否则
+  你看到的是「context deadline exceeded」，而不是服务端自己的 504，就分不清
+  「索引慢」和「服务不可达」。详见 §5。
 - `mcp.register`：自动把 `<base_url>/mcp` 注册成 MCP server，让模型拿到 OpenViking
   自己的工具。若 `mcp.servers` 里已有同名条目，以你声明的为准。
 
@@ -122,13 +129,52 @@ VLM 可用。
 `find` 可能还看不到。`huan-agent viking sync` 结束时会提示这一点；
 把 `documents.wait_index` 设为 `true` 可以让同步等索引完成（每个文件多一次往返）。
 
+**保存文档报 `context deadline exceeded (Client.Timeout exceeded while awaiting headers)`**
+— 这是客户端超时预算配错了，不是文档丢了。成因：`content/write` 在 `wait=true`
+时先落盘、再等索引，而索引要走完服务端的语义抽取（一次约 15–17 秒）。如果
+HTTP 客户端超时和「服务端等待预算」一样长（旧默认都是 15s），两者会在同一瞬间
+到期，客户端必然先放弃，于是拿到一个什么都说明不了的传输层错误。
+
+现在两者被强制拉开：`index_wait_seconds`（服务端预算，默认 30）严格小于
+`timeout_seconds`（客户端超时，自动 = 前者 + 15s）。所以你会看到服务端自己的
+`HTTP 504: DEADLINE_EXCEEDED`，而不是传输层超时。
+
+**更重要的是：等待超时不再算保存失败。** 内容在等待之前就已落盘，所以
+「等待超时」会被判为「已保存，索引稍后就绪」：打一条 WARN、写进本地同步状态、
+正常返回 URI。只有**连内容都确认读不到**时才报错。想确认服务端在忙什么：
+
+```bash
+ov observer queue      # Semantic / Embedding 队列的 pending / in-progress
+ov status              # queue 组件的健康与处理中数量
+```
+
+如果语义队列长期堆积，把 `index_wait_seconds` 调大即可——它只影响等多久，
+不影响写入是否成功。
+
 **同步把不该传的文件传上去了** — 用 `include` / `exclude` 收敛：
 `**` 跨目录，不含 `/` 的模式（如 `*.log`）也会按文件名在任意层级匹配。
 另外 `max_file_kb` 限制单文件大小，二进制由 `binary_mode` 决定。
 
 **连接失败** — `huan-agent viking status` 会直接把原因打出来；`ov health` 与
-`ov status` 是服务端的自检。服务端不在本机时记得配 `api_key`（api_key 模式下
-`X-API-Key` 必填）并确认 `account` / `user` 有权限。
+`ov status` 是服务端的自检。配置 `api_key`（api_key 模式下 `X-API-Key` 必填）
+并确认 `account` / `user` 指向的子树有权限。
+
+服务端绑定非 loopback 地址时**必须**用 api_key 模式：`~/.openviking/ov.conf` 的
+`server.root_api_key` 一旦非空，认证模式自动从 `dev` 切到 `api_key`，此时
+没有 key 的请求一律 401。key 分两层：`root_api_key` 只能调 admin/system/reindex，
+数据接口（`ls` / `find` / `write`）要用 Admin API 建出来的 **user key**：
+
+```bash
+# 用 root key 建账户与用户，返回 user_key
+curl -X POST http://127.0.0.1:1933/api/v1/admin/accounts/default/users \
+  -H "X-API-Key: $ROOT_KEY" -H "Content-Type: application/json" \
+  -d '{"user_id": "default", "role": "admin"}'
+```
+
+把返回的 `user_key` 填进 `openviking.api_key`（或用 `HUAN_OPENVIKING_API_KEY`）。
+api_key 模式下服务端从 key 推导身份，`X-OpenViking-Account` / `X-OpenViking-User`
+会被**忽略**（不报错），但 `openviking.user` 仍决定写入的
+`viking://user/<user>/huan-agent` 路径，两者要保持一致。
 
 ## 6. 设计取舍
 

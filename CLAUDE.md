@@ -54,6 +54,7 @@ internal/           # 业务代码（不可被外部 import）
   tool/             # 工具注册
   mcp/              # MCP 客户端
   skill/            # Skill 系统
+  prompt/           # 系统提示词（通用 Agent prompt，按界面拼装）
   memory/           # 记忆系统
   context/          # 上下文管理
   usage/            # 用量统计

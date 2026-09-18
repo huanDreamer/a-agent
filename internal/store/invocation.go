@@ -26,6 +26,32 @@ func (s *sqliteStore) RecordInvocation(ctx context.Context, e InvocationEvent) e
 	return nil
 }
 
+// InvocationTotals is the aggregate over a session's tool invocations: how many
+// ran, and how long they took together.
+//
+// It exists because a conversation's header wants a running total, not a page of
+// audit rows: reading (and parsing) every invocation to add up one number would
+// make opening a long conversation slower the longer it gets.
+type InvocationTotals struct {
+	// Calls counts the recorded invocations.
+	Calls int
+	// DurationMs sums their measured wall-clock time.
+	DurationMs int64
+}
+
+// QueryInvocationTotals aggregates one session's tool invocations.
+func (s *sqliteStore) QueryInvocationTotals(ctx context.Context, sessionID string) (InvocationTotals, error) {
+	var out InvocationTotals
+	// COALESCE keeps a session with no invocations at 0 rather than NULL, which
+	// is the answer the caller would otherwise have to special-case.
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(duration_ms), 0) FROM tool_invocations WHERE session_id = ?`,
+		sessionID).Scan(&out.Calls, &out.DurationMs); err != nil {
+		return InvocationTotals{}, fmt.Errorf("invocation totals: %w", err)
+	}
+	return out, nil
+}
+
 // QueryInvocations returns recent invocations matching the filter, newest
 // first. Zero-value filter fields are ignored; Since is an inclusive lower
 // bound, Until an exclusive upper bound, and Limit defaults to 100 (max 1000).

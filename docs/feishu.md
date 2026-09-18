@@ -124,6 +124,16 @@ feishu:
   max_download_mb: 32       # per-attachment cap
 ```
 
+### What the bot is told
+
+The bot answers with the built-in Chinese general-purpose agent prompt plus a
+section describing this surface: answers arrive as interactive cards, an
+over-wide table is split across messages, and there is no `ask_user` card in a
+chat, so the model asks its question in prose instead. `chat.system_prompt`
+replaces that whole default — the surface section included — exactly as it does
+in the console, and it is read at startup, so a deployment that wants its own
+instructions in both places writes them once. See `docs/prompt.md`.
+
 ### Event transport: WebSocket vs callback
 
 By default events arrive over the **WebSocket long-connection**, which needs no

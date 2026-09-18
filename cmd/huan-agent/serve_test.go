@@ -4,6 +4,9 @@ import (
 	"testing"
 
 	"github.com/cloudwego/eino/schema"
+
+	"github.com/huan/huan-agent/internal/config"
+	"github.com/huan/huan-agent/internal/prompt"
 )
 
 func TestSanitizeBotHistory_DropsToolMessages(t *testing.T) {
@@ -82,5 +85,34 @@ func TestSanitizeBotHistory_DoesNotMutateInput(t *testing.T) {
 	_ = sanitizeBotHistory(input)
 	if len(assistant.ToolCalls) != 1 {
 		t.Errorf("input message was mutated (ToolCalls = %d, want 1)", len(assistant.ToolCalls))
+	}
+}
+
+func TestBotSystemPromptFollowsTheOperator(t *testing.T) {
+	// The default is the general-purpose prompt plus the Feishu section, and a
+	// configured chat.system_prompt wins over both — the same rule the console
+	// applies, so a deployment that wrote its own prompt gets it in a chat
+	// instead of the built-in text about cards and tables.
+	h := &botHandler{cfg: &config.Config{}}
+	if got := h.systemPrompt(); got != prompt.For(prompt.SurfaceFeishu) {
+		t.Errorf("systemPrompt = %q, want the Feishu default", got)
+	}
+
+	h.cfg.Chat.SystemPrompt = "  你只回答天气，别的都说不清楚。  "
+	if got, want := h.systemPrompt(), "你只回答天气，别的都说不清楚。"; got != want {
+		t.Errorf("systemPrompt = %q, want %q", got, want)
+	}
+
+	// A whitespace-only value is not a prompt: it is an unset field, and the
+	// model must not be left with no instructions at all.
+	h.cfg.Chat.SystemPrompt = "   "
+	if got := h.systemPrompt(); got != prompt.For(prompt.SurfaceFeishu) {
+		t.Errorf("systemPrompt = %q, want the Feishu default", got)
+	}
+
+	// cfg nil is a supported shape for a handler built in a test or a partial
+	// deployment; it must not panic on the way to the default.
+	if got := (&botHandler{}).systemPrompt(); got != prompt.For(prompt.SurfaceFeishu) {
+		t.Errorf("systemPrompt = %q, want the Feishu default", got)
 	}
 }

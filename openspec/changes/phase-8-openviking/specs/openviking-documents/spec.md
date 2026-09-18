@@ -21,7 +21,13 @@
    不同内容不互相覆盖。
 2. **可检索即可用。** 文档写入 MUST 使用 `content/write` 且等待索引完成
    （`wait=true`），使 `Save` 返回后 `find` MUST 已能命中；返回值 MUST 是写入的
-   `viking://` URI。
+   `viking://` URI。等待预算 MUST 由 `index_wait_seconds` 给出，且 MUST 严格小于
+   HTTP 客户端超时（`timeout_seconds`，未配置时自动取前者 + 15s）——否则客户端先
+   到期，调用方只会看到传输层超时，MUST NOT 出现这种配置组合。
+   - **等待超时不算保存失败。** openviking 先落盘再等索引，故「内容已写入但索引未在
+     预算内完成」MUST 判定为保存成功：MUST 记 WARN、MUST 写入本地同步状态、MUST 返回
+     URI。判定 MUST 先确认（读取该 URI 成功）而不是仅凭错误类型推断；确认失败时 MUST
+     返回原始错误且 MUST NOT 记录状态。
 3. **frontmatter。** 文档 MUST 带 YAML frontmatter：`title`、`tags`、`source`、
    `created_at`、`generator: huan-agent`，便于人工在 openviking 侧识别来源。
 4. **工作区增量。** `SyncWorkspace` MUST 按 `include` / `exclude` glob 过滤，

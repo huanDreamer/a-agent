@@ -54,6 +54,9 @@ type Store interface {
 	// Tool invocation audit log (Phase 2).
 	RecordInvocation(ctx context.Context, e InvocationEvent) error
 	QueryInvocations(ctx context.Context, f InvocationFilter) ([]InvocationRecord, error)
+	// QueryInvocationTotals is the aggregate a conversation's header shows:
+	// how many tools ran in it, and how long they took together.
+	QueryInvocationTotals(ctx context.Context, sessionID string) (InvocationTotals, error)
 
 	// Usage aggregation (Phase 5).
 	QueryUsageTotals(ctx context.Context, w UsageWindow) (UsageTotals, error)
@@ -75,6 +78,14 @@ type Store interface {
 	ListChatMessages(ctx context.Context, sessionID string, limit int) ([]ChatMessage, error)
 	DeleteChatMessages(ctx context.Context, sessionID string) error
 
+	// The task plan a conversation's model maintains (任务看板), and the one
+	// piece of turn state that deliberately outlives its turn: it is what a turn
+	// that died cannot report and the next one needs in order to continue rather
+	// than start over.
+	GetChatPlan(ctx context.Context, sessionID string) (ChatPlanRow, error)
+	SetChatPlan(ctx context.Context, row ChatPlanRow) error
+	DeleteChatPlan(ctx context.Context, sessionID string) error
+
 	// Media attachments uploaded for a chat session (Phase 5 chat).
 	// The bytes live in the workspace; these rows are what a message references.
 	CreateMediaAsset(ctx context.Context, a MediaAsset) error
@@ -95,6 +106,12 @@ type Store interface {
 	MoveWorkspaceBindings(ctx context.Context, from, to string) (int, error)
 	ListScopesInWorkspace(ctx context.Context, name string) ([]string, error)
 	ListUnboundWebSessions(ctx context.Context) ([]string, error)
+
+	// App settings (设置 → 对话预算): the per-turn budget the console may change
+	// while the process runs. Only an explicit override is stored; a nil field
+	// means the key is absent and config.yaml governs.
+	GetTurnBudgetOverride(ctx context.Context) (TurnBudgetOverride, error)
+	SetTurnBudgetOverride(ctx context.Context, o TurnBudgetOverride) error
 
 	// Trace store (Phase 5c). An agent turn and its observation nodes, so the
 	// console can explain a turn without an external observability service.

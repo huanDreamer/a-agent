@@ -18,6 +18,9 @@
 //
 //   * 外观        theme, from theme.js — this browser only;
 //   * 模型        the read-only catalog (what 对话's picker offers) + 模型管理;
+//   * 对话预算    the per-turn budget, editable: it is the one panel here that
+//                 changes how a turn runs, and it exists so a turn that stopped on
+//                 its step cap is not fixable only from a shell;
 //   * MCP         the MCP servers, their live state, and the AI assistant that
 //                 drafts a definition from a description;
 //   * OpenViking  the context database: connection, memory counters, workspace
@@ -37,6 +40,7 @@
 // admin.require_login is on.
 import { computed } from 'vue'
 import AppearancePanel from './AppearancePanel.vue'
+import BudgetPanel from './BudgetPanel.vue'
 import McpPanel from './McpPanel.vue'
 import ModelPanel from './ModelPanel.vue'
 import OpenVikingPanel from './OpenVikingPanel.vue'
@@ -48,6 +52,7 @@ import { SETTINGS_TABS, setSettings, state } from '../state.js'
 const PANELS = {
   appearance: AppearancePanel,
   models: ModelPanel,
+  budget: BudgetPanel,
   mcp: McpPanel,
   openviking: OpenVikingPanel,
   skills: SkillPanel,
@@ -58,6 +63,7 @@ const PANELS = {
 const NOTES = {
   appearance: '主题与显示偏好 · 立即生效，只保存在本机浏览器',
   models: '模型目录与模型管理 · 对话的模型选择器读的就是这里',
+  budget: '每轮预算 · 立即生效（写入数据库），覆盖 config.yaml 的默认值',
   mcp: 'MCP 服务器 · 保存后立即连接，模型下一轮对话即可调用',
   openviking: 'OpenViking 上下文库 · 长期记忆与文档，设置来自服务端配置',
   skills: '技能（Skill）· 启用的技能会出现在对话的系统提示里，由模型按需加载',

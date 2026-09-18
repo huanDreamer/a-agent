@@ -3,6 +3,7 @@ package documents
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,6 +21,10 @@ type fakeClient struct {
 
 	writes      []openviking.WriteRequest
 	writeErr    error
+	reads       []string
+	readErr     error
+	readMissing bool
+	readRes     map[string]string
 	uploads     []string
 	uploadErr   error
 	resources   []openviking.AddResourceRequest
@@ -36,6 +41,30 @@ func (f *fakeClient) WriteContent(_ context.Context, req openviking.WriteRequest
 		return nil, f.writeErr
 	}
 	return &openviking.WriteResult{URI: req.URI}, nil
+}
+
+func (f *fakeClient) ReadContent(_ context.Context, uri string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reads = append(f.reads, uri)
+	if f.readErr != nil {
+		return "", f.readErr
+	}
+	// The default is "the content is there": the interesting case in these
+	// tests is a write that outran indexing, not a missing file.
+	if f.readMissing {
+		return "", &openviking.APIError{Op: "GET /api/v1/content/read", Status: 404, Code: "NOT_FOUND", Message: "no such file"}
+	}
+	if c, ok := f.readRes[uri]; ok {
+		return c, nil
+	}
+	return "", nil
+}
+
+func (f *fakeClient) readURIs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.reads...)
 }
 
 func (f *fakeClient) UploadTemp(_ context.Context, filename string, _ io.Reader) (string, error) {
@@ -171,6 +200,79 @@ func TestSaveSurfacesWriteFailure(t *testing.T) {
 	}
 	if len(s.Documents()) != 0 {
 		t.Error("a failed save was recorded in the state, want nothing recorded")
+	}
+}
+
+// A waited write that outruns the index budget is the shape that produced
+// "context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+// in production: the server had already stored the file, it was only still
+// indexing. Reporting that as a failed save loses the document's state entry.
+func TestSaveTreatsIndexWaitTimeoutAsSaved(t *testing.T) {
+	// The two shapes the client can see: the server's own 504, and a transport
+	// timeout before any response arrived.
+	shapes := map[string]error{
+		"server 504": &openviking.APIError{
+			Op: "POST /api/v1/content/write", Status: 504,
+			Code: "DEADLINE_EXCEEDED", Message: "Queue processing timed out after 30.0s",
+		},
+		"transport timeout": fmt.Errorf("openviking: POST /api/v1/content/write: %w", context.DeadlineExceeded),
+	}
+	for name, shape := range shapes {
+		t.Run(name, func(t *testing.T) {
+			ov := &fakeClient{writeErr: shape}
+			s := newSyncer(t, ov, Config{RootURI: "viking://user/default/huan-agent"})
+			s.now = func() time.Time { return time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC) }
+
+			uri, err := s.Save(context.Background(), Document{Title: "报告", Content: "正文"})
+			if err != nil {
+				t.Fatalf("Save: %v (the content is on the server; this must not be a failure)", err)
+			}
+			// The content must be confirmed with a read, not assumed.
+			if got := ov.readURIs(); len(got) != 1 || got[0] != uri {
+				t.Fatalf("reads = %v, want one read of %q", got, uri)
+			}
+			docs := s.Documents()
+			if len(docs) != 1 || docs[0].URI != uri {
+				t.Fatalf("Documents() = %+v, want the saved document recorded", docs)
+			}
+		})
+	}
+}
+
+// The classifier is a hint, not proof: when the confirming read cannot find the
+// content either, the write genuinely failed and the error must surface.
+func TestSaveKeepsFailureWhenContentIsNotThere(t *testing.T) {
+	ov := &fakeClient{
+		writeErr: &openviking.APIError{
+			Op: "POST /api/v1/content/write", Status: 504,
+			Code: "DEADLINE_EXCEEDED", Message: "Queue processing timed out",
+		},
+		readMissing: true,
+	}
+	s := newSyncer(t, ov, Config{})
+	if _, err := s.Save(context.Background(), Document{Title: "x", Content: "y"}); err == nil {
+		t.Fatal("Save with an unconfirmable write: want error, got nil")
+	}
+	if len(s.Documents()) != 0 {
+		t.Error("an unconfirmed save was recorded in the state, want nothing recorded")
+	}
+}
+
+// A plain rejection is not a wait timeout, so it must not be softened into a
+// success by the confirming read.
+func TestSaveDoesNotSoftenRejections(t *testing.T) {
+	ov := &fakeClient{
+		writeErr: &openviking.APIError{
+			Op: "POST /api/v1/content/write", Status: 400,
+			Code: "INVALID_URI", Message: "extension not supported",
+		},
+	}
+	s := newSyncer(t, ov, Config{})
+	if _, err := s.Save(context.Background(), Document{Title: "x", Content: "y"}); err == nil {
+		t.Fatal("Save with a rejected write: want error, got nil")
+	}
+	if got := ov.readURIs(); len(got) != 0 {
+		t.Errorf("reads = %v, want none (a rejection needs no confirmation)", got)
 	}
 }
 
@@ -411,6 +513,59 @@ func TestSyncWorkspaceCollectsFailuresAndContinues(t *testing.T) {
 	}
 }
 
+// A bulk sync that asked to wait for indexing gets the same treatment as a
+// saved document: running out of index budget is not a failed upload, and
+// counting it as one would make the report lie about files that are there.
+func TestSyncWorkspaceWithWaitIndexTreatsTimeoutAsUploaded(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a.md", "b.md"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("content of "+name), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	ov := &fakeClient{writeErr: &openviking.APIError{
+		Op: "POST /api/v1/content/write", Status: 504,
+		Code: "DEADLINE_EXCEEDED", Message: "Queue processing timed out after 30.0s",
+	}}
+	s := newSyncer(t, ov, Config{WaitForIndex: true})
+
+	rep, err := s.SyncWorkspace(context.Background(), dir, false)
+	if err != nil {
+		t.Fatalf("SyncWorkspace: %v", err)
+	}
+	if rep.Uploaded != 2 {
+		t.Errorf("Uploaded = %d, want 2 (the content is on the server)", rep.Uploaded)
+	}
+	if rep.Failed != 0 {
+		t.Errorf("Failed = %d (%v), want 0", rep.Failed, rep.Errors)
+	}
+	if len(s.Documents()) != 2 {
+		t.Errorf("tracked = %d, want 2 (so the next sync does not re-upload)", len(s.Documents()))
+	}
+}
+
+// Without wait_index an ordinary broken upload is still a failure: nothing
+// about the soft-success path may swallow it.
+func TestSyncWorkspaceWithoutWaitIndexStillReportsFailures(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("hi"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ov := &fakeClient{writeErr: &openviking.APIError{
+		Op: "POST /api/v1/content/write", Status: 0, Code: "UNAVAILABLE",
+		Message: "dial tcp 127.0.0.1:1933: connect: connection refused",
+	}}
+	s := newSyncer(t, ov, Config{WaitForIndex: false})
+
+	rep, err := s.SyncWorkspace(context.Background(), dir, false)
+	if err != nil {
+		t.Fatalf("SyncWorkspace: %v", err)
+	}
+	if rep.Failed != 1 {
+		t.Errorf("Failed = %d, want 1", rep.Failed)
+	}
+}
+
 func TestSyncWorkspaceUnreadableFileIsReportedNotFatal(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: file permissions are not enforced")
@@ -491,6 +646,10 @@ func (b *blockingClient) WriteContent(ctx context.Context, req openviking.WriteR
 		return nil, ctx.Err()
 	}
 	return &openviking.WriteResult{URI: req.URI}, nil
+}
+
+func (b *blockingClient) ReadContent(context.Context, string) (string, error) {
+	return "", errors.New("not used")
 }
 
 func (b *blockingClient) UploadTemp(context.Context, string, io.Reader) (string, error) {

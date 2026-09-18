@@ -103,8 +103,25 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 
 	toolsConfig := compose.ToolsNodeConfig{
-		Tools:               baseTools,
-		ExecuteSequentially: true, // deterministic; helps audit ordering
+		Tools: baseTools,
+		// Sequential on purpose, and not for the reason "it was easier":
+		//
+		//   - The audit log has to read as the program the model wrote. Eino's
+		//     default is parallel (see compose.parallelRunToolCall), and with it the
+		//     order of the recorded entries is the order of completion — so a review
+		//     of "what did the agent do" would show a write before the read that
+		//     informed it.
+		//   - Eino's parallel path has no barrier: two write_file calls in one reply
+		//     run at the same time, which is a lost update on a file the model asked
+		//     to change twice in a known order.
+		//
+		// The web console's loop (internal/chat) does overlap calls, because it
+		// implements the schedule itself: it groups by each tool's declared
+		// concurrency (internal/tool/concurrency.go), serialises everything that did
+		// not declare itself parallel-safe, assembles the results in program order,
+		// and keeps the audit equivalent. If this path is ever given the same
+		// treatment, those are the four properties it has to reproduce.
+		ExecuteSequentially: true, // see above: audit order, and no barrier in the parallel path
 	}
 	if cfg.Audit != nil {
 		toolsConfig.ToolCallMiddlewares = []compose.ToolMiddleware{auditMiddleware(cfg.Audit, cfg.SessionIDFn, cfg.Logger)}
@@ -129,6 +146,7 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 // Generate runs the ReAct loop and returns the final assistant message.
 func (a *Agent) Generate(ctx context.Context, messages []*schema.Message) (*schema.Message, error) {
 	start := time.Now()
+	ctx = a.withTurnResources(ctx, messages)
 	out, err := a.react.Generate(ctx, messages)
 	if err != nil {
 		return nil, err
@@ -141,7 +159,39 @@ func (a *Agent) Generate(ctx context.Context, messages []*schema.Message) (*sche
 // assistant message chunks. Intermediate tool-call / tool-result
 // steps are NOT exposed — the caller sees only the final answer.
 func (a *Agent) Stream(ctx context.Context, messages []*schema.Message) (*schema.StreamReader[*schema.Message], error) {
-	return a.react.Stream(ctx, messages)
+	return a.react.Stream(a.withTurnResources(ctx, messages), messages)
+}
+
+// withTurnResources publishes what a tool needs in order to run something of its
+// own — `spawn_agent`, today.
+//
+// The chat loop publishes the same thing for the same reason: the registry and the
+// model are chosen by whoever owns the turn, and a tool is built once at startup,
+// so neither can be captured in the tool. Without this a subagent on this surface
+// is registered, offered to the model, and fails on every call — which the first
+// end-to-end run on the CLI showed, word for word.
+func (a *Agent) withTurnResources(ctx context.Context, messages []*schema.Message) context.Context {
+	session := "default"
+	if a.cfg.SessionIDFn != nil {
+		session = a.cfg.SessionIDFn()
+	}
+	return tool.WithTurnResources(ctx, tool.TurnResources{
+		Registry:     a.cfg.Tools,
+		Model:        a.cfg.Model,
+		SessionID:    session,
+		SystemPrompt: systemPromptOf(messages),
+	})
+}
+
+// systemPromptOf returns the system message a turn was given, so anything the turn
+// spawns inherits the deployment's instructions rather than starting from none.
+func systemPromptOf(messages []*schema.Message) string {
+	for _, m := range messages {
+		if m != nil && m.Role == schema.System {
+			return m.Content
+		}
+	}
+	return ""
 }
 
 func (a *Agent) recordUsage(ctx context.Context, msg *schema.Message, dur time.Duration) {

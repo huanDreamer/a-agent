@@ -172,6 +172,10 @@ type buildOpts struct {
 	// jobs, when set, is the background-process supervisor the console lists and
 	// stops. Nil covers a deployment with background jobs turned off.
 	jobs *jobs.Manager
+	// checkpoints, when set, turns the file-level checkpoints on for the console.
+	// The zero value covers a deployment with the feature off, which is why the
+	// endpoints are absent in most tests.
+	checkpoints CheckpointSettings
 }
 
 // buildServerWith constructs a Server with optional chat wiring.
@@ -197,20 +201,21 @@ func buildServerWith(t *testing.T, opts buildOpts) (*Server, store.Store) {
 	}
 
 	srv, err := New(Config{
-		Host:          "127.0.0.1",
-		Port:          0,
-		MetricsEnable: true,
-		Version:       "test-version",
-		Provider:      "deepseek",
-		Model:         "deepseek-chat",
-		ChatMaxSteps:  4,
-		Chat:          opts.chat,
-		OpenViking:    opts.openviking,
-		Jobs:          opts.jobs,
-		MCPDial:       opts.mcpDial,
-		Tracer:        opts.tracer,
-		Traces:        opts.traces,
-		Logger:        zap.NewNop(),
+		Host:                "127.0.0.1",
+		Port:                0,
+		MetricsEnable:       true,
+		Version:             "test-version",
+		Provider:            "deepseek",
+		Model:               "deepseek-chat",
+		DefaultChatMaxSteps: 4,
+		Chat:                opts.chat,
+		OpenViking:          opts.openviking,
+		Jobs:                opts.jobs,
+		MCPDial:             opts.mcpDial,
+		Tracer:              opts.tracer,
+		Traces:              opts.traces,
+		Checkpoints:         opts.checkpoints,
+		Logger:              zap.NewNop(),
 	}, st, pricing.NewTable(map[string]pricing.Rate{
 		"deepseek/deepseek-chat": {PromptPer1K: 0.001, CompletionPer1K: 0.002},
 	}, pricing.Rate{}), config.AdminConfig{

@@ -52,11 +52,23 @@ func (s *Server) runnerFor(ctx context.Context, sess store.ChatSession) (*chat.R
 		// static registry above is used exactly as before.
 		ToolsFor: s.chat.ToolsFor,
 		Tracer:   s.tracer,
-		MaxSteps: s.chatMaxSteps(),
-		// The other two budgets, and the condenser that keeps a turn long enough
-		// to need them from resending its whole history every step.
-		MaxTokens: s.chatMaxTokens(),
-		Deadline:  s.chatTurnDeadline(),
+		// Parallel tool calls. It is set here rather than per turn because it is a
+		// property of the deployment, not a dimension of a budget: "how many reads
+		// may overlap" is the same answer whoever is asking.
+		MaxParallel: s.chat.MaxParallel,
+		// MaxSteps / MaxTokens / Deadline are deliberately left unset, so this
+		// runner has no budget of its own: every dimension travels per turn on
+		// chat.Request (see handleSendMessage). A cap captured here would survive
+		// 设置 → 对话预算 changing it while this runner sits in the cache, and the
+		// turn would keep answering with the number it was built with.
+		//
+		// StepRetry is not a budget: it is how the runner behaves when a step
+		// fails, so it belongs to the runner and comes from the deployment.
+		StepRetry: s.chat.StepRetry,
+		// The condenser that keeps a turn long enough to need a big step budget
+		// from resending its whole history every step is built once, from
+		// context.max_tokens, so it is the one half of the budget a console
+		// change cannot make live — the panel says so.
 		Condenser: s.chat.Condenser,
 		Logger:    s.logger,
 	})
@@ -97,6 +109,18 @@ func (c *runnerCache) put(key string, r *chat.Runner) {
 	c.m[key] = r
 }
 
+// reset drops every cached runner.
+//
+// It is called when the per-turn budget changes, because a runner is built with
+// its budget baked in: keeping a cached one would leave an already-used model
+// running the old step cap until the process restarted, which is exactly the
+// behaviour the console's budget panel exists to remove.
+func (c *runnerCache) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m = nil
+}
+
 // maxRunnerCache bounds cached runners.
 const maxRunnerCache = 32
 
@@ -114,6 +138,20 @@ const maxRunnerCache = 32
 // turn it was sent. Re-inlining it here would re-upload the same base64 payload
 // on every later turn of the conversation.
 func (s *Server) buildHistory(ctx context.Context, sess store.ChatSession, newUser *schema.Message) ([]*schema.Message, error) {
+	return s.buildHistoryWithContext(ctx, sess, nil, newUser)
+}
+
+// buildHistoryWithContext is buildHistory with extra messages injected between
+// the stored conversation and the new user message.
+//
+// The extra messages are for the model only and are never stored. That split is
+// the point: a resumed turn has to hand the model a briefing (what the previous
+// attempt already did, what the plan says is left) without that briefing
+// appearing in the transcript as something a person typed. The last message is
+// still the user's, so the model's instruction is unambiguous.
+func (s *Server) buildHistoryWithContext(ctx context.Context, sess store.ChatSession,
+	extra []*schema.Message, newUser *schema.Message) ([]*schema.Message, error) {
+
 	limit := s.chatHistoryLimit()
 	stored, err := s.store.ListChatMessages(ctx, sess.ID, 0)
 	if err != nil {
@@ -150,6 +188,9 @@ func (s *Server) buildHistory(ctx context.Context, sess store.ChatSession, newUs
 		// is already reflected in the assistant's next answer.
 	}
 
+	if len(extra) > 0 {
+		msgs = append(msgs, extra...)
+	}
 	if newUser != nil {
 		msgs = append(msgs, newUser)
 	}

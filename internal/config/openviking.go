@@ -30,8 +30,17 @@ type OpenVikingConfig struct {
 	// Empty falls back to "default", which a local install uses.
 	Account string `mapstructure:"account" json:"account"`
 	User    string `mapstructure:"user" json:"user"`
-	// TimeoutSeconds bounds one API call. 0 uses the client default (15s).
+	// TimeoutSeconds bounds one HTTP call. 0 uses the client default (15s),
+	// and the effective timeout is always at least IndexWait() plus a margin:
+	// the server must be able to answer before we stop listening, or a slow
+	// index turns into an opaque transport error instead of the server's own
+	// verdict.
 	TimeoutSeconds int `mapstructure:"timeout_seconds" json:"timeout_seconds"`
+	// IndexWaitSeconds is how long a write may wait for OpenViking's index
+	// queue. It is the "timeout" field the server honours when a write asks to
+	// wait for indexing, so it must stay comfortably below TimeoutSeconds.
+	// 0 uses the default (30s).
+	IndexWaitSeconds int `mapstructure:"index_wait_seconds" json:"index_wait_seconds"`
 
 	Memory    OpenVikingMemoryConfig    `mapstructure:"memory" json:"memory"`
 	Documents OpenVikingDocumentsConfig `mapstructure:"documents" json:"documents"`
@@ -148,6 +157,18 @@ const (
 	DefaultOpenVikingBinaryMode = "skip"
 	// DefaultOpenVikingTimeoutSeconds bounds one API call.
 	DefaultOpenVikingTimeoutSeconds = 15
+	// DefaultOpenVikingIndexWaitSeconds is how long a waited write lets the
+	// server's index queue run before it answers 504. Measured on a local `ov`,
+	// a small document takes ~15-17s to get through semantic extraction and
+	// embedding, so 30s leaves room for one slow cycle without making a stalled
+	// server feel like a hang.
+	DefaultOpenVikingIndexWaitSeconds = 30
+	// DefaultOpenVikingTimeoutMargin is the gap kept between the HTTP client
+	// timeout and the server-side index wait. Without it the two fire at the
+	// same instant and the caller reliably sees "context deadline exceeded
+	// (Client.Timeout exceeded while awaiting headers)" instead of a 504 it
+	// could classify and act on.
+	DefaultOpenVikingTimeoutMargin = 15
 )
 
 // DefaultOpenVikingInclude is the text allow-list used when none is configured.
@@ -169,12 +190,32 @@ func (c OpenVikingConfig) Enabled() bool {
 	return c.Enable && strings.TrimSpace(c.BaseURL) != ""
 }
 
-// Timeout returns the configured per-call timeout.
-func (c OpenVikingConfig) Timeout() time.Duration {
-	if c.TimeoutSeconds <= 0 {
-		return DefaultOpenVikingTimeoutSeconds * time.Second
+// IndexWait returns how long a write may wait for OpenViking's index queue.
+// It is the server-side budget, sent as the request's "timeout" field.
+func (c OpenVikingConfig) IndexWait() time.Duration {
+	if c.IndexWaitSeconds > 0 {
+		return time.Duration(c.IndexWaitSeconds) * time.Second
 	}
-	return time.Duration(c.TimeoutSeconds) * time.Second
+	return DefaultOpenVikingIndexWaitSeconds * time.Second
+}
+
+// Timeout returns the HTTP client timeout for one call.
+//
+// It is deliberately never shorter than IndexWait plus a margin. The two are
+// not independent knobs: if the client gives up first, a write that only ran
+// slow is reported as an unreachable server, the server's own 504 never gets
+// seen, and the caller cannot tell "saved but still indexing" from "never
+// arrived". Enforcing the ordering here means no configuration can recreate
+// that failure.
+func (c OpenVikingConfig) Timeout() time.Duration {
+	timeout := DefaultOpenVikingTimeoutSeconds * time.Second
+	if c.TimeoutSeconds > 0 {
+		timeout = time.Duration(c.TimeoutSeconds) * time.Second
+	}
+	if floor := c.IndexWait() + DefaultOpenVikingTimeoutMargin*time.Second; timeout < floor {
+		timeout = floor
+	}
+	return timeout
 }
 
 // AccountOr returns the configured account, defaulting to "default".

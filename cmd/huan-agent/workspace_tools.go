@@ -39,9 +39,12 @@ import (
 	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/jobs"
+	"github.com/huan/huan-agent/internal/lsp"
 	"github.com/huan/huan-agent/internal/mcp"
 	"github.com/huan/huan-agent/internal/media"
+	"github.com/huan/huan-agent/internal/prompt"
 	"github.com/huan/huan-agent/internal/store"
+	"github.com/huan/huan-agent/internal/subagent"
 	"github.com/huan/huan-agent/internal/tool/builtin"
 	"github.com/huan/huan-agent/internal/viking"
 	"github.com/huan/huan-agent/internal/workspace"
@@ -64,9 +67,15 @@ type workspaceToolSet struct {
 	// "nothing outlives the agent" a property of the process rather than of a
 	// workspace. Nil withholds the background tools.
 	jobs *jobs.Manager
-	// surface names where these tools are used (web, cli, feishu). It is recorded
-	// on every background job, so the console can say who started a process.
+	// surface names where these tools are used (web, cli, feishu, run). It is
+	// recorded on every background job, so the console can say who started a
+	// process.
 	surface string
+	// allowBackground overrides the one-shot surface's default of withholding the
+	// background-process tools. See build.
+	allowBackground bool
+	// gate applies the approval policy to what this set builds.
+	gate approvalGate
 
 	mu       sync.Mutex
 	resolved map[store.Capability]mediaTarget
@@ -83,27 +92,72 @@ type toolSetOptions struct {
 	// Jobs is the background-process supervisor. Nil withholds the background
 	// tools rather than registering tools that cannot work.
 	Jobs *jobs.Manager
-	// Surface names the caller: web, cli or feishu.
+	// Surface names the caller: web, cli, feishu or run.
 	//
 	// It is not only a label: a tool that needs something only one surface has is
 	// registered off it. ask_user is the case it exists for — it parks the turn
 	// until a person answers on the console's card, so the surfaces with no card
 	// never see the tool at all.
 	Surface string
+	// AllowBackground permits the background-process tools on a surface that
+	// otherwise withholds them. Only `huan-agent run` needs it: its default is
+	// "no", because a process it leaves behind survives the run.
+	AllowBackground bool
+	// Gate puts the write and exec tools behind an approval, or withholds them on
+	// a surface that cannot ask. The zero value gates nothing, which is what every
+	// deployment gets until it turns the gate on.
+	Gate approvalGate
+	// SpawnAgent runs a subagent. Nil means this surface has no subagents, which is
+	// how a deployment with them off (or a surface that cannot support them) keeps
+	// the tool off the menu.
+	SpawnAgent *subagent.Agent
+	// ResolveModel turns a model name into a model, for a subagent the model asked
+	// to run on something cheaper.
+	ResolveModel agenttool.ModelResolver
 }
 
+// promptSurfaceRun is the surface name of the one-shot command. It is spelled
+// from internal/prompt so the tool set and the system prompt cannot disagree
+// about which surface they are building for.
+const promptSurfaceRun = prompt.SurfaceRun
+
 // newWorkspaceToolSet builds a tool set for one process.
+//
+// It resolves the approval gate itself when the caller has not, rather than
+// requiring every construction site to remember. That is deliberate: the console
+// builds its per-turn bindings from a different place than the CLI does, and a
+// gate that covers the tools registered at startup but not the ones bound per turn
+// would leave every write ungated while looking configured.
 func newWorkspaceToolSet(cfg *config.Config, st store.Store, logger *zap.Logger, opts toolSetOptions) *workspaceToolSet {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	if opts.Gate.policy.Mode == "" && opts.Gate.surface == "" {
+		if policy, err := approvalPolicyFor(cfg); err == nil {
+			opts.Gate = approvalGate{
+				policy:  policy,
+				canAsk:  approvalSurfaceCanAsk(opts.Surface),
+				surface: opts.Surface,
+				logger:  logger,
+			}
+		} else {
+			// An unparseable mode is refused by registerBuiltinTools, which runs
+			// before any of this. Reaching here means a caller built a tool set
+			// without going through it; starting ungated would be the wrong
+			// direction, so the policy stays off only because the caller already
+			// decided the tool set is not for a gated surface.
+			logger.Warn("approval mode could not be parsed; this tool set is not gated", zap.Error(err))
+		}
+	}
 	return &workspaceToolSet{
-		cfg:      cfg,
-		st:       st,
-		logger:   logger,
-		jobs:     opts.Jobs,
-		surface:  opts.Surface,
-		resolved: map[store.Capability]mediaTarget{},
+		cfg:             cfg,
+		st:              st,
+		logger:          logger,
+		jobs:            opts.Jobs,
+		surface:         opts.Surface,
+		allowBackground: opts.AllowBackground,
+		gate:            opts.Gate,
+		resolved:        map[store.Capability]mediaTarget{},
 	}
 }
 
@@ -117,6 +171,19 @@ func newWorkspaceToolSet(cfg *config.Config, st store.Store, logger *zap.Logger,
 // "the call was refused" is a worse answer than a tool that was never on the
 // menu.
 func (s *workspaceToolSet) build(ws *workspace.Workspace, label string) ([]agenttool.Tool, error) {
+	out, err := s.buildUngated(ws, label)
+	if err != nil {
+		return nil, err
+	}
+	// The gate is applied here, at the one exit, rather than at each return
+	// inside: this function has four of them (read-only, no shell, no job
+	// manager, the normal path) and a gate that covers three is worse than none,
+	// because it looks like it covers four.
+	return s.gate.applyToTools(out), nil
+}
+
+// buildUngated assembles the workspace's tools without the approval gate.
+func (s *workspaceToolSet) buildUngated(ws *workspace.Workspace, label string) ([]agenttool.Tool, error) {
 	if ws == nil {
 		return nil, fmt.Errorf("workspace tool set: 缺少工作区沙箱")
 	}
@@ -138,16 +205,96 @@ func (s *workspaceToolSet) build(ws *workspace.Workspace, label string) ([]agent
 		if err != nil {
 			return nil, fmt.Errorf("build %s tool: %w", r.name, err)
 		}
-		out = append(out, agenttool.WithCapability(t, agenttool.CapRead))
+		// ParallelSafe: reading a file, listing a directory, globbing and grepping
+		// observe state and touch nothing, so two of them overlapping is not a
+		// question of policy — it is just I/O the model asked for twice.
+		out = append(out, agenttool.WithConcurrency(
+			agenttool.WithCapability(t, agenttool.CapRead), agenttool.ParallelSafe))
 	}
 
 	// The media tools read (and, for image generation, write) files in the same
 	// workspace, so they follow the same process-wide policy.
 	out = append(out, s.mediaTools(ws, s.cfg.Tools.ReadOnly)...)
 
+	// Code intelligence: diagnostics, definitions, references, symbols. It is
+	// bound to the workspace like the file tools are, because a language server
+	// answers about the project its root names. When the capability is off, or no
+	// server is configured, this contributes nothing at all — see
+	// codeIntelligenceFor.
+	codeIntel, diagnoser := codeIntelligenceFor(s.cfg, ws, s.logger)
+	out = append(out, codeIntel...)
+
 	if s.cfg.Tools.ReadOnly {
 		return out, nil
 	}
+
+	// The checkpointer is built here, for this workspace, rather than being handed
+	// in: the console serves several workspaces from one process, and a
+	// checkpointer created once would resolve every path through whichever
+	// workspace happened to be current when it was made. A failure disables
+	// checkpoints for this workspace with a warning — a broken safety net must not
+	// take the file tools down with it.
+	checkpointer, cpErr := newCheckpointer(s.cfg, ws, s.logger)
+	if cpErr != nil {
+		s.logger.Warn("checkpoints disabled for this workspace", zap.Error(cpErr))
+	}
+
+	// A write tool is wrapped in two decorators, in this order:
+	//
+	//   checkpoint guard → writes the pre-image before the tool runs
+	//   diagnostics feedback → appends what the language server says afterwards
+	//
+	// The order matters and is not symmetric: the guard has to be outside so its
+	// capture happens first, because after the write there is no previous content
+	// left to record. Both are applied here rather than inside write_file so that
+	// every way of writing a file gets them, and so the sandbox-bound tools stay
+	// free of any knowledge of language servers or checkpoints.
+	// Serial, and the declaration sits on the outside of both decorators: two
+	// writes are a barrier even when they name different files, because "write A
+	// then write B" is an order the model chose and a checkpointer's pre-image is
+	// taken for exactly one file at a time.
+	feedback := func(t tool.InvokableTool) agenttool.Tool {
+		var out agenttool.Tool = t
+		if checkpointer != nil {
+			out = checkpointer.Guard(out, "path")
+		}
+		if diagnoser != nil {
+			out = lsp.NewFeedback(out, diagnoser, feedbackOptions(s.cfg, ws))
+		}
+		return agenttool.WithConcurrency(
+			agenttool.WithCapability(out, agenttool.CapWrite), agenttool.Serial)
+	}
+
+	// apply_patch: the multi-file, all-or-nothing editor. It goes through the same
+	// wrappers as the single-file writers below, which is what makes a batch edit
+	// visible to the approval gate and to the checkpoint of the turn that asked
+	// for it.
+	batch, perr := newApplyPatchBatch(s, ws, checkpointer)
+	if perr != nil {
+		return nil, perr
+	}
+	patchTool, perr := newApplyPatchTool(s, ws, batch)
+	if perr != nil {
+		return nil, perr
+	}
+	// rename_symbol: the same batch applier, driven by the language server's
+	// reference set instead of by a patch the model wrote. It is absent on a
+	// read-only workspace and where no language server is configured.
+	renameTool, rerr := newRenameSymbolTool(s, languageServers(s.cfg, s.logger), ws, batch)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if renameTool != nil {
+		out = append(out, feedback(renameTool))
+	}
+
+	if patchTool != nil {
+		// It goes through the same wrapper as the single-file writers, which is
+		// what makes a batch edit visible to the approval gate and to the
+		// checkpoint of the turn that asked for it.
+		out = append(out, feedback(patchTool))
+	}
+
 	writers := []struct {
 		name string
 		make func(*workspace.Workspace) (tool.InvokableTool, error)
@@ -160,7 +307,7 @@ func (s *workspaceToolSet) build(ws *workspace.Workspace, label string) ([]agent
 		if err != nil {
 			return nil, fmt.Errorf("build %s tool: %w", w.name, err)
 		}
-		out = append(out, agenttool.WithCapability(t, agenttool.CapWrite))
+		out = append(out, feedback(t))
 	}
 
 	if !s.cfg.Tools.EnableBash {
@@ -170,7 +317,11 @@ func (s *workspaceToolSet) build(ws *workspace.Workspace, label string) ([]agent
 	if err != nil {
 		return nil, fmt.Errorf("build bash tool: %w", err)
 	}
-	out = append(out, agenttool.WithCapability(bashTool, agenttool.CapExec))
+	// Serial: a command can do anything the process user can, including changing
+	// files, so it is a barrier by definition. "Run the tests" overlapping "write
+	// the source it tests" is the failure this ordering exists to prevent.
+	out = append(out, agenttool.WithConcurrency(
+		agenttool.WithCapability(bashTool, agenttool.CapExec), agenttool.Serial))
 
 	// Background processes are a separate, explicit capability rather than a mode
 	// of bash. That split is the point: bash keeps its guarantee that a call
@@ -178,6 +329,15 @@ func (s *workspaceToolSet) build(ws *workspace.Workspace, label string) ([]agent
 	// They are withheld — not registered and refused — when the operator turned
 	// them off or when this process has no manager to supervise them with.
 	if !s.cfg.Tools.EnableBackground || s.jobs == nil {
+		return out, nil
+	}
+	// A one-shot run is withheld from these tools as well, and for a reason that
+	// has nothing to do with policy: nobody is around after it exits. A dev
+	// server started by `huan-agent run` would outlive the process that
+	// supervises it, and the next run would find a port already taken by a
+	// process it cannot name. `--allow-background` is the explicit opt-in, and
+	// the caller then owns stopping them.
+	if s.surface == promptSurfaceRun && !s.allowBackground {
 		return out, nil
 	}
 	backgroundTools, err := builtin.NewBackgroundTools(ws, s.jobs, builtin.BackgroundPolicy{
@@ -194,7 +354,17 @@ func (s *workspaceToolSet) build(ws *workspace.Workspace, label string) ([]agent
 		return nil, fmt.Errorf("build background tools: %w", err)
 	}
 	for _, t := range backgroundTools {
-		out = append(out, agenttool.WithCapability(t, agenttool.CapExec))
+		// Serial, with one exception worth stating: `bash_output` (reading a job's
+		// log) is parallel-safe, and it is the tool a model calls several times in
+		// one breath while watching a build. The others start, stop or list
+		// processes, which is a barrier.
+		mode := agenttool.Serial
+		if info, ierr := t.Info(context.Background()); ierr == nil && info != nil &&
+			info.Name == builtin.BackgroundOutputToolName {
+			mode = agenttool.ParallelSafe
+		}
+		out = append(out, agenttool.WithConcurrency(
+			agenttool.WithCapability(t, agenttool.CapExec), mode))
 	}
 	return out, nil
 }
@@ -240,7 +410,11 @@ func (s *workspaceToolSet) mediaTools(ws *workspace.Workspace, readOnly bool) []
 				zap.String("capability", string(c.capability)), zap.Error(err))
 			continue
 		}
-		out = append(out, agenttool.WithCapability(t, c.access))
+		// The media tools may read a file or write a generated one, and they call a
+		// model to do it: Serial regardless of which, because a "generate an
+		// image" call overlapping three others is a bill nobody asked for.
+		out = append(out, agenttool.WithConcurrency(
+			agenttool.WithCapability(t, c.access), agenttool.Serial))
 	}
 	return out
 }
@@ -264,28 +438,6 @@ func (s *workspaceToolSet) mediaTarget(cap store.Capability) (media.Target, bool
 	}
 	s.resolved[cap] = mediaTarget{target: target, ok: ok}
 	return target, ok
-}
-
-// registerStaticTools adds the tools that do not depend on a workspace.
-//
-// These are the ones a workspace clone carries by reference: they have no path
-// to resolve, so every turn gets the same instance.
-func (s *workspaceToolSet) registerStaticTools(reg *agenttool.Registry, svc *viking.Service) error {
-	basics := []func() (agenttool.Tool, error){
-		func() (agenttool.Tool, error) { return builtin.NewTimeTool() },
-		func() (agenttool.Tool, error) { return builtin.NewCalcTool() },
-		func() (agenttool.Tool, error) { return builtin.NewEchoTool() },
-	}
-	for _, make := range basics {
-		t, err := make()
-		if err != nil {
-			return err
-		}
-		if err := reg.Register(agenttool.WithCapability(t, agenttool.CapRead)); err != nil {
-			return err
-		}
-	}
-	return registerDocumentTool(reg, s.cfg, svc)
 }
 
 // workspaceBindings turns a scope into the tool registry a turn should run with.
@@ -363,7 +515,13 @@ func (b *workspaceBindings) bind(ws *workspace.Workspace, spec workspaces.Spec) 
 // list would leak the base registry's binding — built for the default
 // workspace — into a turn running somewhere else.
 func workspaceBoundToolNames() []string {
-	names := []string{"read_file", "list_dir", "glob", "grep", "write_file", "edit_file", "bash"}
+	names := []string{"read_file", "list_dir", "glob", "grep", "write_file", "edit_file", "bash",
+		// apply_patch and rename_symbol edit files inside a workspace, so which files
+		// they may touch and whether they may write at all follow the turn's
+		// workspace like the single-file writers do. rename_symbol also depends on
+		// the workspace for the language server that answers it.
+		builtin.ApplyPatchToolName,
+		builtin.RenameSymbolToolName}
 	// The background tools are bound here for the same reason bash is: their
 	// policy (read-only workspace, deny patterns, cwd) and the jobs they may
 	// manage both follow the workspace a turn runs in.
@@ -528,34 +686,29 @@ func (t *feishuTooling) close() {
 func buildFeishuTooling(ctx context.Context, cfg *config.Config, st store.Store, logger *zap.Logger,
 	svc *viking.Service, jobMgr *jobs.Manager) (*feishuTooling, error) {
 
+	// The bot spawns subagents on the same Eino loop the CLI uses. It is a surface
+	// with no approval channel, so the write tools it may hand a subagent are the
+	// ones it does not register in the first place — the narrowing then has nothing
+	// to grant, which is the correct outcome rather than a special case.
+	spawner, spawnErr := spawnerForEino(cfg, st, "", nil, logger)
+	if spawnErr != nil {
+		logger.Warn("subagents disabled", zap.Error(spawnErr))
+	}
+
 	out := &feishuTooling{base: agenttool.NewRegistry()}
-	if err := registerBuiltinTools(out.base, cfg, st, logger, svc, toolSetOptions{Jobs: jobMgr, Surface: "feishu"}); err != nil {
+	if err := registerBuiltinTools(out.base, cfg, st, logger, svc, toolSetOptions{
+		Jobs:       jobMgr,
+		Surface:    "feishu",
+		SpawnAgent: spawner,
+	}); err != nil {
 		return nil, fmt.Errorf("register builtin tools: %w", err)
 	}
 
-	for _, s := range cfg.MCP.Servers {
-		if !s.IsEnabled() {
-			continue
-		}
-		c, err := mcp.Connect(ctx, mcp.ServerSpec{
-			Name:    s.Name,
-			Command: s.Command,
-			Args:    s.Args,
-			Env:     s.Env,
-		})
-		if err != nil {
-			out.close()
-			return nil, fmt.Errorf("connect mcp %s: %w", s.Name, err)
-		}
-		out.clients = append(out.clients, c)
-		n, rerr := mcp.RegisterMCPTools(ctx, out.base, c, logger)
-		if rerr != nil {
-			out.close()
-			return nil, fmt.Errorf("register mcp tools %s: %w", s.Name, rerr)
-		}
-		logger.Info("mcp server connected for the feishu bot",
-			zap.String("server", s.Name), zap.Int("tools", n))
+	clients, err := connectConfiguredMCP(ctx, out.base, cfg, logger, "feishu")
+	if err != nil {
+		return nil, err
 	}
+	out.clients = clients
 
 	mgr, err := newWorkspaceManager(cfg, st, logger)
 	if err != nil {

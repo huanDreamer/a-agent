@@ -21,12 +21,14 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/huan/huan-agent/internal/agent"
+	"github.com/huan/huan-agent/internal/checkpoint"
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/jobs"
 	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/mcp"
 	"github.com/huan/huan-agent/internal/media"
 	"github.com/huan/huan-agent/internal/obs"
+	"github.com/huan/huan-agent/internal/prompt"
 	"github.com/huan/huan-agent/internal/skill"
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/tool"
@@ -123,6 +125,12 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		}
 	}
 	registry := llm.NewRegistry(providers, cfg.LLM.DefaultProvider)
+	// Every model this process builds retries a transient call failure with
+	// exponential backoff. It is applied here, where the providers are
+	// constructed, rather than at each call site: a dropped connection interrupts
+	// a long task whichever surface started it, and the CLI's ReAct loop has no
+	// retry of its own.
+	registry.WithOptions(llm.WithRetry(cfg.LLM.RetryPolicy(), logger))
 
 	chosen := chatProvider
 	if chosen == "" {
@@ -139,7 +147,7 @@ func runChat(cmd *cobra.Command, _ []string) error {
 	if chatModel != "" {
 		prov, _ := registry.Provider(chosen)
 		prov.Model = chatModel
-		cm, err = llm.New(prov)
+		cm, err = llm.New(prov, llm.WithRetry(cfg.LLM.RetryPolicy(), logger))
 		if err != nil {
 			return err
 		}
@@ -178,8 +186,12 @@ func runChat(cmd *cobra.Command, _ []string) error {
 	fmt.Println(banner(chosen, effectiveModel(registry, chosen, chatModel), chatTools, chatSkill))
 	fmt.Println()
 
-	// Build the system prompt (skill or --system) and wire memory + context.
-	systemPrompt := chatSystem
+	// Build the system prompt and wire memory + context. A skill's body is a
+	// prompt of its own, so --skill wins over --system; either wins over the
+	// general-purpose prompt every surface starts from, which is what keeps
+	// `huan-agent chat` the same agent as the console instead of a model with no
+	// instructions at all.
+	systemPrompt := prompt.Effective(chatSystem, prompt.SurfaceCLI)
 	if chosenSkill != nil {
 		systemPrompt = chosenSkill.SystemPrompt()
 	}
@@ -223,6 +235,14 @@ func runChat(cmd *cobra.Command, _ []string) error {
 	}
 	defer jobMgr.Close()
 
+	// Checkpoints: the pre-image of every file a turn changes. The path is
+	// resolved here rather than inside the tool set so a deployment that turned
+	// the feature off pays nothing for it.
+	checkpointer, cpErr := newCheckpointer(cfg, workspaceForCheckpoints(cfg), logger)
+	if cpErr != nil {
+		logger.Warn("checkpoints disabled", zap.Error(cpErr))
+	}
+
 	// Build the agent if tools are enabled. Tool registry + MCP clients live
 	// for the duration of the REPL.
 	var (
@@ -231,7 +251,7 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		mcpClients []*mcp.Client
 	)
 	if chatTools {
-		ag, toolReg, mcpClients, err = buildAgent(ctx, cm, cfg, chosenSkill, st, logger, sessionID, vikingSvc, jobMgr)
+		ag, toolReg, mcpClients, err = buildAgent(ctx, cm, cfg, chosenSkill, st, logger, sessionID, vikingSvc, jobMgr, checkpointer, recorder)
 		if err != nil {
 			return fmt.Errorf("build agent: %w", err)
 		}
@@ -248,6 +268,28 @@ func runChat(cmd *cobra.Command, _ []string) error {
 
 	in := bufio.NewScanner(os.Stdin)
 	in.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	// The approval gate's terminal half. It reads through the scanner above
+	// rather than opening os.Stdin, because two readers on one terminal would
+	// fight over lines: whichever goroutine reached the file descriptor first
+	// would take the line the other was waiting for.
+	approver := newCLIApprover(
+		func() (string, bool) {
+			if !in.Scan() {
+				return "", false
+			}
+			return in.Text(), true
+		},
+		os.Stderr,
+		terminalInteractive(),
+	)
+	if gateMode, _ := approvalPolicyFor(cfg); gateMode.Mode != tool.ApprovalOff && !approver.interactive {
+		// A piped session has nobody to ask. The gate withholds the write and
+		// exec tools instead of refusing every call, and saying so once here is
+		// what turns "why are there no write tools" into an answer.
+		logger.Info("approval gate: stdin is not a terminal, so interactive approval is unavailable; " +
+			"write and exec tools are withheld for this session (tools.approval.mode=off gives them back)")
+	}
 
 	for {
 		fmt.Print("you> ")
@@ -297,6 +339,9 @@ func runChat(cmd *cobra.Command, _ []string) error {
 				fmt.Printf("(remembered %q)\n", key)
 			}
 			continue
+		case strings.HasPrefix(lower, "/checkpoints"), strings.HasPrefix(lower, "/rollback"):
+			runCheckpointCommand(line, checkpointer, sessionID)
+			continue
 		case strings.HasPrefix(lower, "/recall "):
 			facts, _ := mem.recallFacts(strings.TrimSpace(line[len("/recall "):]), 5)
 			if len(facts) == 0 {
@@ -319,7 +364,14 @@ func runChat(cmd *cobra.Command, _ []string) error {
 
 		var runErr error
 		if ag != nil {
-			runErr = agentOnce(ctx, ag, &history)
+			// A fresh allowance set per turn: "allow for this turn" has to end
+			// when the turn does, and the context is what enforces it. The
+			// checkpoint turn is opened at the same moment, so the pre-image of
+			// every file this turn writes is attributed to it.
+			turnCtx, endTurn := beginCheckpointTurn(ctx, checkpointer, sessionID, logger)
+			turnCtx = tool.WithApprover(tool.WithTurnAllowances(turnCtx), approver)
+			runErr = agentOnce(turnCtx, ag, &history)
+			endTurn()
 		} else {
 			runErr = streamOnce(ctx, cm, registry, chosen, chatModel, &history, sessionID, recorder, logger)
 		}
@@ -354,42 +406,39 @@ func buildAgent(
 	sessionID string,
 	svc *viking.Service,
 	jobMgr *jobs.Manager,
+	checkpointer *checkpoint.Checkpointer,
+	rec *usage.Recorder,
 ) (*agent.Agent, *tool.Registry, []*mcp.Client, error) {
 	tcm, ok := cm.(model.ToolCallingChatModel)
 	if !ok {
 		return nil, nil, nil, fmt.Errorf("provider does not support tool calling")
 	}
 
+	// The subagents this surface can spawn. The CLI drives Eino's ReAct loop, so it
+	// needs the Eino runner; the spawner is the process's, so the concurrency gate
+	// is shared with any other surface in the same process.
+	spawner, spawnErr := spawnerForEino(cfg, st, sessionID, rec, logger)
+	if spawnErr != nil {
+		logger.Warn("subagents disabled", zap.Error(spawnErr))
+	}
+
 	reg := tool.NewRegistry()
 	if err := registerBuiltinTools(reg, cfg, st, logger, svc,
-		toolSetOptions{Jobs: jobMgr, Surface: "cli"}); err != nil {
+		toolSetOptions{
+			Jobs:       jobMgr,
+			Surface:    "cli",
+			SpawnAgent: spawner,
+			// No model resolver on this surface: the model registry lives one
+			// level up, and a subagent that asks for a specific model gets a clear
+			// refusal from the tool rather than silently running on the parent's.
+			ResolveModel: nil,
+		}); err != nil {
 		return nil, nil, nil, fmt.Errorf("register builtin tools: %w", err)
 	}
 
-	var clients []*mcp.Client
-	for _, s := range cfg.MCP.Servers {
-		c, err := mcp.Connect(ctx, mcp.ServerSpec{
-			Name:    s.Name,
-			Command: s.Command,
-			Args:    s.Args,
-			Env:     s.Env,
-		})
-		if err != nil {
-			// Roll back on failure: kill the servers we already started.
-			for _, prev := range clients {
-				_ = prev.Close()
-			}
-			return nil, nil, nil, fmt.Errorf("connect mcp %s: %w", s.Name, err)
-		}
-		clients = append(clients, c)
-		n, rErr := mcp.RegisterMCPTools(ctx, reg, c, logger)
-		if rErr != nil {
-			for _, prev := range clients {
-				_ = prev.Close()
-			}
-			return nil, nil, nil, fmt.Errorf("register mcp tools %s: %w", s.Name, rErr)
-		}
-		logger.Info("mcp server connected", zap.String("name", s.Name), zap.Int("tools", n))
+	clients, err := connectConfiguredMCP(ctx, reg, cfg, logger, "cli")
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	// Apply allow-list: skill wins, then config, else "allow all".
@@ -436,6 +485,24 @@ func buildAgent(
 // caller can expose read-only access to a less trusted surface.
 func registerBuiltinTools(reg *tool.Registry, cfg *config.Config, st store.Store, logger *zap.Logger,
 	svc *viking.Service, opts toolSetOptions) error {
+
+	// The approval gate is resolved once per surface and passed down, so the
+	// workspace-bound tools this function registers on the way out are gated the
+	// same way the base ones are. A failure to parse the mode is a configuration
+	// error worth refusing: starting with a gate the operator did not ask for is
+	// worse than not starting.
+	policy, err := approvalPolicyFor(cfg)
+	if err != nil {
+		return err
+	}
+	gate := approvalGate{
+		policy:  policy,
+		canAsk:  approvalSurfaceCanAsk(opts.Surface),
+		surface: opts.Surface,
+		logger:  logger,
+	}
+	opts.Gate = gate
+
 	basics := []struct {
 		make func() (tool.Tool, error)
 	}{
@@ -448,7 +515,10 @@ func registerBuiltinTools(reg *tool.Registry, cfg *config.Config, st store.Store
 		if err != nil {
 			return err
 		}
-		if err := reg.Register(tool.WithCapability(t, tool.CapRead)); err != nil {
+		// ParallelSafe: time, calc and echo are pure — no state, no I/O, nothing
+		// another call could observe.
+		if err := reg.Register(tool.WithConcurrency(
+			tool.WithCapability(t, tool.CapRead), tool.ParallelSafe)); err != nil {
 			return err
 		}
 	}
@@ -462,14 +532,79 @@ func registerBuiltinTools(reg *tool.Registry, cfg *config.Config, st store.Store
 		if err != nil {
 			return fmt.Errorf("build ask_user tool: %w", err)
 		}
-		// CapRead: asking reads nothing and changes nothing.
-		if err := reg.Register(tool.WithCapability(t, tool.CapRead)); err != nil {
+		// CapRead: asking reads nothing and changes nothing. Serial: it parks the
+		// whole turn waiting for a person, so overlapping it with anything — or
+		// with another card — is not a race, it is a conversation with two
+		// questions in flight and one person reading them.
+		if err := reg.Register(tool.WithConcurrency(
+			tool.WithCapability(t, tool.CapRead), tool.Serial)); err != nil {
 			return err
+		}
+	}
+
+	// The plan tools are the web console's 任务看板: the model maintains a task
+	// list that the console renders above the composer, and that a resumed turn
+	// reads to find out what is already done. They are registered under the same
+	// condition as ask_user and for the same reason: the plan store is installed
+	// per turn by the server (see internal/server/turnPlanner), so on a surface
+	// without one every call could only fail.
+	if opts.Surface == "web" && cfg.Chat.Plan.Enable {
+		planTools, err := builtin.NewPlanTools()
+		if err != nil {
+			return fmt.Errorf("build plan tools: %w", err)
+		}
+		for _, t := range planTools {
+			// CapRead: a plan is the agent's own working state. It touches no
+			// files and runs no commands, so it must not be withheld from a
+			// read-only workspace — that is exactly where a long task needs to
+			// explain itself.
+			//
+			// Serial, and this is the case that proves capability and concurrency
+			// are different questions: a plan_update is CapRead and is a
+			// read-modify-write on one shared plan. Two at once lose an update and
+			// scramble the board the user is watching.
+			if err := reg.Register(tool.WithConcurrency(
+				tool.WithCapability(t, tool.CapRead), tool.Serial)); err != nil {
+				return err
+			}
 		}
 	}
 	if err := registerDocumentTool(reg, cfg, svc); err != nil {
 		return err
 	}
+
+	// fetch_url: reading pages from the internet. Registered here with the other
+	// always-on tools, and declared ParallelSafe below because "read these three
+	// pages and compare them" is its main use.
+	if cfg.Tools.Web.Enable {
+		if err := registerFetchURLTool(reg, cfg, logger); err != nil {
+			return err
+		}
+	}
+
+	// spawn_agent: the tool that hands a question to a nested run. It is built
+	// here rather than per turn because the process-wide concurrency gate inside
+	// the spawner is what bounds how many subagents run at once — a spawner per
+	// surface would multiply that bound by the number of surfaces.
+	//
+	// The model it runs on is not captured here: it comes from the turn (see
+	// tool.TurnResources), because a conversation can pick its own model and a
+	// subagent should run on it unless the model asks for a cheaper one.
+	if opts.SpawnAgent != nil {
+		if err := registerSpawnAgentTool(reg, cfg, opts.SpawnAgent, opts.ResolveModel, logger); err != nil {
+			return err
+		}
+	}
+
+	// Everything registered so far goes through the gate as one pass. Doing it
+	// here rather than at each Register call is what makes the coverage
+	// structural: the always-on tools, the media tools, the document tool and the
+	// skill tool are assembled in four different places, and a fifth added later
+	// is covered without anyone remembering to.
+	if err := gate.applyToRegistry(context.Background(), reg); err != nil {
+		return err
+	}
+
 	return registerWorkspaceTools(reg, cfg, st, logger, opts)
 }
 
@@ -486,7 +621,12 @@ func registerDocumentTool(reg *tool.Registry, cfg *config.Config, svc *viking.Se
 	}
 	// CapRead: saving a document reads nothing and runs nothing. It is a write
 	// to the agent's own document store, not to the workspace.
-	if err := reg.Register(tool.WithCapability(t, tool.CapRead)); err != nil {
+	//
+	// Serial for the same reason a plan update is: it is a write, whatever its
+	// capability says, and two writes to one store overlapping is a question about
+	// that store's idempotence that nobody has answered.
+	if err := reg.Register(tool.WithConcurrency(
+		tool.WithCapability(t, tool.CapRead), tool.Serial)); err != nil {
 		return fmt.Errorf("register save_document: %w", err)
 	}
 	return nil

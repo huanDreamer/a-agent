@@ -7,13 +7,22 @@ import (
 	"testing"
 	"time"
 
+	"sync"
+
 	"github.com/huan/huan-agent/internal/documents"
 	"github.com/huan/huan-agent/internal/viking"
 )
 
 // stubConsole is a scriptable OpenVikingConsole, so the console's routes can be
 // tested without an OpenViking server.
+//
+// Every field is guarded by mu. The handler that writes them runs on Hertz's
+// goroutine, so a test that reads one directly is racing it — which the race
+// detector reports, and which makes `make test-race` unusable for this package.
+// The accessors below are how a test reads instead.
 type stubConsole struct {
+	mu sync.Mutex
+
 	status    viking.Status
 	report    documents.Report
 	syncErr   error
@@ -25,21 +34,50 @@ type stubConsole struct {
 	lastFull  bool
 }
 
+// flushCount is the number of flush calls the console has received.
+func (s *stubConsole) flushCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushed
+}
+
+// wasFullSync reports whether the last sync asked for a full crawl.
+func (s *stubConsole) wasFullSync() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastFull
+}
+
+// savedDocuments is a copy of what the console was asked to store.
+func (s *stubConsole) savedDocuments() []documents.Document {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]documents.Document(nil), s.saved...)
+}
+
 func (s *stubConsole) Status(context.Context) viking.Status { return s.status }
 
 func (s *stubConsole) SyncWorkspace(_ context.Context, full bool) (documents.Report, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.lastFull = full
 	return s.report, s.syncErr
 }
 
 func (s *stubConsole) SaveDocument(_ context.Context, doc documents.Document) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.saved = append(s.saved, doc)
 	return s.saveURI, s.saveErr
 }
 
 func (s *stubConsole) SyncedDocuments() []documents.Entry { return s.documents }
 
-func (s *stubConsole) Flush(context.Context) { s.flushed++ }
+func (s *stubConsole) Flush(context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushed++
+}
 
 // newOpenVikingHarness starts a server whose console talks to stub.
 func newOpenVikingHarness(t *testing.T, stub OpenVikingConsole) *harness {
@@ -115,7 +153,7 @@ func TestOpenVikingAPI_SyncReturnsReport(t *testing.T) {
 	if !body.OK || body.Report.Uploaded != 2 {
 		t.Errorf("body = %+v, want ok with 2 uploads", body)
 	}
-	if stub.lastFull {
+	if stub.wasFullSync() {
 		t.Error("full = true, want the incremental default")
 	}
 }
@@ -127,7 +165,7 @@ func TestOpenVikingAPI_SyncFullFlagIsPassed(t *testing.T) {
 	resp := h.postJSON(t, "/api/openviking/sync", map[string]any{"full": true})
 	requireStatus(t, resp, http.StatusOK)
 	_ = resp.Body.Close()
-	if !stub.lastFull {
+	if !stub.wasFullSync() {
 		t.Error("full = false, want the flag to reach the syncer")
 	}
 }
@@ -184,10 +222,11 @@ func TestOpenVikingAPI_SaveValidatesAndStores(t *testing.T) {
 	if !body.OK || body.URI == "" {
 		t.Fatalf("body = %+v, want the stored uri", body)
 	}
-	if len(stub.saved) != 1 {
-		t.Fatalf("saved = %d, want 1", len(stub.saved))
+	saved := stub.savedDocuments()
+	if len(saved) != 1 {
+		t.Fatalf("saved = %d, want 1", len(saved))
 	}
-	if got := stub.saved[0].Source; got != "console" {
+	if got := saved[0].Source; got != "console" {
 		t.Errorf("source = %q, want console", got)
 	}
 }
@@ -247,8 +286,8 @@ func TestOpenVikingAPI_FlushCallsThrough(t *testing.T) {
 	resp := h.postJSON(t, "/api/openviking/flush", nil)
 	requireStatus(t, resp, http.StatusOK)
 	_ = resp.Body.Close()
-	if stub.flushed != 1 {
-		t.Errorf("flushed = %d, want 1", stub.flushed)
+	if got := stub.flushCount(); got != 1 {
+		t.Errorf("flushed = %d, want 1", got)
 	}
 }
 

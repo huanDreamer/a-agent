@@ -61,6 +61,29 @@ func (r *Registry) Register(t Tool) error {
 	return nil
 }
 
+// Empty reports whether the registry permits no tools at all.
+//
+// It is what a caller checks before running something that needs a tool set: an
+// empty registry is not a smaller agent, it is an agent that can only talk.
+func (r *Registry) Empty() bool {
+	if r == nil {
+		return true
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for name := range r.tools {
+		// Respect the allow-list: a registry whose tools are all excluded permits
+		// nothing, whatever it holds.
+		if !r.allowListSet {
+			return false
+		}
+		if _, ok := r.allowList[name]; ok {
+			return false
+		}
+	}
+	return true
+}
+
 // Get returns the tool registered under name and whether it exists.
 func (r *Registry) Get(name string) (Tool, bool) {
 	r.mu.RLock()

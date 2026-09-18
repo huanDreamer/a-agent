@@ -35,8 +35,21 @@ func init() {
 }
 
 func main() {
-	if err := rootCmd.Execute(); err != nil {
+	err := rootCmd.Execute()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
-		os.Exit(1)
+	}
+
+	// Language servers are child processes. Stopping them here rather than in
+	// each command means no subcommand can forget: one left behind holds locks on
+	// the module cache, and the next run pays for it.
+	closeLanguageServers()
+
+	if err != nil {
+		// A command that knows which exit code its failure means says so through
+		// exitCodeFor; everything else is a plain failure. `run` is the reason
+		// this exists: a script has to be able to tell "the model failed" from
+		// "the budget ran out", and both from "it worked".
+		os.Exit(exitCodeFor(err))
 	}
 }

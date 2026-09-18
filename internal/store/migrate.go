@@ -360,6 +360,62 @@ var migrations = []migration{
 		// model answered on its own.
 		up: `ALTER TABLE chat_messages ADD COLUMN stop_reason TEXT NOT NULL DEFAULT '';`,
 	},
+	{
+		version: 12,
+		name:    "create_app_settings",
+		// A small key/value table for the settings the console may change while
+		// the process runs. It is deliberately generic: the first tenant is the
+		// per-turn budget (设置 → 对话预算), and a second one should not need
+		// another table and another migration.
+		//
+		// Only an explicit override is stored. An absent key means "use the value
+		// from config.yaml", which is what makes 恢复默认 a DELETE instead of a
+		// copy of the startup default — and what lets an edit of config.yaml stay
+		// visible to a console that never overrode that key.
+		up: `CREATE TABLE IF NOT EXISTS app_settings (
+			key        TEXT PRIMARY KEY,
+			value      TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
+	},
+	{
+		version: 13,
+		name:    "chat_message_steps",
+		// The turn broken down by iteration: each step's reasoning, what it said,
+		// and the tool calls it asked for. A turn used to be stored as one blob of
+		// reasoning plus a flat array of tool calls, which is exactly the pairing a
+		// reader needs and exactly what that shape loses — nothing in it says which
+		// thought asked for which call.
+		//
+		// reasoning and tool_calls are still written: the audit log, the session
+		// statistics and older clients read them. This column is what the console
+		// renders, and an empty value means "no step information" (a row written
+		// before this migration), which the console falls back from.
+		up: `ALTER TABLE chat_messages ADD COLUMN steps TEXT NOT NULL DEFAULT '';`,
+	},
+	{
+		version: 14,
+		name:    "create_chat_plans",
+		// The task plan a conversation's model maintains through the plan_* tools,
+		// and the thing the console renders above the composer.
+		//
+		// It is one row per conversation holding the whole plan as JSON, rather
+		// than a table of tasks, because a plan is read and written as a unit: the
+		// console renders all of it, the model rewrites all of it, and nothing ever
+		// queries one task. A task table would add joins and a second ordering
+		// column to a document that has neither.
+		//
+		// It is the one piece of turn state that outlives its turn on purpose:
+		// "what have I already done" is exactly what a turn that died cannot
+		// answer, and what the next one needs in order not to start over.
+		up: `CREATE TABLE IF NOT EXISTS chat_plans (
+			session_id TEXT PRIMARY KEY REFERENCES chat_sessions(id) ON DELETE CASCADE,
+			goal       TEXT NOT NULL DEFAULT '',
+			tasks      TEXT NOT NULL DEFAULT '[]',
+			revision   INTEGER NOT NULL DEFAULT 0,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
+	},
 }
 
 // Migrate applies any pending migrations idempotently.

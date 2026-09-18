@@ -107,13 +107,20 @@ func (m *Manager) Apply(ctx context.Context, specs []ServerSpec) []ServerStatus 
 	}
 
 	desired := make(map[string]ServerSpec, len(specs))
+	ordered := make([]ServerSpec, 0, len(specs))
 	for _, spec := range specs {
 		if strings.TrimSpace(spec.ID) == "" {
 			// Fall back to the name so a caller that only has names (a config
 			// file entry) still gets a stable key.
 			spec.ID = ServerID(spec.Name)
 		}
+		if _, dup := desired[spec.ID]; dup {
+			// The same id twice: the first appearance wins, which is what the map
+			// assignment below would have left behind anyway.
+			continue
+		}
 		desired[spec.ID] = spec
+		ordered = append(ordered, spec)
 	}
 
 	// Disconnect servers that are no longer wanted.
@@ -123,8 +130,16 @@ func (m *Manager) Apply(ctx context.Context, specs []ServerSpec) []ServerStatus 
 		}
 	}
 
-	// Connect or reconnect the wanted ones.
-	for id, spec := range desired {
+	// Connect or reconnect the wanted ones, in the order the caller gave them.
+	//
+	// The order is the caller's and not a map's, because it decides something
+	// visible: two servers that both expose a tool with the same name are
+	// connected in turn, the first keeps the name, and the second is reported as a
+	// collision. Ranging over a map (as this used to) made that depend on Go's
+	// randomised iteration order, so which server lost its tool was decided by
+	// chance — and the test that pins the behaviour flaked about one run in ten.
+	for _, spec := range ordered {
+		id := spec.ID
 		cur := m.servers[id]
 		if cur != nil && cur.err == "" && cur.client != nil && cur.fingerprint == spec.Fingerprint() {
 			// Unchanged and healthy: keep the connection (and any subprocess)
@@ -203,9 +218,8 @@ func (m *Manager) connectLocked(ctx context.Context, id string, spec ServerSpec)
 // registerTools registers every tool the client exposes, returning the names it
 // added and one message per tool that could not be added.
 //
-// A name already taken (by a builtin, or by another MCP server) is reported and
-// skipped rather than failing the whole server: the registry refuses duplicate
-// names, and a server with one colliding tool is still worth connecting.
+// The per-tool rule (a name already taken is reported and skipped, not fatal)
+// lives in registerToolSpecs, which the one-shot bridge in bridge.go shares.
 func (m *Manager) registerTools(ctx context.Context, c *Client) ([]string, []string) {
 	if m.reg == nil {
 		return nil, nil
@@ -214,20 +228,7 @@ func (m *Manager) registerTools(ctx context.Context, c *Client) ([]string, []str
 	if err != nil {
 		return nil, []string{fmt.Sprintf("list tools: %v", err)}
 	}
-
-	var (
-		names []string
-		errs  []string
-	)
-	for _, s := range specs {
-		adapter := &mcpAdapter{client: c, name: s.Name, spec: s}
-		if err := m.reg.Register(adapter); err != nil {
-			errs = append(errs, fmt.Sprintf("tool %q not registered: %v", s.Name, err))
-			continue
-		}
-		names = append(names, s.Name)
-	}
-	return names, errs
+	return registerToolSpecs(m.reg, c, specs, m.logger)
 }
 
 // teardownLocked unregisters a server's tools and closes its connection.

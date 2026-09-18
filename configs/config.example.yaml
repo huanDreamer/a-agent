@@ -59,6 +59,31 @@ llm:
       # request, at the cost of getting no token counts on streamed calls.
       # disable_usage_request: false
 
+  # Retrying a failed model call. A long turn makes hundreds of calls, so a
+  # transient failure — a dropped connection, a 429, a 502 — is a matter of
+  # when, not whether; without this, one of them ends the whole task.
+  #
+  # What is retried is decided by what the failure means, not by "is it an
+  # error": timeouts, connection errors, 408/409/425/429 and 5xx are retried,
+  # while a 400 / 401 / 403 / 404 / 422 (or an exhausted balance) fails
+  # immediately — a second attempt would buy the same refusal.
+  #
+  # It applies to every model this process builds: the web chat, the Feishu bot,
+  # the CLI REPL, the context condenser and the auto-title call.
+  #
+  # This is the retry for ONE model call. A stream that dies after the model has
+  # already started answering is not repeated here (the reader has seen the
+  # beginning of that answer); chat.step_retry below is what covers it.
+  #   HUAN_LLM_RETRY_ENABLE=false
+  #   HUAN_LLM_RETRY_MAX_ATTEMPTS=5
+  retry:
+    enable: true
+    max_attempts: 3          # total attempts, including the first
+    base_delay_ms: 800       # how long the first retry waits
+    max_delay_ms: 30000      # ceiling for the exponential growth
+    multiplier: 2.0          # how much each further wait grows
+    jitter: true             # +/-25%, so parallel turns do not retry in lockstep
+
 # Agent (ReAct loop) settings. Used by `huan-agent chat --tools` and by
 # any platform integrations that build an agent.Agent.
 agent:
@@ -127,8 +152,13 @@ context:
   # long task from resending its whole transcript on every step. Compression
   # always keeps the system prompt and the last user message verbatim, and rolls
   # the middle into a summary. Pick something like 60%~70% of the model's window.
-  max_tokens: 0
-  keep_recent: 10         # messages kept verbatim after a compression pass
+  # 60000 is roughly 60%~70% of a 128k window, which is what makes a 60-step turn
+  # affordable: without it every step resends the whole history, so cost grows
+  # about quadratically and a long task ends in a context-limit error instead.
+  # 设置 → 对话预算 reports this value and warns when it is 0, but does not change
+  # it: the compressor is built once, at startup.
+  max_tokens: 60000
+  keep_recent: 12         # messages kept verbatim after a compression pass
   summarize: true         # use the LLM to summarize rolled-up turns (else drop + placeholder)
 
 # Feishu (Lark) IM bot (Phase 4).
@@ -255,17 +285,72 @@ admin:
   allow_insecure_bind: false
 
 # Web chat in the admin UI (requires `huan-agent admin serve`).
+#
+# These are *startup defaults*. The console's 设置 → 对话预算 overrides them, per
+# field, and the override is stored in the database (app_settings) and read
+# per turn — so a change applies to the next message with no restart. 恢复默认 in
+# that panel hands a field back to the value below.
 chat:
   enable: true             # off = the chat tab is hidden
-  max_steps: 12            # tool-calling iterations per turn (> 500 is refused)
-  turn_max_tokens: 0       # per-turn token budget; 0 = unlimited
-  turn_deadline_seconds: 0 # per-turn wall-clock budget; 0 = unlimited
+  max_steps: 60            # tool-calling iterations per turn (> 500 is refused)
+  turn_max_tokens: 6000000 # per-turn token budget; 0 = unlimited. With in-turn
+                           # compression on, a 60-step turn costs roughly 1~2M, so a
+                           # cap below that stops turns that are behaving normally.
+  turn_deadline_seconds: 10800 # per-turn wall-clock budget, 3h; 0 = unlimited
   history_limit: 40        # stored messages replayed to the model
-  system_prompt: ""        # empty = built-in default
+  system_prompt: ""        # empty = the built-in Chinese general-purpose agent
+                           # prompt in internal/prompt (see docs/prompt.md); a value
+                           # here replaces it in the web console and in the Feishu
+                           # bot (the CLI uses --system / --skill instead)
   # ask_user 的交互卡片等多久算超时（秒）；0 = 默认 600。
   # 等待发生在这一轮之内，所以要明显小于 turn_deadline_seconds，否则等到答案时
   # 这一轮已经没有预算继续了。超时不算失败：模型收到「用户没有回答」后自行收口。
   ask_user_timeout_seconds: 600
+
+  # 单步重试：某一步的模型调用失败后，从同一份历史重跑这一步。它管的是
+  # llm.retry 管不了的那种失败——流已经吐出一半才断。此时 llm 层刻意不重试
+  # （重放会让读者看到两遍同一句话的开头），由这里重跑，并先发一个 step_retry
+  # 事件让界面丢掉那半截文本。
+  #
+  # 退避时间与 llm.retry 同形，只是更长：一次重试后面往往还跟着一轮工具调用。
+  # 注意两层会相乘：最坏情况下一步的模型调用次数 = llm.retry.max_attempts ×
+  # step_retry.max_attempts（默认 3 × 3），而且只在连续失败时才会发生。
+  step_retry:
+    enable: true
+    max_attempts: 3          # 这一步最多跑几次（含第一次）
+    base_delay_ms: 1500
+    max_delay_ms: 20000
+    multiplier: 2.0
+    jitter: true
+
+  # 任务计划：模型通过 plan_create / plan_add / plan_update / plan_read 维护一份
+  # 任务清单，控制台把它画在输入框上方（任务看板：执行中 / 待执行 / 已完成），
+  # 并落库到 chat_plans。任务被中断后点「继续执行」，新一轮会带着这份计划与上一轮
+  # 已完成的步骤接着跑，而不是从零重来。
+  #
+  # 关掉之后 plan_* 工具不再注册（提示词里也就不会有它们），看板自然不出现；
+  # 已经存在的计划仍会被「继续执行」读取，因为它是接续点的来源。
+  plan:
+    enable: true
+    max_tasks: 50            # 一份计划最多几条；超出的调用被拒绝而不是被截断
+
+# 一次性运行：`huan-agent run "<prompt>"`。给 git hook / CI / cron 用的入口——没有
+# 终端、没有人看着、也没有人在中途回答问题。答案是逐块写到 stdout 的，日志与进度
+# 全部写 stderr，所以输出可以直接接进管道：
+#
+#   huan-agent run "读一下 README.md，一句话说这个项目是什么"
+#   git diff --cached | huan-agent run - "审一遍下面这段 diff"
+#   huan-agent run "..." --output json | jq -r .answer
+#
+# 退出码是它与 shell 的契约（0 跑完 / 1 模型或循环失败 / 2 用法错误 / 3 超时 /
+# 4 预算耗尽 / 5 工具失败且设了 --fail-on-tool-error / 6 配置问题），详见 docs/run.md。
+#
+# 它默认带工具，但按 surface 裁掉两样：ask_user（没有可以回答的地方）与后台进程
+# 工具（退出后没人管那些进程；--allow-background 才给，且退出前一律停掉）。
+run:
+  timeout_seconds: 0       # 整轮墙钟预算；0 = 不限（与 chat.turn_deadline_seconds 同义）
+  max_steps: 0             # 0 = 继承 chat.max_steps，让两种跑法的上限不会各自漂移
+  default_output: "text"   # text = stdout 上只有答案；json = 一个对象
 
 # 长任务（几十步、十几分钟）：这四个开关要一起调，别只调 max_steps ——
 # 只把步数调大的结果是每一步都重发整段历史，token 成本近似平方增长，
@@ -273,7 +358,7 @@ chat:
 #
 #   chat:
 #     max_steps: 60
-#     turn_max_tokens: 400000       # 这一轮最多烧多少 token
+#     turn_max_tokens: 6000000      # 这一轮最多烧多少 token（压缩开启后按 1~2M/60 步估）
 #     turn_deadline_seconds: 3600   # 这一轮最多跑多久
 #   context:
 #     max_tokens: 60000             # 循环内窗口上限，建议取模型窗口的 60%~70%
@@ -285,6 +370,10 @@ chat:
 #
 # 停因不会被吞掉：到预算就收口，回答里写明是哪一个预算用尽，控制台给这一轮打标记，
 # 日志里有一条 warn（reason / steps / tokens / elapsed）。详见 docs/long-tasks.md。
+#
+# 跑不完也不再等于白跑：模型先建计划（任务看板就在输入框上方），单次模型调用失败
+# 按 llm.retry 退避重试，流断在中途按 chat.step_retry 重跑那一步；两层都失败时，
+# 用户点「继续执行」——新一轮带着计划、上一轮已完成的步骤与工具观察接着做，不重头思考。
 
 # Langfuse tracing. Traces every chat turn: model generations (with token
 # usage) and tool calls, viewable in the admin UI's 链路追踪 tab and in
@@ -347,6 +436,16 @@ tools:
   # SIGTERM-to-SIGKILL grace when stopping a job. Generous on purpose: a database
   # flushes on SIGTERM and losing that is worse than waiting.
   background_stop_grace_seconds: 5
+  # 工具并发：同一个模型回复里的多个调用，只有**声明自己 ParallelSafe** 的才会重叠执行。
+  #
+  # 它不是"一次能跑多少个工具"，而是"一次能重叠多少 I/O"：写与执行永远是屏障（barrier）——
+  # 它们之前的调用先做完，它们之后的调用等它们做完。这是模型写下的程序顺序，不是性能取舍：
+  # 「先写配置，再跑测试」被重排就会在旧配置上测试。
+  #
+  # 默认 4：一个"同时读五个文件"的步骤是它存在的主要场景，4 个重叠已经把延迟压到一次读加上
+  # 一点点；再高主要是多开文件描述符。0 或 1 表示逐个执行，也就是这个功能之前的全部行为。
+  max_parallel: 4
+
   # Per-call limits.
   max_read_kb: 512
   max_write_mb: 4
@@ -355,6 +454,113 @@ tools:
   # (rm -rf /, mkfs, dd of=/dev/..., fork bombs, shutdown/reboot). This is a
   # speed bump, NOT a boundary — an equivalent command that does not match runs.
   deny_patterns: []
+
+  # 读网页：fetch_url 抓取一个 URL、抽掉导航与脚本、把可读正文交给模型。
+  #
+  # 没有它，模型的替代品是 curl —— 一个现代文档页面几百 KB 的 HTML 里正文很少，
+  # 进到上下文里的是被截断的壳。抓取 + 抽取正文就是它全部的价值。
+  #
+  # **地址检查是安全边界，不是功能**：模型可以要求任意 URL，没有检查的话
+  # http://169.254.169.254/（云元数据，会交出实例凭据）、http://127.0.0.1:1933/（本机
+  # OpenViking）和 http://10.0.0.1/ 都是可达的。检查在**每一次重定向**与**建立连接时**
+  # 各做一次，因为 302 与 DNS rebind 正是"只检查一次"的两种经典绕过方式。
+  web:
+    enable: true
+    allow_private: false      # true 会同时放开云元数据地址与本机服务，启动时会打一条 warn
+    timeout_seconds: 20
+    max_kb: 2048              # 响应体上限，边读边计数（不是读完再判断）
+    max_chars: 20000          # 单次调用返回的正文上限；更长的用 offset 分页读
+    cache_ttl_seconds: 300    # 进程内缓存；0 = 用默认，负数 = 关闭
+    user_agent: ""            # 空 = 默认标识
+
+  # 子 agent：模型可以把一个问题交给一个嵌套的 agent，只拿回一份有界报告。
+  #
+  # 它买的是**上下文隔离，不是算力**：为了回答一个问题而 grep 二十次、读三十个文件，这些工具结果
+  # 原本会留在主轮次的窗口里，把真正要改的代码挤出去。子 agent 有一个可以随便脏的窗口，代价是一次
+  # 额外的模型调用序列。
+  #
+  # 三个默认值都是"bound 成本"而不是"开关功能"，因为这个功能的风险就是成本：
+  #   - 报告有界：只有最终结论（截断）加一段结构化尾注跨回来，中间的工具结果和思考都留在它自己那边；
+  #   - 能力收窄：默认只有**只读且可并行**的工具。写/执行必须显式列出才授予，而且仍然经过父轮次的
+  #     审批闸门、检查点与工作区沙箱——子 agent 不是绕过它们的路；
+  #   - 费用归父轮次：token 与墙钟计入发起它的那一轮，并共享那一轮的 deadline。
+  #
+  # 三个工具永远不授予：ask_user（子 agent 没有通向人的通道，卡片只会挂着）、plan_*（计划属于顶层
+  # 轮次，子 agent 改看板会让用户看到不属于自己的进度）、spawn_agent（深度上限 1）。
+  subagent:
+    enable: true
+    max_steps: 8             # 一个子 agent 最多几步
+    max_concurrent: 2        # 全进程同时最多几个；"同时探三条路"是它的用法，四个父轮次各派四个就是账单
+                             # 拿不到槽位的那个排队而不是失败，控制台的顶部状态栏会说还有几个在等
+    max_report_chars: 8000   # 报告截断上限；截断会如实说明
+
+  # 审批闸门：写/执行类工具调用落地之前，先让人决定。
+  #
+  # **默认为 off**，这是刻意的：默认打开会从"没人在看"的部署（CI、cron、飞书机器人）
+  # 手里拿走写权限，那个意外比没有闸门更糟。打开它是一次显式的决定，代价是某些
+  # surface 随后会失去写工具 —— 见下面的 mode 说明。
+  #
+  # 与 ask_user 的关键区别：**超时按拒绝处理**。提问超时是"模型拿不到信息"，它自己
+  # 决定下一步；审批超时是"没人在看"，而没人在看恰恰是闸门必须生效的时刻。
+  approval:
+    mode: "off"              # off | writes | writes+exec | all
+    allow: []                # 按动作摘要匹配的 RE2；命中即免审批。与 deny_patterns
+                             # 一样是减速带不是边界，但这里默认是"问"，所以漏一条
+                             # 的代价是一次询问，而不是一次事故。
+    timeout_seconds: 300     # 单次等待上限；超时=拒绝
+    # mode 非 off 时各 surface 的行为：
+    #   Web 控制台  → 弹出审批卡片，允许一次 / 本轮允许 / 拒绝
+    #   交互式 CLI  → 终端上 y（一次）/ t（本轮）/ n 或直接写拒绝理由
+    #   飞书 / run  → **不给**写与执行工具（没有可以询问的地方）。一个必然失败的工具
+    #                 比没有这个工具更糟，所以是"不在菜单上"而不是"每次都被拒"。
+
+  # 检查点：每一轮里被文件工具改过的文件，在改动之前留有原样副本，可以整体回退。
+  #
+  # 覆盖范围是**通过文件工具的改动**。bash 造成的改动（rm、sed -i、构建产物）不在
+  # 其中——那需要整仓快照，成本与收益不成比例。作为补偿，检查点也记录轮次开始与结束
+  # 时的 git status，所以 bash 动了什么仍然看得见。
+  checkpoint:
+    enable: true
+    dir: ""                  # 空 = 数据库文件旁的 checkpoints 目录
+    keep_turns: 20           # 每个会话保留最近多少轮；更旧的先淘汰
+    max_total_mb: 512        # 整个检查点目录的上限
+
+  # 代码智能：接语言服务器，给模型四个只读工具——diagnostics（诊断）、
+  # goto_definition（跳转）、find_references（引用）、workspace_symbols（符号搜索）。
+  #
+  # 它们回答的是 grep 回答不了的问题：grep 匹配字符串，这些工具问编译器——
+  # 「这个接口有几个实现」「改这个签名要动哪些调用点」。漏掉一个调用点不会报错，
+  # 只会留下半个编译不过的仓库，所以「谁在用这个符号」需要精确答案。
+  #
+  # attach_diagnostics 是另一半，而且是最常起作用的那一半：改完文件之后，把该文件的
+  # 诊断附在工具结果里。于是「改完 → 跑测试 → 发现类型错 → 再改」这个循环被砍成
+  # 「改完就知道」。它不是模型要主动调用的工具——在「我觉得改对了」的心态下，
+  # 需要主动调用的检查不会被调用。
+  lsp:
+    enable: true                 # 关掉后不启动任何进程、不注册任何工具、编辑结果不变
+    attach_diagnostics: true     # 写/编辑成功后附上该文件的诊断
+    diagnostics_wait_ms: 2000    # 等诊断稳定的上限；超时如实报「尚未就绪」，编辑照常成功
+    idle_timeout_seconds: 600    # 空闲多久回收语言服务器进程；-1 = 从不回收
+    max_diagnostics: 20          # 单次附给模型的条数上限；总数始终会说明，不静默截断
+    # 语言服务器表。留空使用内置默认（Go 用 gopls）。语言既可以写扩展名（.go）
+    # 也可以写语言 id（go）；root_markers 决定服务器索引哪个项目——最近的含标记文件
+    # 的祖先目录会成为它的 root，这直接决定「找不到引用」是一个答案还是一个错误。
+    #
+    # 注意 gopls 是外部二进制：没装的话这四个工具**不会注册**（一个必然失败的工具
+    # 比没有这个工具更糟），日志里会给出安装命令：
+    #   go install golang.org/x/tools/gopls@latest
+    servers: []
+    # servers:
+    #   - name: "gopls"
+    #     command: "gopls"
+    #     args: ["-mode=stdio"]
+    #     languages: ["go"]
+    #     root_markers: ["go.mod", "go.work"]
+    #   - name: "typescript"
+    #     command: "typescript-language-server"
+    #     args: ["--stdio"]
+    #     languages: ["typescript", "javascript", ".ts", ".tsx", ".js", ".jsx"]
+    #     root_markers: ["package.json", "tsconfig.json"]
 
 # ---------------------------------------------------------------------------
 # Media tools and model management
@@ -411,10 +617,21 @@ tools:
 openviking:
   enable: false                       # off by default; a machine without the server is unaffected
   base_url: "http://127.0.0.1:1933"   # a local `ov` server
-  api_key: ""                         # empty = dev auth (what a local install uses)
-  account: "default"                  # X-OpenViking-Account
+  api_key: ""                         # user key; required when the server runs auth_mode=api_key.
+                                      # Empty = dev auth, which only a server bound to loopback still allows.
+                                      # Set via env: HUAN_OPENVIKING_API_KEY
+  account: "default"                  # X-OpenViking-Account; ignored by the server in api_key mode
   user: "default"                     # X-OpenViking-User; data is scoped under viking://user/<user>
-  timeout_seconds: 15
+  timeout_seconds: 0                  # HTTP client timeout; 0 = auto (index_wait_seconds + 15s).
+                                      # Never takes effect below index_wait_seconds + 15s: if the client
+                                      # gave up first you would see "context deadline exceeded" rather
+                                      # than the server's own 504, and could not tell a slow index apart
+                                      # from an unreachable server.
+  index_wait_seconds: 30              # how long a write may wait for OpenViking's index queue (the
+                                      # "timeout" the server honours). A local `ov` needs ~15-17s to get
+                                      # a small document through semantic extraction plus embedding, so
+                                      # 30s covers a slow cycle. Raise it if `ov observer queue` shows
+                                      # the semantic queue still draining when writes give up.
 
   memory:
     enable: true

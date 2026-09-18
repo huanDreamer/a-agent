@@ -12,6 +12,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/huan/huan-agent/internal/prompt"
 	"github.com/huan/huan-agent/internal/skill"
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/tool"
@@ -335,10 +336,10 @@ func TestSkillPromptSectionListsEnabledSkills(t *testing.T) {
 	if strings.Contains(section, "按清单检查") {
 		t.Errorf("section = %q, want bodies left out", section)
 	}
-	// The full prompt is the operator's prompt plus this section.
-	prompt := h.srv.systemPrompt()
-	if !strings.Contains(prompt, section) || !strings.Contains(prompt, defaultSystemPrompt) {
-		t.Errorf("systemPrompt = %q", prompt)
+	// The full prompt is the console's default plus this section.
+	full := h.srv.systemPrompt()
+	if !strings.Contains(full, section) || !strings.Contains(full, prompt.For(prompt.SurfaceWeb)) {
+		t.Errorf("systemPrompt = %q", full)
 	}
 }
 

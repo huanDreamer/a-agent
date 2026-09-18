@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"go.uber.org/zap"
 
+	"github.com/huan/huan-agent/internal/retry"
 	"github.com/huan/huan-agent/internal/tool"
 )
 
@@ -88,6 +90,14 @@ type Config struct {
 	Tracer Tracer
 	// MaxSteps is the default step cap.
 	MaxSteps int
+	// MaxParallel is how many parallel-safe tool calls from one model reply may
+	// run at once. 0 or 1 means one at a time, which is what every deployment got
+	// before this option existed.
+	//
+	// It bounds I/O concurrency, not correctness: only tools that declared
+	// themselves ParallelSafe may overlap at all, and the schedule still keeps the
+	// model's program order (see runToolCalls).
+	MaxParallel int
 	// MaxTokens is the default per-turn token budget, summed from the usage the
 	// provider reports. 0 (the default) means unlimited.
 	//
@@ -97,6 +107,13 @@ type Config struct {
 	MaxTokens int
 	// Deadline is the default per-turn wall-clock budget. 0 means unlimited.
 	Deadline time.Duration
+	// StepRetry is how one step is retried when its model call fails. The zero
+	// value means one attempt, i.e. no retrying — the behaviour of a deployment
+	// that never configured it.
+	//
+	// It sits at the step rather than at the model because it is the step that a
+	// mid-stream failure damages: see streamStep.
+	StepRetry retry.Policy
 	// Condenser bounds the in-loop history when a token budget is configured.
 	// Nil means the history is sent whole, which is only safe for short turns:
 	// every step resends everything the turn has accumulated so far.
@@ -106,15 +123,17 @@ type Config struct {
 
 // Runner drives a streaming tool-calling conversation.
 type Runner struct {
-	model     model.BaseChatModel
-	tools     *tool.Registry
-	toolsFor  func(ctx context.Context) (*tool.Registry, error)
-	tracer    Tracer
-	maxSteps  int
-	maxTokens int
-	deadline  time.Duration
-	condenser Condenser
-	logger    *zap.Logger
+	model       model.BaseChatModel
+	tools       *tool.Registry
+	toolsFor    func(ctx context.Context) (*tool.Registry, error)
+	tracer      Tracer
+	maxSteps    int
+	maxParallel int
+	maxTokens   int
+	deadline    time.Duration
+	stepRetry   retry.Policy
+	condenser   Condenser
+	logger      *zap.Logger
 }
 
 // New builds a Runner.
@@ -146,15 +165,17 @@ func New(cfg Config) (*Runner, error) {
 		tracer = NopTracer{}
 	}
 	return &Runner{
-		model:     cfg.Model,
-		tools:     cfg.Tools,
-		toolsFor:  cfg.ToolsFor,
-		tracer:    tracer,
-		maxSteps:  max,
-		maxTokens: cfg.MaxTokens,
-		deadline:  cfg.Deadline,
-		condenser: cfg.Condenser,
-		logger:    logger,
+		model:       cfg.Model,
+		tools:       cfg.Tools,
+		toolsFor:    cfg.ToolsFor,
+		tracer:      tracer,
+		maxSteps:    max,
+		maxParallel: cfg.MaxParallel,
+		maxTokens:   cfg.MaxTokens,
+		deadline:    cfg.Deadline,
+		stepRetry:   cfg.StepRetry,
+		condenser:   cfg.Condenser,
+		logger:      logger,
 	}, nil
 }
 
@@ -182,6 +203,18 @@ func ScopeFrom(ctx context.Context) string {
 	}
 	scope, _ := ctx.Value(scopeKey{}).(string)
 	return scope
+}
+
+// systemPromptOf returns the system message a turn was given, for the tools that
+// hand it on (a subagent inherits the deployment's instructions rather than
+// starting from none).
+func systemPromptOf(messages []*schema.Message) string {
+	for _, m := range messages {
+		if m != nil && m.Role == schema.System {
+			return m.Content
+		}
+	}
+	return ""
 }
 
 // resolveTools returns the registry for one turn.
@@ -254,6 +287,18 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 	if err != nil {
 		return nil, err
 	}
+
+	// Publish what a turn-scoped tool needs to run something of its own — the
+	// registry above and the model driving this turn. Both are per-turn facts, so
+	// a tool that captured them at construction would hand its subagent the wrong
+	// workspace or the wrong model, and only on some deployments.
+	ctx = tool.WithTurnResources(ctx, tool.TurnResources{
+		Registry:     reg,
+		Model:        r.model,
+		SessionID:    req.SessionID,
+		Scope:        req.Scope,
+		SystemPrompt: systemPromptOf(req.Messages),
+	})
 	infos, err := r.toolInfos(ctx, reg)
 	if err != nil {
 		return nil, err
@@ -320,7 +365,7 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		res.Steps = step
 		emit(Event{Type: EventStepStart, Step: step})
 
-		msg, callUsage, genErr := r.streamOnce(ctx, mdl, history, step, traceID, emit)
+		msg, callUsage, genErr := r.streamStep(ctx, mdl, history, step, traceID, budget, started, res, emit)
 		if genErr != nil {
 			if errors.Is(genErr, context.Canceled) {
 				emit(Event{Type: EventError, Step: step, Error: "cancelled"})
@@ -349,21 +394,44 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 
 		if len(msg.ToolCalls) == 0 {
 			res.Text = msg.Content
+			// The last step is the one that answered: its text is the answer, and
+			// it is the only step whose text is.
+			res.Plan = append(res.Plan, planStep(step, msg.ReasoningContent, msg.Content))
 			emit(Event{Type: EventDone, Step: step, Text: res.Text})
 			return res, nil
 		}
 
-		// Announce and run each tool the model asked for.
-		for _, tc := range msg.ToolCalls {
-			run := r.runTool(ctx, reg, tc, req, step, traceID, emit)
+		// The step is over and it is going to act: everything it said was a
+		// preamble to that action, and belongs inside the step. A reader that has
+		// only the text deltas cannot tell — they arrived before the model said
+		// whether it wanted a tool — so the boundary is announced here.
+		emit(Event{Type: EventStepEnd, Step: step, Text: msg.Content})
+
+		// Run the tools the model asked for: the ones that declared themselves
+		// parallel-safe may overlap, and everything else is a barrier.
+		//
+		// The results are assembled in the order the model wrote the calls, no
+		// matter what order they finished in. That is not tidiness: the messages
+		// that go back to the model are matched to its tool calls by position, and
+		// a plan step lists its calls in the order that explains it.
+		runs := r.runToolCalls(ctx, reg, msg.ToolCalls, req, step, traceID, emit)
+		var calls []ToolRun
+		for i, run := range runs {
 			res.Tools = append(res.Tools, run)
+			calls = append(calls, run)
 			history = append(history, &schema.Message{
 				Role:       schema.Tool,
 				Content:    toolResultContent(run),
-				ToolCallID: tc.ID,
-				ToolName:   tc.Function.Name,
+				ToolCallID: msg.ToolCalls[i].ID,
+				ToolName:   msg.ToolCalls[i].Function.Name,
 			})
 		}
+		res.Plan = append(res.Plan, Step{
+			Index:     step,
+			Reasoning: msg.ReasoningContent,
+			Text:      msg.Content,
+			Tools:     calls,
+		})
 	}
 
 	// The step budget is exhausted: the loop's own bound is the check, so
@@ -450,6 +518,105 @@ func (r *Runner) condense(ctx context.Context, res *Result, emit Emitter, histor
 	return out
 }
 
+// streamStep performs one step's model call, retrying it while the failure looks
+// like something another attempt could survive.
+//
+// The retry belongs to the *step* rather than to the model call because that is
+// what a mid-stream failure damages. A stream that dies after the model has
+// started answering cannot be retried where it failed — the caller has already
+// been handed half an answer, and llm's wrapper deliberately refuses to replay
+// that (see internal/llm/retry.go). Here the history is still exactly what the
+// step started with, so re-running it is free of that problem: the half-answer
+// belongs to the failed attempt, which produced no message at all, and the
+// client is told to drop it by the step_retry event this emits first.
+//
+// Waits are capped by the wall clock the turn had left when the step began, so a
+// retry cannot sleep past a deadline that was about to fire. The deadline itself
+// stays a between-steps bound (see turnBudget.expired): no model call in flight
+// is interrupted, and that includes the attempt a wait is followed by.
+func (r *Runner) streamStep(ctx context.Context, mdl model.BaseChatModel, history []*schema.Message,
+	step int, traceID string, budget turnBudget, started time.Time, res *Result, emit Emitter) (*schema.Message, Usage, error) {
+
+	if r.stepRetry.Attempts() <= 1 {
+		return r.streamOnce(ctx, mdl, history, step, traceID, emit)
+	}
+
+	var (
+		msg   *schema.Message
+		usage Usage
+	)
+	err := r.stepRetry.Do(ctx, retry.Op{
+		Fn: func(ctx context.Context) error {
+			m, u, err := r.streamOnce(ctx, mdl, history, step, traceID, emit)
+			if err != nil {
+				return err
+			}
+			msg, usage = m, u
+			return nil
+		},
+		// Asked of the error itself rather than of the caller: *llm.LLMError
+		// answers through a one-method interface, so this package never has to
+		// import a provider implementation to know a 401 from a dropped socket.
+		Retryable: func(err error) bool {
+			if !stepRetryable(err) {
+				return false
+			}
+			// A retry that starts after the budget expired would spend a model
+			// call the turn is no longer allowed to make.
+			return budget.expired(started, res) == ""
+		},
+		MaxDelay: budget.retryShare(started),
+		OnRetry: func(info retry.Info) {
+			r.logger.Warn("chat: step failed, retrying",
+				zap.Int("step", step),
+				zap.Int("attempt", info.Attempt),
+				zap.Int("max_attempts", info.MaxAttempts),
+				zap.Duration("delay", info.Delay),
+				zap.Int("steps_done", res.Steps),
+				zap.Error(info.Err),
+			)
+			emit(Event{
+				Type:        EventStepRetry,
+				Step:        step,
+				Attempt:     info.Attempt,
+				MaxAttempts: info.MaxAttempts,
+				DelayMs:     info.Delay.Milliseconds(),
+				Error:       info.Err.Error(),
+			})
+		},
+	})
+	if err != nil {
+		return nil, Usage{}, err
+	}
+	return msg, usage, nil
+}
+
+// stepRetryable decides whether a failed step is worth running again.
+//
+// Cancellation and a deadline are never retried. Cancellation is a decision —
+// the user pressed stop, or the process is going away. A deadline means either
+// the turn's own context is over (nothing left to spend) or the call already
+// exhausted a timeout farther down, where it was retried as many times as the
+// llm policy allowed; another attempt at this level is not the answer to either.
+//
+// An error that knows it is permanent (a 400, a 401, an exhausted balance) is
+// not retried either: the second attempt would produce the same sentence for the
+// same money. Everything else is treated as transient, because from here a
+// network blip and an unclean stream end look alike.
+func stepRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var decided interface{ Retryable() bool }
+	if errors.As(err, &decided) {
+		return decided.Retryable()
+	}
+	return true
+}
+
 // streamOnce performs one streaming model call, forwarding deltas as they
 // arrive and returning the assembled message.
 func (r *Runner) streamOnce(ctx context.Context, mdl model.BaseChatModel, history []*schema.Message,
@@ -527,6 +694,93 @@ func (r *Runner) streamOnce(ctx context.Context, mdl model.BaseChatModel, histor
 }
 
 // runTool executes one tool call and reports it.
+// runToolCalls runs one step's tool calls, overlapping the ones that are safe to
+// overlap.
+//
+// The schedule comes from the tools' own declarations (see tool.Segment): a
+// maximal run of parallel-safe calls becomes one group, and every other call is a
+// group of its own — which is what makes a write or a command a barrier. The
+// model expressed a program when it emitted them in an order, and this keeps that
+// program's meaning while dropping the parts of its latency that were only ever
+// waiting.
+//
+// The returned slice is always in the model's order, whatever order the calls
+// actually completed in.
+func (r *Runner) runToolCalls(ctx context.Context, reg *tool.Registry, calls []schema.ToolCall,
+	req Request, step int, traceID string, emit Emitter) []ToolRun {
+
+	runs := make([]ToolRun, len(calls))
+	if len(calls) == 0 {
+		return runs
+	}
+
+	modes := make([]tool.Concurrency, len(calls))
+	for i, tc := range calls {
+		t, ok := reg.Get(tc.Function.Name)
+		if !ok {
+			// An unknown tool is handled inside runTool, which reports it as the
+			// observation the model needs; it cannot be classified, so it is a
+			// barrier.
+			modes[i] = tool.Serial
+			continue
+		}
+		modes[i] = tool.EffectiveConcurrency(t)
+	}
+
+	limit := r.maxParallel
+	if limit < 1 {
+		limit = 1
+	}
+
+	for _, group := range tool.Segment(modes) {
+		if len(group) == 1 || limit == 1 {
+			for _, i := range group {
+				runs[i] = r.runTool(ctx, reg, calls[i], req, step, traceID, emit)
+			}
+			continue
+		}
+
+		// A bounded fan-out rather than an errgroup: the calls are independent by
+		// declaration, one failing is an observation rather than a reason to
+		// abandon the others, and a bounded number in flight is what keeps "read
+		// these five files" from opening five hundred descriptors.
+		sem := make(chan struct{}, limit)
+		var wg sync.WaitGroup
+		for _, i := range group {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				// A tool that panics must not take the turn — and with it the
+				// process — down. Serially a panic was fatal too, but serially
+				// nobody had made ten of them happen at once.
+				defer func() {
+					if rec := recover(); rec != nil {
+						runs[i] = ToolRun{
+							ID:   calls[i].ID,
+							Name: calls[i].Function.Name,
+							Args: calls[i].Function.Arguments,
+							Step: step,
+							Err:  fmt.Sprintf("工具执行时 panic：%v", rec),
+						}
+						emit(Event{
+							Type:       EventToolResult,
+							Step:       step,
+							ToolCallID: calls[i].ID,
+							ToolName:   calls[i].Function.Name,
+							ToolError:  runs[i].Err,
+						})
+					}
+				}()
+				runs[i] = r.runTool(ctx, reg, calls[i], req, step, traceID, emit)
+			}(i)
+		}
+		wg.Wait()
+	}
+	return runs
+}
+
 func (r *Runner) runTool(ctx context.Context, reg *tool.Registry, tc schema.ToolCall, req Request,
 	step int, traceID string, emit Emitter) ToolRun {
 
@@ -534,10 +788,37 @@ func (r *Runner) runTool(ctx context.Context, reg *tool.Registry, tc schema.Tool
 		ID:   tc.ID,
 		Name: tc.Function.Name,
 		Args: tc.Function.Arguments,
+		Step: step,
 	}
 	emit(Event{
 		Type: EventToolCall, Step: step,
 		ToolCallID: run.ID, ToolName: run.Name, ToolArgs: run.Args,
+	})
+
+	// Anything this call spawns reports through the same stream, tagged with this
+	// call's id. Published here because this is the only place that knows both the
+	// emitter and which call is running — a tool itself knows neither.
+	// The nested events are also collected here, so the call's own record carries
+	// what it spawned. Without that the report reaches a caller that reads the
+	// result (the one-shot command, the stored turn) as a card that spawned
+	// something and never said what came of it.
+	var (
+		nestedMu  sync.Mutex
+		nestedLog []NestedCall
+	)
+	ctx = tool.WithToolCallID(ctx, run.ID)
+	ctx = WithNested(ctx, Nested{
+		ParentCallID: run.ID,
+		Emit: func(nested Event) {
+			nested.ParentToolCallID = run.ID
+			// A nested event is never a step of the parent's: its step number would
+			// place a subagent's tool call inside the parent's plan.
+			nested.Step = step
+			nestedMu.Lock()
+			nestedLog = appendNestedCall(nestedLog, nested)
+			nestedMu.Unlock()
+			emit(nested)
+		},
 	})
 
 	spanID := r.tracer.StartSpan(ctx, SpanInfo{
@@ -575,7 +856,41 @@ func (r *Runner) runTool(ctx context.Context, reg *tool.Registry, tc schema.Tool
 		ToolResult: run.Result, ToolError: run.Err,
 		DurationMs: run.DurationMs,
 	})
+	nestedMu.Lock()
+	run.Nested = nestedLog
+	nestedMu.Unlock()
 	return run
+}
+
+// appendNestedCall folds one nested event into the call's own record.
+//
+// It coalesces the same way every other consumer does — consecutive deltas of one
+// kind become one entry — because a per-token list is unreadable and would make the
+// stored turn large for no information.
+func appendNestedCall(log []NestedCall, e Event) []NestedCall {
+	switch e.Type {
+	case EventTextDelta, EventReasoningDelta:
+		kind := "text"
+		if e.Type == EventReasoningDelta {
+			kind = "reasoning"
+		}
+		if n := len(log); n > 0 && log[n-1].Kind == kind {
+			log[n-1].Text += e.Text
+			return log
+		}
+		return append(log, NestedCall{Kind: kind, Text: e.Text})
+	case EventToolCall:
+		return append(log, NestedCall{Kind: "tool", Name: e.ToolName, ID: e.ToolCallID})
+	case EventToolResult:
+		for i := range log {
+			if log[i].Kind == "tool" && log[i].ID == e.ToolCallID {
+				log[i].Result = e.ToolResult
+				log[i].Err = e.ToolError
+				return log
+			}
+		}
+	}
+	return log
 }
 
 // toolsTool looks a tool up in the registry a turn is running against,
@@ -585,6 +900,15 @@ func toolsTool(reg *tool.Registry, name string) (tool.Tool, bool) {
 		return nil, false
 	}
 	return reg.Get(name)
+}
+
+// planStep is one iteration with no tool calls: the step that answered.
+//
+// Its text is kept on the step as well as on the result, so a reader of the plan
+// sees a uniform shape — every step has the text it produced — rather than having
+// to know that the last one is special.
+func planStep(step int, reasoning, text string) Step {
+	return Step{Index: step, Reasoning: reasoning, Text: text}
 }
 
 // toolSpanOutput renders a tool run for tracing.

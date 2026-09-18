@@ -427,10 +427,19 @@ function isFolded(name) {
                 >
                   <span class="session-title">{{ session.title || '新对话' }}</span>
                   <span class="session-meta">
-                    <span :title="formatAbsolute(session.updated_at)">
-                      {{ formatRelative(session.updated_at) }}
+                    <!-- A turn running in a conversation the reader is not
+                         looking at: the answer is arriving, and this is where
+                         they can see that it exists. -->
+                    <span v-if="session.streaming" class="session-live">
+                      <span class="spin" aria-hidden="true" />
+                      <span>生成中</span>
                     </span>
-                    <span class="dimmer">· {{ formatCount(session.message_count) }} 条</span>
+                    <template v-else>
+                      <span :title="formatAbsolute(session.updated_at)">
+                        {{ formatRelative(session.updated_at) }}
+                      </span>
+                      <span class="dimmer">· {{ formatCount(session.message_count) }} 条</span>
+                    </template>
                   </span>
                 </button>
 

@@ -41,6 +41,9 @@ import (
 // Client is the slice of the OpenViking client the syncer uses.
 type Client interface {
 	WriteContent(ctx context.Context, req openviking.WriteRequest) (*openviking.WriteResult, error)
+	// ReadContent is here so a write that waited too long for indexing can be
+	// confirmed instead of assumed. See writeContentWaited.
+	ReadContent(ctx context.Context, uri string) (string, error)
 	UploadTemp(ctx context.Context, filename string, content io.Reader) (string, error)
 	AddResource(ctx context.Context, req openviking.AddResourceRequest) (*openviking.AddResourceResult, error)
 	Find(ctx context.Context, req openviking.FindRequest) (*openviking.FindResult, error)
@@ -77,8 +80,10 @@ type Config struct {
 	// it. Off by default: a bulk sync should not pay an index round-trip per
 	// file, while an explicitly saved document always waits.
 	WaitForIndex bool
-	// TimeoutSeconds bounds one server-side wait (documents, and syncs when
-	// WaitForIndex is on).
+	// TimeoutSeconds is the server-side budget one waited write is given, i.e.
+	// the "timeout" field OpenViking honours while its index queue drains. It
+	// is not the HTTP client's own timeout, which must be larger — see
+	// config.OpenVikingConfig.Timeout.
 	TimeoutSeconds float64
 	// StatePath is the JSON state file. Empty keeps state in memory only, which
 	// means every sync is a full sync.
@@ -154,9 +159,10 @@ func (s *Syncer) RootURI() string { return strings.TrimRight(s.cfg.RootURI, "/")
 
 // Save writes one document and returns its URI.
 //
-// It always waits for indexing, so a successful Save means the document is
-// already findable: that is what a caller asked for when it saved a document in
-// the first place.
+// It always waits for indexing, so a successful Save normally means the
+// document is already findable — that is what a caller asked for when it saved
+// a document in the first place. A wait that runs out of time is not a failed
+// save, though: see writeContentWaited.
 func (s *Syncer) Save(ctx context.Context, doc Document) (string, error) {
 	title := strings.TrimSpace(doc.Title)
 	if title == "" {
@@ -173,15 +179,14 @@ func (s *Syncer) Save(ctx context.Context, doc Document) (string, error) {
 	uri := s.RootURI() + "/" + rel
 
 	body := frontmatter(title, doc.Tags, doc.Source, now) + content + "\n"
-	_, err := s.ov.WriteContent(ctx, openviking.WriteRequest{
+	if err := s.writeContentWaited(ctx, openviking.WriteRequest{
 		URI:            uri,
 		Content:        body,
 		Mode:           "replace",
 		Tags:           doc.Tags,
 		Wait:           true,
 		TimeoutSeconds: s.cfg.TimeoutSeconds,
-	})
-	if err != nil {
+	}); err != nil {
 		return "", fmt.Errorf("documents: save %s: %w", rel, err)
 	}
 
@@ -198,6 +203,45 @@ func (s *Syncer) Save(ctx context.Context, doc Document) (string, error) {
 	s.saveLocked()
 	s.mu.Unlock()
 	return uri, nil
+}
+
+// writeContentWaited writes content and reports whether it is durably stored.
+//
+// A waited write can end three ways, and only two of them are failures:
+//
+//   - The server confirms the write and its indexes. Success.
+//   - The write never landed (a rejected request, a server that is down).
+//     Failure, reported as such.
+//   - The content landed but the index queue did not drain inside the budget.
+//     Success — just not yet searchable.
+//
+// The third case is the one worth being careful about. OpenViking stores the
+// file before it waits, and semantic extraction is genuinely slow (seconds to
+// tens of seconds, depending on the model), so a caller that reported failure
+// here would be wrong twice over: the document is retrievable, and the state
+// entry would be dropped, so the next workspace sync would upload it again.
+//
+// The classification is a hint, never proof — a client-side timeout cannot
+// distinguish "the server is thinking" from "the request never arrived". So the
+// content is confirmed with a read before the write is called saved. If the
+// read fails too, the original error stands.
+func (s *Syncer) writeContentWaited(ctx context.Context, req openviking.WriteRequest) error {
+	_, err := s.ov.WriteContent(ctx, req)
+	if err == nil {
+		return nil
+	}
+	if !req.Wait || !openviking.IsIndexWaitTimeout(err) {
+		return err
+	}
+	if _, rerr := s.ov.ReadContent(ctx, req.URI); rerr != nil {
+		return err
+	}
+	s.logger.Warn("openviking: content saved but indexing did not finish in time; it will become searchable shortly",
+		zap.String("uri", req.URI),
+		zap.Float64("index_wait_seconds", req.TimeoutSeconds),
+		zap.Error(err),
+	)
+	return nil
 }
 
 // Find searches the documents this syncer owns, scoped to its subtree so a
@@ -361,7 +405,7 @@ func (s *Syncer) syncFile(ctx context.Context, dir, rel, abs string, prev Entry,
 
 	uri := s.RootURI() + "/workspace/" + rel
 	if isText(data) {
-		if _, werr := s.ov.WriteContent(ctx, openviking.WriteRequest{
+		if werr := s.writeContentWaited(ctx, openviking.WriteRequest{
 			URI:            uri,
 			Content:        string(data),
 			Mode:           "replace",

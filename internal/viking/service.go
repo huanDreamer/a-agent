@@ -80,7 +80,7 @@ func New(cfg config.OpenVikingConfig, tools config.ToolsConfig, logger *zap.Logg
 			MaxFileBytes:   cfg.Documents.MaxFileBytes(),
 			UploadBinaries: cfg.Documents.UploadsBinaries(),
 			WaitForIndex:   cfg.Documents.WaitIndex,
-			TimeoutSeconds: float64(cfg.Timeout().Seconds()),
+			TimeoutSeconds: float64(cfg.IndexWait().Seconds()),
 			StatePath:      cfg.Documents.StateFile(),
 		}, logger)
 		if serr != nil {

@@ -10,23 +10,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/schema"
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/route"
 	"github.com/google/uuid"
 
 	"github.com/huan/huan-agent/internal/chat"
+	"github.com/huan/huan-agent/internal/prompt"
+	"github.com/huan/huan-agent/internal/retry"
 	"github.com/huan/huan-agent/internal/store"
 	"github.com/huan/huan-agent/internal/tool"
 	"github.com/huan/huan-agent/internal/workspace"
 	"github.com/huan/huan-agent/internal/workspaces"
 )
-
-// defaultSystemPrompt is used when config does not override it.
-const defaultSystemPrompt = "You are huan-agent, a helpful personal AI assistant. " +
-	"Answer in the user's language, be concise, and use tools when they help. " +
-	"Commands run with no terminal and with standard input at /dev/null, so run each one " +
-	"non-interactively — its flag for that (-y, --yes, --no-input, CI=1, git commit -m) or " +
-	"the answers piped in — instead of a command that waits for input, a REPL, a pager or an editor."
 
 // sseHeartbeat keeps an idle stream alive through proxies and lets the client
 // notice a dead connection.
@@ -117,6 +113,16 @@ type ChatDeps struct {
 	// The web chat is the surface most turns go through, so leaving this unset
 	// makes 统计监控 show nothing for the conversations a user actually has.
 	Usage UsageRecorder
+	// StepRetry is how one step of a turn is retried when its model call fails
+	// mid-stream — the failure the llm layer cannot take back, because it has
+	// already handed the caller half an answer. The zero value means no retrying.
+	StepRetry retry.Policy
+	// PlanEnable installs the per-turn task plan: the plan_* tools write to it,
+	// the console renders it above the composer, and a resumed turn reads it to
+	// know what is already done.
+	PlanEnable bool
+	// PlanMaxTasks bounds how many tasks one plan may hold (0 = default).
+	PlanMaxTasks int
 	// AskTimeout bounds how long an ask_user question waits for an answer. Zero
 	// uses DefaultAskTimeout.
 	//
@@ -127,6 +133,40 @@ type ChatDeps struct {
 	// tab or a shutdown ends it — and it counts against the turn's wall-clock
 	// deadline, so this must stay well under chat.turn_deadline_seconds.
 	AskTimeout time.Duration
+	// Checkpoints configures the file-level checkpoints the console keeps for a
+	// turn. Enabled is what turns the feature on; the rest are its knobs.
+	Checkpoints CheckpointSettings
+	// MaxParallel is how many parallel-safe tool calls from one model reply may
+	// run at once. Zero means one at a time.
+	MaxParallel int
+	// Subagents lists the runs a conversation delegated, for the header. Nil means
+	// this deployment has no subagents and the endpoint is absent.
+	Subagents SubagentTracker
+	// SubagentMaxConcurrent is the process-wide bound the header reports, so a
+	// reader can see why three spawned subagents are running two at a time.
+	SubagentMaxConcurrent int
+	// ApprovalTimeout bounds how long one write/exec approval waits for a
+	// decision. Zero uses DefaultApprovalTimeout.
+	//
+	// It is shorter than AskTimeout on purpose: a question is the model gathering
+	// information, while an approval is a decision about an action that is
+	// otherwise blocked, so leaving it hanging holds a turn and a half-finished
+	// tool call for no benefit. What happens at zero differs too: a question that
+	// times out is an answer the model handles, and an approval that times out is
+	// a refusal.
+	ApprovalTimeout time.Duration
+}
+
+// CheckpointSettings are the checkpoint knobs the console needs.
+//
+// It is a struct here rather than a config type so the server keeps depending on
+// what it uses: the console only ever reads these four fields, and a caller
+// wiring it in a test does not have to build a whole configuration.
+type CheckpointSettings struct {
+	Enable     bool
+	Dir        string
+	KeepTurns  int
+	MaxTotalMB int
 }
 
 // UsageRecorder records one model call's token usage. It mirrors
@@ -258,13 +298,40 @@ func (s *Server) registerChatRoutes(authed *route.RouterGroup) {
 	// reloaded conversation can render the image that was sent with it.
 	authed.POST("/chat/sessions/:id/attachments", s.handleUploadAttachment)
 	authed.GET("/chat/attachments/:id", s.handleGetAttachment)
-	// Streaming endpoint: Server-Sent Events, because the browser needs partial
-	// output as the model produces it.
+	// Sending a message starts a turn and returns immediately: the turn belongs
+	// to the conversation rather than to this request, so the answer is read
+	// from the attach endpoint below. That split is what lets a reader come back
+	// to a running turn — another page, another conversation, a reload — and
+	// still see it, instead of losing the answer because a connection went away.
 	authed.POST("/chat/sessions/:id/messages", s.handleSendMessage)
-	// The answer to an ask_user card arrives on its own request: the streaming
-	// response above is already committed to the event stream, so a browser
-	// cannot send a second body on it. The question id joins the two.
+	// Attaching streams a conversation's running turn: the events so far,
+	// replayed, and then the rest of them as they happen. Server-Sent Events,
+	// because the browser needs partial output as the model produces it.
+	authed.GET("/chat/sessions/:id/turn", s.handleAttachTurn)
+	// Stopping ends the turn for everyone attached to it.
+	authed.POST("/chat/sessions/:id/turn/stop", s.handleStopTurn)
+	// Resuming starts a new turn from where the last one died: the previous
+	// turn's stored steps and the current plan are folded into the context, so
+	// the model continues instead of starting the task over. It answers the same
+	// shape as the message endpoint, and the reader then attaches to the turn in
+	// the usual way.
+	authed.POST("/chat/sessions/:id/resume", s.handleResumeTurn)
+	// The answer to an ask_user card arrives on its own request: the attach
+	// stream above is one-way, so a browser cannot send a second body on it. The
+	// question id joins the two.
 	authed.POST("/chat/sessions/:id/questions/:qid/answer", s.handleAnswerQuestion)
+	// A write or exec waiting on a decision is decided the same way and for the
+	// same reason: the attach stream is one-way, so the decision arrives on its
+	// own request and the request id joins the two.
+	authed.POST("/chat/sessions/:id/approvals/:aid", s.handleDecideApproval)
+
+	// Checkpoints: what a turn changed, and the way back. Registered only when the
+	// feature is on — a console offering a rollback button that always fails is
+	// worse than one that does not offer it.
+	s.registerCheckpointRoutes(authed)
+
+	// Subagents: what this conversation delegated, for the header chip.
+	s.registerSubagentRoutes(authed)
 }
 
 // maxAttachmentBytes returns the effective per-upload cap.
@@ -291,14 +358,18 @@ func (s *Server) maxInlineImageBytes() int64 {
 // same arrays. Anything a model surface displays therefore comes from here
 // rather than from a second derivation that could disagree.
 func (s *Server) handleChatModels(ctx context.Context, c *app.RequestContext) {
+	// The budget comes from the same resolver a turn uses (config.yaml merged
+	// with whatever 设置 → 对话预算 stored), so what the composer shows and what
+	// the next turn actually runs cannot disagree.
+	budget := s.effectiveBudget(ctx)
 	out := map[string]any{
 		"system_prompt": s.chatPrompt(),
-		"max_steps":     s.chatMaxSteps(),
+		"max_steps":     budget.maxSteps,
 		// The other two budgets travel with the step cap: the console shows what
 		// a turn may spend, and a user who just watched a turn stop on its
 		// budget should be able to see which budget that was.
-		"turn_max_tokens":       s.chatMaxTokens(),
-		"turn_deadline_seconds": int(s.chatTurnDeadline().Seconds()),
+		"turn_max_tokens":       budget.maxTokens,
+		"turn_deadline_seconds": budget.deadlineSeconds(),
 	}
 	if s.chat.Builder != nil {
 		cat := s.chat.Builder.Catalog(ctx)
@@ -337,38 +408,18 @@ func (s *Server) toolNames() []string {
 	return s.chat.Tools.Names()
 }
 
-// chatPrompt returns the effective system prompt.
+// chatPrompt returns the effective system prompt: the operator's override when
+// they set one, otherwise the console's default (the general-purpose prompt plus
+// the web section). The precedence is prompt.Effective's, so it is the same rule
+// the Feishu bot applies.
 func (s *Server) chatPrompt() string {
-	if p := strings.TrimSpace(s.chat.SystemPrompt); p != "" {
-		return p
-	}
-	return defaultSystemPrompt
+	return prompt.Effective(s.chat.SystemPrompt, prompt.SurfaceWeb)
 }
 
-// chatMaxSteps returns the effective per-turn step cap.
-func (s *Server) chatMaxSteps() int {
-	if s.cfg.ChatMaxSteps > 0 {
-		return s.cfg.ChatMaxSteps
-	}
-	return chat.DefaultMaxSteps
-}
-
-// chatMaxTokens returns the effective per-turn token budget, or 0 for unlimited.
-func (s *Server) chatMaxTokens() int {
-	if s.cfg.ChatMaxTokens > 0 {
-		return s.cfg.ChatMaxTokens
-	}
-	return 0
-}
-
-// chatTurnDeadline returns the effective per-turn wall-clock budget, or 0 for
-// unlimited.
-func (s *Server) chatTurnDeadline() time.Duration {
-	if s.cfg.ChatTurnDeadline > 0 {
-		return s.cfg.ChatTurnDeadline
-	}
-	return 0
-}
+// The three budget accessors that used to live here are gone: the per-turn
+// budget now has exactly one resolver, effectiveBudget (budget.go), because a
+// second one that only read config.yaml would ignore what 设置 → 对话预算 stored
+// and let the console show one number while a turn ran another.
 
 // handleListSessions returns the caller's sessions, newest activity first.
 func (s *Server) handleListSessions(ctx context.Context, c *app.RequestContext) {
@@ -400,7 +451,7 @@ func (s *Server) handleListSessions(ctx context.Context, c *app.RequestContext) 
 			sessions[i].Workspace = fallback
 		}
 	}
-	c.JSON(http.StatusOK, map[string]any{"sessions": sessions})
+	c.JSON(http.StatusOK, map[string]any{"sessions": s.withStreaming(sessions)})
 }
 
 // handleCreateSession creates a conversation, applying the default model.
@@ -580,7 +631,20 @@ func (s *Server) handleGetSession(ctx context.Context, c *app.RequestContext) {
 	// the same value the turn's tools will use rather than a client-side guess.
 	// The console no longer renders it (the sidebar's folder is where that fact
 	// lives), but the reply is the contract other clients read.
-	body := map[string]any{"session": sess, "messages": msgs}
+	body := map[string]any{
+		"session":  sessionView{ChatSession: sess, Streaming: s.turns.running(sess.ID)},
+		"messages": msgs,
+		// The header's numbers (轮数 / 模型调用 / 工具调用 / token) are aggregated
+		// here rather than in the browser: they have to survive a reload, and two
+		// clients must not be able to disagree about them.
+		"stats": s.sessionStatsFor(ctx, sess.ID, msgs),
+		// The task plan travels with the conversation for the same reason: the
+		// board above the composer is conversation state, and a reloaded page has
+		// to show it without waiting for the next turn to touch it. Null means
+		// "this conversation has no plan", which the console renders as no board
+		// rather than as an empty one.
+		"plan": s.sessionPlan(ctx, sess.ID),
+	}
 	if spec, ok := s.sessionWorkspace(ctx, sess); ok {
 		body["workspace"] = spec
 	}
@@ -699,6 +763,14 @@ func (s *Server) handleClearSession(ctx context.Context, c *app.RequestContext) 
 		s.fail(c, "clear chat session", err)
 		return
 	}
+	// The plan goes with the history. It is the one piece of turn state that
+	// outlives its turn, and leaving it behind would show a board of tasks for a
+	// conversation that no longer has the messages explaining them — and offer
+	// 继续执行 for work whose context was just deleted.
+	if err := s.store.DeleteChatPlan(ctx, id); err != nil {
+		s.fail(c, "clear chat plan", err)
+		return
+	}
 	c.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -766,34 +838,133 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 		persisted = defaultAttachmentText
 	}
 
-	// Build the model for this session's choice before opening the stream, so a
-	// misconfiguration is reported as a normal JSON error instead of a broken
-	// stream.
-	runner, err := s.runnerFor(ctx, sess)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-
 	history, err := s.buildHistory(ctx, sess, buildUserMessage(turnText, inline))
 	if err != nil {
 		s.fail(c, "build chat history", err)
 		return
 	}
 
+	s.launchTurn(ctx, c, sess, store.ChatMessage{
+		Role: store.RoleUser, Content: persisted, Attachments: attachmentsJSON(assetIDs),
+	}, history, true)
+}
+
+// launchTurn puts one turn in flight for a conversation and answers the request
+// that asked for it, on a history the caller has already assembled.
+//
+// It is shared by sending a message and by resuming a dead turn, because
+// everything after "the history is ready" is identical for the two and the
+// difference between them is exactly the history. Keeping it in one place is
+// what makes the resume path inherit the budget resolution, the workspace
+// binding, the one-turn-per-conversation rule and the accepted-response shape
+// without a second copy that can drift from them.
+//
+// newTask says which of the two this is: a message from the user starts a new
+// piece of work (so a finished plan is cleared), while a resume continues the one
+// that is already in progress (so its plan is the whole point).
+func (s *Server) launchTurn(ctx context.Context, c *app.RequestContext, sess store.ChatSession,
+	userMsg store.ChatMessage, history []*schema.Message, newTask bool) {
+
+	// Refuse before anything is written. A message that is going to be refused
+	// must not be left in the conversation: the reader would see their own text
+	// followed by no answer and no explanation, and the client is already
+	// offering it back for a retry.
+	if s.turns.running(sess.ID) {
+		c.JSON(http.StatusConflict, map[string]string{
+			"error": "这个对话已有一轮正在生成，请等它结束或先停止它",
+		})
+		return
+	}
+
+	// The model for this session's choice, resolved before anything is written:
+	// a misconfigured model is a normal JSON error rather than a stored message
+	// nobody will ever answer.
+	runner, err := s.runnerFor(ctx, sess)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
 	// Persist the user's message before running, so a crash mid-turn does not
 	// lose it.
-	if _, err := s.store.AppendChatMessage(ctx, sess.ID, store.ChatMessage{
-		Role: store.RoleUser, Content: persisted, Attachments: attachmentsJSON(assetIDs),
-	}); err != nil {
+	if _, err := s.store.AppendChatMessage(ctx, sess.ID, userMsg); err != nil {
 		s.fail(c, "persist user message", err)
 		return
 	}
 
-	// The handler returns while the goroutine keeps writing, which is what makes
-	// this a stream. The request context is tied to the connection, so a client
-	// disconnect cancels the run.
-	clientGone := ctx.Done()
+	// This turn's budget, resolved once, from config.yaml merged with whatever
+	// 设置 → 对话预算 stored. Reading it here rather than at startup is what makes
+	// a change in the console apply to the next message instead of the next
+	// process; reading it once is what keeps a change made mid-turn from moving
+	// the ceiling of a turn already in flight.
+	budget := s.effectiveBudget(ctx)
+
+	// Bump the conversation before the turn runs, not only when it is stored.
+	//
+	// The sidebar sorts by "last activity", and a conversation that is being
+	// answered right now is the most active thing there is. Without this, a
+	// reload would sort a running turn below older ones — and auto-select
+	// something else, which is precisely when a reader cannot find the answer
+	// they were watching.
+	if err := s.store.TouchChatSession(ctx, sess.ID); err != nil {
+		s.logger.Warn("chat: touch session on turn start failed",
+			zapString("session", sess.ID), zapError(err))
+	}
+
+	workspace := s.sessionWorkspaceName(ctx, sess)
+	live := s.startTurn(turnRun{
+		session:   sess,
+		workspace: workspace,
+		runner:    runner,
+		history:   history,
+		scope:     workspaces.WebScope(sess.ID),
+		newTask:   newTask,
+		maxSteps:  budget.maxSteps,
+		maxTokens: budget.maxTokens,
+		deadline:  budget.deadline,
+	})
+	if live == nil {
+		// One turn per conversation: the reader has a single composer, and two
+		// answers interleaved into one transcript could not be told apart. The
+		// check above already answered this case; this is the race it cannot
+		// close, and losing here means the user message above is already stored.
+		c.JSON(http.StatusConflict, map[string]string{
+			"error": "这个对话已有一轮正在生成，请等它结束或先停止它",
+		})
+		return
+	}
+
+	// The turn is now the conversation's, not this request's: it keeps running
+	// whether or not the caller stays attached. The browser attaches to it with
+	// GET /chat/sessions/{id}/turn — and re-attaches after a reload, another
+	// page, or another conversation, and sees the same stream from the start.
+	c.JSON(http.StatusAccepted, map[string]any{
+		"turn": map[string]any{
+			"session_id": sess.ID,
+			"streaming":  true,
+			"started_at": live.startedAt.UTC().Format(time.RFC3339Nano),
+		},
+	})
+}
+
+// handleAttachTurn streams a conversation's running turn to whoever asks.
+//
+// This is the endpoint the console reads its answers from. It replays the turn
+// from its first event and then follows it live, so attaching late — after
+// switching pages, switching conversations, or reloading the browser — shows
+// the same thing as having been there from the start: the answer so far, and
+// then the rest of it as it arrives.
+//
+// It answers a plain JSON `{"streaming": false}` when nothing is running, rather
+// than holding a connection open: the conversation's stored messages are then
+// the whole truth, and the console has already loaded them.
+func (s *Server) handleAttachTurn(ctx context.Context, c *app.RequestContext) {
+	live := s.turns.find(c.Param("id"))
+	if live == nil {
+		c.JSON(http.StatusOK, map[string]any{"streaming": false})
+		return
+	}
+
 	pr, pw := io.Pipe()
 	c.Response.Header.Set("Content-Type", "text/event-stream")
 	c.Response.Header.Set("Cache-Control", "no-cache")
@@ -803,97 +974,36 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 	c.Response.Header.Set("X-Accel-Buffering", "no")
 	c.SetBodyStream(pr, -1)
 
-	events := make(chan chat.Event, 64)
-	done := make(chan *chat.Result, 1)
-
-	// The turn's answerer. It writes the question onto the same channel the
-	// runner reports tool calls on, so the card appears in the conversation at
-	// the moment the model asks, and it is created per turn because the answer
-	// only means anything while this request is open.
-	runCtx := tool.WithAsker(ctx, &turnAsker{
-		hub:     s.questions,
-		session: sess.ID,
-		timeout: s.askTimeout(),
-		logger:  s.logger,
-		emit: func(e chat.Event) {
-			select {
-			case events <- e:
-			case <-clientGone:
-			}
-		},
-	})
-
-	go func() {
-		defer close(done)
-		res, runErr := runner.Run(runCtx, chat.Request{
-			Messages:  history,
-			SessionID: sess.ID,
-			UserID:    sess.UserID,
-			// The scope is what the per-turn tool set is derived from, so this
-			// conversation's tools resolve inside its own workspace even while
-			// another conversation runs against a different one.
-			Scope: workspaces.WebScope(sess.ID),
-		}, func(e chat.Event) {
-			select {
-			case events <- e:
-			case <-clientGone:
-			}
-		})
-		if runErr != nil {
-			// Run already emitted an error event; record it for the history.
-			//
-			// The trace id survives the reset: a failed turn is exactly when
-			// someone wants to open the trace, and the store already holds it —
-			// the runner opened the trace before it failed and closes it on the
-			// way out.
-			traceID := ""
-			if res != nil {
-				traceID = res.TraceID
-			}
-			res = &chat.Result{Text: "", Usage: chat.Usage{}, TraceID: traceID}
-			select {
-			case events <- chat.Event{Type: chat.EventError, Error: runErr.Error()}:
-			case <-clientGone:
-			}
-		}
-		done <- res
-	}()
-
-	go s.streamTurn(ctx, pw, sess, events, done, clientGone)
+	go s.streamLiveTurn(ctx, pw, live)
 }
 
-// streamTurn writes SSE frames until the turn finishes and persists the result.
-func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.ChatSession,
-	events <-chan chat.Event, done <-chan *chat.Result, clientGone <-chan struct{}) {
+// handleStopTurn ends a conversation's running turn.
+//
+// Stopping is a request of its own so that "the reader stopped it" is a fact
+// about the turn rather than about one connection: the run is cancelled, what
+// it produced is kept, and every attached reader sees it end.
+func (s *Server) handleStopTurn(ctx context.Context, c *app.RequestContext) {
+	stopped := s.turns.stop(c.Param("id"))
+	c.JSON(http.StatusOK, map[string]any{"ok": true, "stopped": stopped})
+}
 
-	// Closing the writer ends the response body; the client sees the stream end.
+// streamLiveTurn writes one attached reader's copy of a live turn.
+//
+// Nothing here owns the turn: the writer may go away at any moment (a closed
+// tab, a reload, a scroll to another conversation) and the turn carries on. The
+// reader's cursor is local, so a slow one falls behind and then catches up
+// rather than losing events, and the heartbeat keeps an idle stream alive
+// through proxies during the long silent stretches a slow model produces.
+func (s *Server) streamLiveTurn(ctx context.Context, pw *io.PipeWriter, live *liveTurn) {
 	defer func() { _ = pw.Close() }()
 
 	heartbeat := time.NewTicker(sseHeartbeat)
 	defer heartbeat.Stop()
 
-	var (
-		answer    strings.Builder
-		reasoning strings.Builder
-		usage     chat.Usage
-		toolRuns  []chat.ToolRun
-		runErr    string
-		// stopReason is why the turn ended when it was not the model's own
-		// answer. It is captured from the event so a turn that stops on its
-		// budget is still marked after a reload, not just while the stream is
-		// open.
-		stopReason string
-		// traceID is known only once the run reports back, so a turn persisted
-		// because the client vanished mid-flight stores no trace link. The trace
-		// itself is still recorded and the trace panel can find it by session;
-		// what is lost is only the shortcut from that one message.
-		traceID string
-	)
-
 	write := func(v any) bool {
 		b, err := json.Marshal(v)
 		if err != nil {
-			return false
+			return true
 		}
 		// SSE frame: "data: <json>\n\n".
 		if _, err := fmt.Fprintf(pw, "data: %s\n\n", b); err != nil {
@@ -902,121 +1012,45 @@ func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.C
 		return true
 	}
 
-	flush := func() {
-		// Persist what we have once the turn is over, even if the client
-		// disconnected: the conversation should survive a closed tab.
-		s.persistTurn(ctx, sess, s.sessionWorkspaceName(ctx, sess), answer.String(), reasoning.String(),
-			toolRuns, usage, runErr, traceID, stopReason)
+	watcher, replayed, cursor, done := live.subscribe()
+	defer live.unsubscribe(watcher)
+
+	send := func(events []chat.Event) bool {
+		for _, e := range events {
+			if !write(e) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if !send(replayed) {
+		return
 	}
 
 	for {
-		select {
-		case <-clientGone:
-			// The browser went away: stop writing but let the run finish and
-			// still persist the answer.
-			flush()
-			return
-
-		case <-heartbeat.C:
-			if _, err := fmt.Fprint(pw, ": ping\n\n"); err != nil {
-				flush()
-				return
-			}
-
-		case e, ok := <-events:
-			if !ok {
-				events = nil
-				continue
-			}
-			switch e.Type {
-			case chat.EventTextDelta:
-				answer.WriteString(e.Text)
-			case chat.EventReasoningDelta:
-				reasoning.WriteString(e.Text)
-			case chat.EventToolCall:
-				toolRuns = append(toolRuns, chat.ToolRun{
-					ID: e.ToolCallID, Name: e.ToolName, Args: e.ToolArgs,
-				})
-			case chat.EventToolResult:
-				for i := range toolRuns {
-					if toolRuns[i].ID == e.ToolCallID {
-						toolRuns[i].Result = e.ToolResult
-						toolRuns[i].Err = e.ToolError
-						toolRuns[i].DurationMs = e.DurationMs
-						break
-					}
-				}
-			case chat.EventUsage:
-				if e.Usage != nil {
-					usage = *e.Usage
-				}
-			case chat.EventBudgetStop:
-				stopReason = e.Reason
-			case chat.EventDone:
-				if e.Text != "" {
-					answer.Reset()
-					answer.WriteString(e.Text)
-				}
-			case chat.EventError:
-				runErr = e.Error
-			}
-			if !write(e) {
-				flush()
-				return
-			}
-
-		case res := <-done:
-			// Drain anything the runner queued before finishing.
-			for {
-				select {
-				case e := <-events:
-					switch e.Type {
-					case chat.EventReasoningDelta:
-						reasoning.WriteString(e.Text)
-					case chat.EventBudgetStop:
-						stopReason = e.Reason
-					case chat.EventDone:
-						if e.Text != "" {
-							answer.Reset()
-							answer.WriteString(e.Text)
-						}
-					case chat.EventError:
-						runErr = e.Error
-					}
-					_ = write(e)
-					continue
-				default:
-				}
-				break
-			}
-			if res != nil {
-				traceID = res.TraceID
-				if res.Text != "" {
-					answer.Reset()
-					answer.WriteString(res.Text)
-				}
-				if res.Reasoning != "" {
-					reasoning.Reset()
-					reasoning.WriteString(res.Reasoning)
-				}
-				if res.Usage.TotalTokens > 0 {
-					usage = res.Usage
-				}
-				if len(res.Tools) > 0 {
-					toolRuns = res.Tools
-				}
-				// The result carries the reason too, so a turn that lost its
-				// budget_stop event to a dropped connection is still marked.
-				if res.StopReason != "" {
-					stopReason = res.StopReason
-				}
-			}
-			flush()
-			// A terminating frame tells the client the stream is complete even
-			// if a proxy closes the connection without warning.
-			_ = write(map[string]any{"type": "stream_end"})
+		if done {
+			// A terminating frame tells the client the turn is complete even if
+			// a proxy closes the connection without warning. The turn has been
+			// persisted by now, so the reader can reload and find the message.
+			write(map[string]any{"type": "stream_end"})
 			return
 		}
+		select {
+		case <-watcher.notify:
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(pw, ": ping\n\n"); err != nil {
+				return
+			}
+		case <-ctx.Done():
+			// This reader is gone. The turn is not.
+			return
+		}
+		next, advanced, finished := live.since(cursor)
+		if !send(next) {
+			return
+		}
+		cursor, done = advanced, finished
 	}
 }
 
@@ -1026,8 +1060,8 @@ func (s *Server) streamTurn(ctx context.Context, pw *io.PipeWriter, sess store.C
 // is workspace-relative, so "write_file src/main.go" looks identical in every
 // workspace and the audit would otherwise be unable to say which project a
 // change landed in.
-func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, workspace, answer, reasoning string,
-	tools []chat.ToolRun, usage chat.Usage, runErr, traceID, stopReason string) {
+func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, workspace string,
+	sum turnSummary, runErr, traceID string) {
 
 	// Use a fresh context: the request context is already cancelled when the
 	// client disconnects, and the answer must still be saved.
@@ -1035,22 +1069,34 @@ func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, worksp
 	defer cancel()
 
 	usageJSON := ""
-	if usage.TotalTokens > 0 || usage.PromptTokens > 0 {
+	if sum.usage.TotalTokens > 0 || sum.usage.PromptTokens > 0 {
 		b, err := json.Marshal(map[string]int{
-			"prompt_tokens":     usage.PromptTokens,
-			"completion_tokens": usage.CompletionTokens,
-			"total_tokens":      usage.TotalTokens,
-			"duration_ms":       int(usage.DurationMs),
+			"prompt_tokens":     sum.usage.PromptTokens,
+			"completion_tokens": sum.usage.CompletionTokens,
+			"total_tokens":      sum.usage.TotalTokens,
+			"duration_ms":       int(sum.usage.DurationMs),
 		})
 		if err == nil {
 			usageJSON = string(b)
 		}
 	}
+	// The flat list stays as well: the audit rows, the session statistics and
+	// older clients read it, and it is what a tool-call count is derived from.
 	toolCallsJSON := ""
-	if len(tools) > 0 {
-		b, err := json.Marshal(tools)
+	if len(sum.tools) > 0 {
+		b, err := json.Marshal(sum.tools)
 		if err == nil {
 			toolCallsJSON = string(b)
+		}
+	}
+	// The same calls, kept next to the reasoning that asked for them. This is
+	// what the console renders: a flat list beside one block of reasoning cannot
+	// show which thought belongs to which action, however it is styled.
+	stepsJSON := ""
+	if len(sum.plan) > 0 {
+		b, err := json.Marshal(sum.plan)
+		if err == nil {
+			stepsJSON = string(b)
 		}
 	}
 
@@ -1058,11 +1104,11 @@ func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, worksp
 	// user actually has. Without this the web chat — the surface nearly every
 	// turn goes through — is invisible in 统计监控, and the dashboard reads as
 	// broken rather than empty.
-	s.recordTurnUsage(sess, usage)
+	s.recordTurnUsage(sess, sum.usage)
 
 	// Record each tool invocation in the audit log as well, so the audit view
 	// and the conversation agree.
-	for _, t := range tools {
+	for _, t := range sum.tools {
 		if err := s.store.RecordInvocation(saveCtx, store.InvocationEvent{
 			SessionID:  sess.ID,
 			UserID:     sess.UserID,
@@ -1077,20 +1123,27 @@ func (s *Server) persistTurn(ctx context.Context, sess store.ChatSession, worksp
 		}
 	}
 
+	answer := sum.answer
 	if answer == "" && runErr == "" {
-		return
+		// The turn ran and produced nothing at all — no text, no failure the
+		// runner could name. Writing no row would leave the conversation holding
+		// the user's message and no trace of what became of it, which is exactly
+		// what "the answer disappeared" looks like from the outside. So the turn
+		// is recorded as the failure it was.
+		runErr = "本轮没有产生任何输出"
 	}
 	msg := store.ChatMessage{
 		Role:      store.RoleAssistant,
 		Content:   answer,
-		Reasoning: reasoning,
+		Reasoning: sum.reasoning,
 		ToolCalls: toolCallsJSON,
+		Steps:     stepsJSON,
 		UsageJSON: usageJSON,
 		Error:     runErr,
 		// Why the turn ended, when it was not the model's own answer. Empty is
 		// the ordinary case, and the UI renders a set value as a badge on the
 		// message rather than leaving the reader to find the sentence inside it.
-		StopReason: stopReason,
+		StopReason: sum.stopReason,
 		// The link from this answer to the trace that produced it. Empty when
 		// tracing is off, which the UI renders as "no link" rather than a link
 		// that leads nowhere.

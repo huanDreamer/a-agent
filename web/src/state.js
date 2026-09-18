@@ -65,6 +65,7 @@ export const MONITOR_TABS = [
 export const SETTINGS_TABS = [
   { key: 'appearance', label: '外观' },
   { key: 'models', label: '模型' },
+  { key: 'budget', label: '对话预算' },
   { key: 'mcp', label: 'MCP' },
   { key: 'openviking', label: 'OpenViking' },
   { key: 'skills', label: '技能' },

@@ -985,13 +985,13 @@ func newCatalogHarness(t *testing.T, seed func(store.Store), builder func(store.
 		t.Fatalf("hash password: %v", err)
 	}
 	srv, err := New(Config{
-		Host:          "127.0.0.1",
-		Port:          0,
-		MetricsEnable: true,
-		Version:       "test-version",
-		ChatMaxSteps:  4,
-		Chat:          ChatDeps{Runner: chatRunnerForTest(t), Builder: builder(st)},
-		Logger:        zap.NewNop(),
+		Host:                "127.0.0.1",
+		Port:                0,
+		MetricsEnable:       true,
+		Version:             "test-version",
+		DefaultChatMaxSteps: 4,
+		Chat:                ChatDeps{Runner: chatRunnerForTest(t), Builder: builder(st)},
+		Logger:              zap.NewNop(),
 	}, st, pricing.NewTable(nil, pricing.Rate{}), config.AdminConfig{
 		Username:     "admin",
 		PasswordHash: hash,

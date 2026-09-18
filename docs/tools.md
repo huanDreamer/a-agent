@@ -52,7 +52,8 @@ tools:
 
   # RE2 patterns that refuse a matching command. Empty = the built-in set.
   # A SPEED BUMP, not a security boundary: an equivalent command that does not
-  # match will run.
+  # match will run. The approval gate (tools.approval.mode) is the gate; this is
+  # the bump.
   deny_patterns: []
 ```
 
@@ -64,7 +65,14 @@ tools:
 | `list_dir` | read | Lists a directory: directories first, then files, each alphabetical. |
 | `glob` | read | Finds files by path pattern. Supports `*` (within a segment), `?`, and `**` (any depth); a pattern with no `/` matches at any depth. |
 | `grep` | read | Searches contents with RE2. Filters by `include` glob, supports `context_lines`, caps matches, clips long lines. |
+| `diagnostics` | read | Compiler and analyzer diagnostics for one file, or for the workspace when `path` is omitted. Requires a language server — see "Code intelligence" below. |
+| `goto_definition` | read | Where the symbol at a 1-based line/column is defined. |
+| `find_references` | read | Every reference to the symbol at a position, from the language server's view rather than a text search. |
+| `workspace_symbols` | read | Searches the workspace for symbols by name — the tool for "which code handles X". |
+| `spawn_agent` | read | Hands a self-contained question to a subagent that works in its own context and returns one short report. See "Subagents" below. |
+| `fetch_url` | read | Fetches a web page and returns its readable text plus its same-site links. See "Reading the web" below. |
 | `write_file` | write | Creates or overwrites a file, creating parent directories, writing atomically. |
+| `apply_patch` | write | Applies a set of edits to several files, all or nothing. See "Editing across files" below. |
 | `edit_file` | write | Replaces exact text. **The text must appear exactly once** unless `replace_all` is set. |
 | `bash` | exec | Runs a command through `/bin/sh -c` with the working directory confined to the workspace, waits for it, and kills its whole process group when the call ends. For things that finish on their own. `timeout_ms` may shorten its limit or extend it up to `tools.bash_max_timeout_seconds`. |
 | `bash_background` | exec | Starts a long-lived process (dev server, `--watch` build, resident API or database) and returns a job id. The result carries the exit code and output if it died within the startup grace. For things that are meant to keep running. |
@@ -78,6 +86,347 @@ tools:
 
 Typical use: `glob` to find the file, `read_file` to see it, `grep` to find the
 call sites, `edit_file` to change it, `bash` to run the tests.
+
+## Reading the web
+
+`fetch_url` fetches a URL, strips the navigation and scripts, and returns the
+readable content. Without it the model's alternative is `curl`, and a modern
+documentation page is hundreds of kilobytes of HTML in which the article is a small
+fraction — what reaches the context is a truncated shell of it.
+
+```
+fetch_url("https://go.dev/blog/context")
+  → title + 正文（`<pre>` 原样保留、其他标签剥掉）
+  → links: ["https://go.dev/blog/...", …]      ← 同站链接，可以直接读下一篇
+```
+
+Long pages come back in windows: `max_chars` (default 20000 runes) bounds one call
+and `offset` continues where the previous call stopped. The extracted text is
+cached in-process for `cache_ttl_seconds`, so paging does not re-fetch.
+
+Two properties are worth knowing:
+
+- **The content is framed as untrusted.** It is the one input a stranger writes, so
+  the tool's result opens with an explicit framing that anything looking like an
+  instruction is data, not an instruction, and the prompt says the same.
+- **It cannot reach your private network.** Loopback, private ranges, link-local
+  addresses and the cloud metadata endpoint (`169.254.169.254`) are refused, and the
+  refusal names what it blocked. The check runs on the initial URL, **on every
+  redirect**, and again at dial time — a 302 into the metadata service and a DNS
+  rebind are the two classic bypasses of a check that runs once. Setting
+  `tools.web.allow_private: true` lifts this for a deployment whose wiki is on the
+  LAN, and logs a warning at startup because it also lifts it for the agent's own
+  local services.
+
+Only text-like content is read (`text/*`, JSON, XML, YAML, Markdown). A PDF, an
+image or an archive is refused with its media type in the message rather than
+dumped into the context as bytes. A page that extracts to almost nothing — usually
+one rendered by JavaScript — says so instead of looking like an empty page.
+
+**Search is not part of this.** `web_search` is deliberately not implemented here:
+search belongs to a provider whose ranking, quotas and terms are its own, and this
+deployment reaches one through an MCP server (see `docs/mcp.md`). `fetch_url` reads
+a page you already have the address of.
+
+## Editing across files
+
+Three tools edit files, and the division of labour is stated in each one's
+description because the model is the one who has to pick:
+
+| Tool | Use it when |
+|---|---|
+| `edit_file` | one change in one file |
+| `apply_patch` | a change across several files, where a half-applied result would be worse than none (a rename, a signature change, the same fix in three places) |
+| `rename_symbol` | every reference to one symbol — it asks the language server, not a string search |
+
+### `rename_symbol`
+
+It gives the 1-based line and column of the symbol, and the language server returns
+the edits that rename it. The difference from a search-and-replace is not
+convenience, it is correctness: a string search for `Add` also rewrites
+`"call Add to sum"`, a comment that mentions it, and another package's function
+with the same name. The server knows which identifier is being pointed at and
+which references that binding resolves to — the same information the compiler has.
+
+```
+rename_symbol(path: "calc.go", line: 4, column: 6, new_name: "Sum")
+  → 已重命名为 Sum：2 个文件、3 处引用（+3 -3）
+```
+
+Two things about it are worth knowing:
+
+- **The file's siblings are opened first.** A language server only knows about
+  documents it has been told about, so a rename asked for right after the target
+  file was opened answers with the references it has seen — which is that file and
+  nothing else. Silently missing the other files is the worst thing this tool could
+  do: it leaves a repository that does not build and looks like it worked. This was
+  found by running it, not by testing it; the fix opens the other files in the same
+  directory (bounded to 64) before asking.
+- **It is absent, not broken, in two situations**: a read-only workspace, and a
+  workspace with no language server configured. Without a server the only
+  implementations available are string searches, and a rename that quietly means
+  "replace this word everywhere" is exactly what this tool exists to replace.
+
+`dry_run: true` shows the plan — files, references, a bounded diff — and writes
+nothing. The change goes through the same all-or-nothing applier as `apply_patch`,
+so a rename either lands everywhere or nowhere; and because it is a write, it goes
+through the approval gate and gets a checkpoint like any other.
+
+**`apply_patch` is all or nothing**, and that is its entire reason for existing. A
+rename that touches seven files, applied one `edit_file` call at a time, leaves a
+repository that compiles nowhere the moment the fourth call fails — with three
+changes already on disk. So it runs in two phases:
+
+1. **Plan.** Read every file, apply every edit in memory, decide whether the whole
+   batch is possible. It touches no disk. Any problem — a target outside the
+   workspace, a binary file, an ambiguous or missing `old_string`, a result over
+   the write limit, the same path twice — produces one error naming the file and
+   the edit index, and the workspace is byte-for-byte what it was.
+2. **Apply.** Take a checkpoint of every file about to change, then write each one
+   atomically (temp file + rename). If a write fails, the files already written
+   are restored from the originals phase 1 kept, and the report says which.
+
+The invariant both phases exist to protect: **either every edit is on disk, or
+none is.** If a rollback itself fails, the error says so explicitly — the
+workspace is then in a state nobody chose, and that is the one outcome a caller
+must not discover by surprise.
+
+`dry_run: true` returns the same structure a real run does, plus a bounded diff
+per file, and writes nothing. The approval card shows that same preview, computed
+from the plan rather than described, so what a person approves is the change that
+will happen.
+
+The matching rules are `edit_file`'s exactly, from the same implementation: a
+unique occurrence, or `replace_all`. The failure messages read the same way, and
+they name the file and the edit index, because "one of your edits did not match"
+is not something a model can act on.
+
+### The two input forms
+
+`apply_patch` takes either a structured `operations` list or a `patch` string:
+
+```
+operations: [{ path, edits: [{ old_string, new_string, replace_all? }] }]
+patch:      "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -3,4 +3,4 @@\n…"
+```
+
+The structured form is the primary one — it is what a model writing a change from
+scratch produces, and its matching rules are `edit_file`'s. The diff form exists for
+the case where a diff already exists: the model wrote one, or someone pasted one
+into the conversation. Both are parsed into the same operations and run through the
+same applier, so **the atomicity guarantee does not depend on which form was used**.
+
+The diff form is located by **context lines, not line numbers**. A hunk header's
+numbers are used only to warn: a diff whose numbers drifted because someone edited
+above the change still applies, and a diff whose *context* does not match is refused
+rather than applied three lines off — a misapplied patch is silent, compiles
+nowhere, and gives the model nothing to act on. A mismatch between the declared
+counts and the hunk body is returned as a `warnings` entry rather than swallowed.
+
+**This stage cannot create or delete files.** A patch that does is refused with the
+alternative named: `write_file` for a new file, `bash` (behind the approval gate)
+for a deletion. Creating and deleting are the two operations where "all or nothing"
+needs a story about the directory entry itself, and that story is not written yet.
+
+## Subagents
+
+`spawn_agent` buys **context isolation, not compute**. Answering one question can
+mean twenty greps and thirty file reads; in the parent's window those results stay
+for the rest of the turn and crowd out the code being changed. A subagent gets a
+window that is allowed to get dirty.
+
+```
+spawn_agent("调研 internal/tool 目录下有哪些文件、各自负责什么")
+  → 报告 + 尾注：子 agent「调研 internal/tool…」：8 步，用了 read_file×18、grep×3，12000 tokens。
+```
+
+A real run of that: the nested run took 8 steps and read 24 files, and what crossed
+back was a few hundred words plus the footer. The parent's own context never saw
+the 24 reads.
+
+### Several at once
+
+Two ways, and both overlap:
+
+```
+spawn_agent(tasks: ["数一下 internal/mcp 有多少 .go 文件",
+                    "数一下 internal/web 有多少 .go 文件",
+                    "数一下 internal/edit 有多少 .go 文件"])
+  → reports[0..2] 各一份，合并文本按任务编号分段
+```
+
+or calling the tool several times in one reply. **Use `tasks` when the questions do
+not depend on each other** — it is the form that works on every surface, including
+the CLI and the bot, whose loop runs a reply's tool calls one at a time: the fan-out
+happens inside the tool, so it does not depend on the loop's scheduling.
+
+`subagent.max_concurrent` (default 2) bounds it process-wide. A run that cannot get a
+slot waits rather than failing, and the header says how many are queued.
+
+### Watching them
+
+The console's header carries a chip next to the background-process one — same
+question, same shape — and it opens a drawer listing what this conversation
+delegated: name, task, status, steps, tokens, how long it took, and why a run that
+did not finish failed.
+
+One detail in that drawer is deliberate: **`steps: -1` is shown as "步数不可得", never
+as "0 步".** Eino's ReAct loop returns only the final message, so a subagent on the
+CLI or the bot cannot report a step count, and a failed one never got one at all. A
+run that worked for a minute shown as "0 steps" reads as "it did nothing", in the one
+place a reader looks to judge whether the work happened.
+
+What it inherits and what it never gets:
+
+| | |
+|---|---|
+| Inherited by default | the parent's **read-only _and_ parallel-safe** tools |
+| On request (`tools:`) | writes and commands, which still pass through the parent's approval gate, checkpoints and sandbox — a subagent is not a way around them |
+| Never | `ask_user` (no channel to a person: a card would only hang), `plan_*` (the plan belongs to the top-level turn), `spawn_agent` (depth is capped at one) |
+
+The report is bounded (`subagent.max_report_chars`, default 8000) and truncation is
+stated, and the footer says how many steps and tools produced it, so the model can
+judge how much to trust it. A subagent that fails is a **report that says so**: the
+parent turns keeps running and decides what to do.
+
+Cost is the parent's: the nested run's tokens and wall-clock count against the
+parent turn's budget and share its deadline, so `chat.turn_max_tokens` and
+`chat.turn_deadline_seconds` stay true. `subagent.max_concurrent` (default 2) is a
+**process-wide** gate, because "spawn three explorations" is the intended use and
+four parents each spawning four is how a fan-out becomes a bill.
+
+**What a subagent did is visible.** Its own steps — the reads, the greps, the
+thinking — arrive on the parent turn's stream tagged with the id of the call that
+spawned it, and the console lists them on that call's card, one line per action.
+`huan-agent run --output json` reports the same thing under the call's `nested`
+field. This is not cosmetic: a card that spawns something and then sits silent for
+thirty seconds reads as a hang, and the alternative — appending the subagent's text
+to the answer — would show the reader text the model never produced and store a
+turn that is not what the model said.
+
+Two differences between the surfaces are worth knowing:
+
+- **The CLI and the bot run subagents on Eino's ReAct loop, which returns only the
+  final message.** So a report from those surfaces says the step and tool counts are
+  *unavailable* rather than reporting zero — a footer claiming "0 steps, no tools"
+  for a subagent that worked for a minute is a lie the parent model will act on.
+  The console and `huan-agent run` report the real counts, because the chat loop
+  keeps them.
+- **Nested steps are summaries, not transcripts.** Each line is one action with its
+  outcome, trimmed to a line; the subagent's full conversation is in its own trace,
+  which is where a reader goes to audit it. A parent's stored turn carries the same
+  summary, so a reloaded conversation shows what a live one showed.
+
+## Parallel tool calls
+
+When one model reply asks for several tools, the ones that declared themselves
+**parallel-safe** run at the same time, and everything else is a barrier: a write
+or a command waits for everything before it and blocks everything after it.
+
+That ordering is not a performance compromise, it is what the model's program
+order means. "Write the config, then run the tests" is two calls with a
+dependency the model expressed by ordering them; overlapping them tests the old
+config. So the schedule is:
+
+```
+[grep, read_file, write_file, read_file, grep]
+ └── parallel ──┘   └─ alone ─┘   └─ parallel ─┘
+```
+
+Two properties are worth knowing as a caller:
+
+- **The results are always in the order the model wrote the calls**, whatever
+  order they finished in. The messages sent back are matched to the calls by
+  position, and a plan step lists its calls in the order that explains it.
+- **A failure is an observation, not a cancellation.** One call failing does not
+  cancel its siblings — the model asked for several things and should see all of
+  the answers. A tool that panics is reported as a failed call rather than taking
+  the turn down with it.
+
+`tools.max_parallel` (default 4; `0` or `1` means one at a time) bounds how many
+may overlap. Which tools may overlap at all is a property of the tool, not of the
+setting:
+
+| May overlap | Runs alone |
+|---|---|
+| `read_file`, `list_dir`, `glob`, `grep`, `time`, `calc`, `echo`, `bash_output`, and the four code-intelligence tools | `write_file`, `edit_file`, `bash`, `bash_background`, `bash_jobs`, `bash_stop`, `ask_user`, `plan_*`, `save_document`, the media tools |
+
+The table is not "reads versus writes", and the difference matters: `ask_user`,
+`plan_update` and `save_document` are all read-capability tools that must not
+overlap anything — the first parks the whole turn waiting for a person, the second
+is a read-modify-write on one shared plan, and the third writes to a store. A new
+tool has to declare which it is, and a test fails if it does not
+(`tool.UndeclaredTools`).
+
+The CLI and the Feishu bot use Eino's ReAct loop, which runs tools sequentially on
+purpose — see the comment in `internal/agent/agent.go` for why, and for the four
+properties a loop has to reproduce before it may overlap them.
+
+## Code intelligence
+
+Four read-only tools come from a **language server** (`gopls` by default) rather
+than from a text search, because some questions only a compiler can answer:
+
+- **"Did my change break anything?"** — `diagnostics`, and more importantly the
+  diagnostics that are attached to what `write_file` / `edit_file` return. That
+  attachment is the point of the feature: it turns "change → run tests → notice a
+  type error → change again" into "change → know". It is not a tool the model has
+  to remember to call, because a check that has to be remembered is not called at
+  the moment it matters most — right after it decided the change was correct.
+- **"Who calls this?"** — `find_references`. `grep` finds the strings; this finds
+  the call sites. A missed call site does not fail loudly, it fails as half a
+  repository that no longer compiles.
+- **"Where is this defined?"** — `goto_definition`.
+- **"Which code handles authentication?"** — `workspace_symbols`. Search a likely
+  name and you get real definitions with their file and line.
+
+### Installing a language server
+
+```bash
+go install golang.org/x/tools/gopls@latest   # Go
+```
+
+**If it is not installed, the four tools are not registered at all**, and the log
+says which command to install. That is deliberate: a tool whose every call fails
+with "not installed" is worse than a tool that is not on the menu, because the
+model will call it and spend a turn on the failure. Nothing else about the agent
+changes — no server, no code intelligence, everything else as before.
+
+Other languages work through `tools.lsp.servers` (see
+`configs/config.example.yaml`): a command, the languages it handles, and the
+files that mark its project root. Nothing about the tool set is Go-specific; only
+the built-in default is.
+
+### What it costs
+
+A language server indexes the whole module when it starts, which is seconds, so it
+is started **once per workspace root**, kept, and reaped after
+`tools.lsp.idle_timeout_seconds` (default 10 minutes) of disuse. Every call after
+the first is fast; the first call of a session on a cold cache is not.
+
+Three settings worth knowing:
+
+| Key | Default | What it does |
+|---|---|---|
+| `tools.lsp.enable` | `true` | Off means no process, no tools, and editing tools that return exactly what they returned before this existed. |
+| `tools.lsp.attach_diagnostics` | `true` | Whether the diagnostics for a written file are appended to the tool result. |
+| `tools.lsp.diagnostics_wait_ms` | `2000` | How long an edit waits for the server to catch up. On timeout the result says the diagnostics were not ready — an edit never waits longer than this and never fails because of it. |
+
+### Honest limits
+
+- **Positions are 1-based**, line as printed by `read_file`, column counted in
+  characters (not bytes, not UTF-16 units — though for ASCII, which is nearly all
+  source code, all three agree).
+- **"No diagnostics" is only reported when the server said so.** If the server has
+  not caught up, the answer says *that* instead. The difference matters: "clean"
+  and "not checked" are not the same claim, and reporting the second as the first
+  is the most dangerous wrong answer this feature could give.
+- **Results outside the workspace are dropped.** A symbol search can return
+  results from a dependency, and a path the agent cannot open is not an answer.
+- **A stale position is dropped, not clamped.** If the server reports a location
+  past the end of the file, it is skipped rather than rounded to a plausible line.
+  For a diagnostic the message is kept with a best-effort position, because losing
+  a reported problem is worse than an approximate column.
 
 ### No terminal
 
@@ -227,8 +576,14 @@ by a path that would resolve elsewhere.
   command can still read and write absolute paths elsewhere, and there is no
   mount namespace, container or seccomp filter. The deny list refuses a handful
   of obviously catastrophic commands and nothing more.
-- **Ask for approval.** A write or a command runs when the model calls it. There
-  is no confirmation step to accept or reject.
+- **Ask for approval — optionally.** With `tools.approval.mode` at its default
+  (`off`), a write or a command runs as soon as the model calls it: there is no
+  confirmation step. Setting the mode to `writes`, `writes+exec` or `all` puts the
+  gated capabilities behind a decision by a person, on the surfaces that can ask
+  one. On a surface that cannot (Feishu, `huan-agent run`) the gated tools are not
+  registered at all, so nothing is offered that would always be refused. See
+  `docs/approvals-and-checkpoints.md` for what a card shows and why a timeout is a
+  refusal rather than an allow.
 - **Protect secrets that are readable by the process user.** `~/.ssh`, `.env`
   or any credential file inside the workspace is readable by `read_file`, and
   anything the process can reach is reachable by a command.
@@ -299,3 +654,40 @@ Two things to review before treating Linux as first-class:
   tool failure. See `docs/long-tasks.md`.
 - **Output ends with a truncation marker** — raise `max_read_kb`, or have the
   agent read a smaller range with `read_file`'s `offset`/`limit`.
+- **The code-intelligence tools are missing** — the language server is not
+  installed, or `tools.lsp.enable` is false. The log has one line saying which:
+  either `code intelligence disabled: the configured language server is not
+  installed` with the install command, or `code intelligence disabled: no language
+  server is configured`. This is the designed behaviour, not a failure.
+- **An edit result says the diagnostics were "not ready"** — the server did not
+  catch up within `tools.lsp.diagnostics_wait_ms`. The edit itself succeeded. On
+  the first edit of a session this is normal (the server is still indexing);
+  raising the wait trades a slower edit for a more complete answer.
+- **`find_references` finds nothing for a symbol used elsewhere** — a language
+  server indexes the project its root names. If the symbol's other users live
+  outside that project, it cannot see them, and the tool says so. Check for a
+  root marker (`go.mod`, `package.json`) above the file.
+- **A definition points at the wrong line** — positions are 1-based and columns
+  count characters, so a column taken from a byte offset is wrong on a line with
+  non-ASCII text. Re-read the line with `read_file` and count characters.
+- **A skill's tool list is silently too narrow** — a skill's `tools` frontmatter is
+  an **allow-list, not a hint**: once it is non-empty, every tool not named in it is
+  withheld for that session. This fails quietly in a specific way — the only thing
+  the loader checks is that each name is *registered* (`tool.Registry.SetAllowList`
+  rejects an unknown name), so a list that is valid but useless, like
+  `tools: [calc, echo]` on a code-review skill, loads without complaint and then
+  leaves the model unable to read a single file. Run `huan-agent chat --tools
+  --skill <name>` and read the `tools available:` line to see the surviving set.
+- **An MCP server's tool never appears** — a tool whose name is already taken is
+  skipped, not registered, and the reason is logged (`mcp tool not registered` with
+  the server and tool name). Skipping is deliberate: a server exposing one
+  colliding name is still worth connecting. Note that builtins win — the
+  OpenViking server exposes its own `grep` and `glob`, and both are skipped in
+  favour of the local tools, which are the ones that respect the workspace.
+- **"command is required for a stdio server" for a server you configured as
+  http/sse** — the entry's transport was lost on the way to the dialer. This is a
+  bug in the conversion, not in your config: every surface must build the runtime
+  spec through the same helper (`cmd/huan-agent/mcp.go`), because a hand-written
+  field list is a field list that can drop one. Check the reported transport in the
+  `connect mcp <name> (<transport>)` error: if it says `stdio` for an entry that
+  says `http`, the field was dropped rather than misconfigured.

@@ -47,7 +47,12 @@ func (e *LLMError) Error() string {
 func (e *LLMError) Unwrap() error { return e.Err }
 
 // New constructs a BaseChatModel for the given provider.
-func New(p Provider) (model.BaseChatModel, error) {
+//
+// Options tune the adapter's own behaviour rather than the endpoint: today that
+// means WithRetry, which is how a transient call failure stops being a failed
+// turn (see retry.go). A caller that passes no option gets the model exactly as
+// the provider describes it.
+func New(p Provider, opts ...Option) (model.BaseChatModel, error) {
 	if p.Name == "" {
 		return nil, errors.New("llm: provider name is required")
 	}
@@ -59,10 +64,15 @@ func New(p Provider) (model.BaseChatModel, error) {
 	}
 	cfg := openai.DefaultConfig(p.APIKey)
 	cfg.BaseURL = p.BaseURL
-	return &openAIModel{
+	// Gateways that spell the reasoning field `reasoning` rather than
+	// `reasoning_content` would otherwise have the model's thinking dropped at
+	// the wire: see reasoning.go.
+	cfg.HTTPClient = reasoningAliasDoer{base: cfg.HTTPClient}
+	base := &openAIModel{
 		provider: p,
 		client:   openai.NewClientWithConfig(cfg),
-	}, nil
+	}
+	return withRetry(base, applyOptions(opts)), nil
 }
 
 // openAIModel is the eino adapter around go-openai.

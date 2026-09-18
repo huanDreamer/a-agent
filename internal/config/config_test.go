@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/huan/huan-agent/internal/retry"
 )
 
 func TestDefault(t *testing.T) {
@@ -945,5 +947,80 @@ func TestTools_WorkspacesDirYAML(t *testing.T) {
 	}
 	if got, _ := cfg.Tools.WorkspacesDirOrDefault("/var/db/huan.db"); got != "/tmp/named-areas" {
 		t.Errorf("resolved to %q, want the configured value", got)
+	}
+}
+
+func TestRetryConfig_Policy(t *testing.T) {
+	// A disabled block means one attempt, which is exactly the behaviour of a
+	// build without retrying: "off" is expressed as an attempt count so there is
+	// one place that decides whether a second call happens.
+	off := RetryConfig{Enable: false, MaxAttempts: 5}
+	if got := off.Policy().Attempts(); got != 1 {
+		t.Errorf("disabled Policy().Attempts() = %d, want 1", got)
+	}
+
+	on := RetryConfig{
+		Enable:      true,
+		MaxAttempts: 4,
+		BaseDelayMS: 250,
+		MaxDelayMS:  5000,
+		Multiplier:  3,
+	}
+	p := on.Policy()
+	if p.Attempts() != 4 {
+		t.Errorf("Attempts() = %d, want 4", p.Attempts())
+	}
+	if p.BaseDelay != 250*time.Millisecond || p.MaxDelay != 5*time.Second || p.Multiplier != 3 {
+		t.Errorf("Policy() = %+v, want the configured numbers", p)
+	}
+	// Jitter unset means on: without it, several turns that failed on the same
+	// outage retry in lockstep and hit it again together.
+	if !p.Jitter {
+		t.Error("Jitter defaults to off, want on")
+	}
+	noJitter := false
+	if got := (RetryConfig{Enable: true, Jitter: &noJitter}).Policy(); got.Jitter {
+		t.Error("an explicit jitter: false did not turn it off")
+	}
+	// A zero MaxAttempts with retrying enabled resolves through the policy's own
+	// defaults rather than becoming "no retrying" by accident.
+	if got := (RetryConfig{Enable: true}).Policy().Attempts(); got != retry.DefaultMaxAttempts {
+		t.Errorf("Attempts() with no number = %d, want the default %d", got, retry.DefaultMaxAttempts)
+	}
+}
+
+func TestPlanConfig_MaxTasksOr(t *testing.T) {
+	if got := (PlanConfig{}).MaxTasksOr(); got != DefaultPlanMaxTasks {
+		t.Errorf("default = %d, want %d", got, DefaultPlanMaxTasks)
+	}
+	if got := (PlanConfig{MaxTasks: -3}).MaxTasksOr(); got != DefaultPlanMaxTasks {
+		t.Errorf("negative = %d, want the default", got)
+	}
+	if got := (PlanConfig{MaxTasks: 8}).MaxTasksOr(); got != 8 {
+		t.Errorf("configured = %d, want 8", got)
+	}
+}
+
+func TestLoad_RetryAndPlanDefaultsAreOn(t *testing.T) {
+	// These defaults are the feature: a deployment that never configures them
+	// must still survive a dropped connection and still show its plan. This is
+	// the one place that says so.
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	c, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\") error = %v", err)
+	}
+	if got := c.LLM.RetryPolicy().Attempts(); got <= 1 {
+		t.Errorf("llm.retry attempts = %d, want retrying on by default", got)
+	}
+	if got := c.Chat.StepRetryPolicy().Attempts(); got <= 1 {
+		t.Errorf("chat.step_retry attempts = %d, want retrying on by default", got)
+	}
+	if !c.Chat.Plan.Enable {
+		t.Error("chat.plan.enable defaults to off, want on")
+	}
+	if got := c.Chat.Plan.MaxTasksOr(); got != DefaultPlanMaxTasks {
+		t.Errorf("plan max tasks = %d, want %d", got, DefaultPlanMaxTasks)
 	}
 }

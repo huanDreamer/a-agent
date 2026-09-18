@@ -343,19 +343,27 @@ func TestChatStream_AskUserCardAnswersMidTurn(t *testing.T) {
 	h.login(t)
 	sessionID := createSession(t, h)
 
-	payload := strings.NewReader(`{"content":"帮我搭个新服务"}`)
-	req, err := http.NewRequest(http.MethodPost, h.base+"/api/chat/sessions/"+sessionID+"/messages", payload)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
+	// Sending starts the turn and returns; the events come from attaching to it,
+	// which is what a browser does and what lets it come back to a running turn.
+	startResp := startTurn(t, h.client, h.base+"/api/chat/sessions/"+sessionID+"/messages",
+		map[string]string{"content": "帮我搭个新服务"})
+	_ = startResp.Body.Close()
+	if startResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start status = %d, want 202", startResp.StatusCode)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := h.client.Do(req)
+
+	attachReq, err := http.NewRequest(http.MethodGet, h.base+"/api/chat/sessions/"+sessionID+"/turn", nil)
 	if err != nil {
-		t.Fatalf("stream request: %v", err)
+		t.Fatalf("new attach request: %v", err)
+	}
+	attachReq.Header.Set("Accept", "text/event-stream")
+	resp, err := h.client.Do(attachReq)
+	if err != nil {
+		t.Fatalf("attach request: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("stream status = %d, want 200", resp.StatusCode)
+		t.Fatalf("attach status = %d, want 200", resp.StatusCode)
 	}
 
 	// Read the stream the way the browser does: act on the card the moment it

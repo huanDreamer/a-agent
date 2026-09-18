@@ -177,7 +177,8 @@ func TestChatMessages_AppendAndList(t *testing.T) {
 	msgs := []ChatMessage{
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "hi", Reasoning: "thinking", UsageJSON: `{"total_tokens":10}`},
-		{Role: "assistant", ToolCalls: `[{"id":"c1","function":{"name":"time"}}]`},
+		{Role: "assistant", ToolCalls: `[{"id":"c1","function":{"name":"time"}}]`,
+			Steps: `[{"index":1,"reasoning":"thinking","text":"let me check","tools":[{"id":"c1","name":"time","step":1}]}]`},
 		{Role: "tool", Content: "12:00", ToolCallID: "c1", ToolName: "time"},
 		{Role: "assistant", Content: "done"},
 	}
@@ -208,6 +209,16 @@ func TestChatMessages_AppendAndList(t *testing.T) {
 	}
 	if got[2].ToolCalls == "" {
 		t.Error("tool calls not persisted")
+	}
+	// The step breakdown is what the console renders; a flat tool list plus one
+	// blob of reasoning cannot say which thought asked for which call.
+	if got[2].Steps == "" || !strings.Contains(got[2].Steps, `"index":1`) {
+		t.Errorf("steps not persisted: %q", got[2].Steps)
+	}
+	// A message written before the column existed reads back empty rather than
+	// with a shape a client would have to guess at.
+	if got[0].Steps != "" {
+		t.Errorf("steps on a plain message = %q, want empty", got[0].Steps)
 	}
 	if got[3].ToolCallID != "c1" || got[3].ToolName != "time" {
 		t.Errorf("tool result linkage lost: %+v", got[3])

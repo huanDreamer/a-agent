@@ -25,6 +25,10 @@ type Registry struct {
 	mu        sync.RWMutex
 	providers map[string]Provider
 	defaultN  string
+	// opts are the adapter options every model this registry builds is
+	// constructed with (see WithOptions). They are set once, before the registry
+	// is shared, and only read afterwards.
+	opts []Option
 }
 
 // NewRegistry builds a registry from the configured providers. Entries that
@@ -72,13 +76,11 @@ func (r *Registry) Names() []string {
 
 // Get returns the provider with the given name.
 func (r *Registry) Get(name string) (model.BaseChatModel, error) {
-	r.mu.RLock()
-	p, ok := r.providers[name]
-	r.mu.RUnlock()
+	p, opts, ok := r.lookup(name)
 	if !ok {
 		return nil, fmt.Errorf("llm: provider %q is not configured (known: %v)", name, r.Names())
 	}
-	return New(p)
+	return New(p, opts...)
 }
 
 // Default returns the default provider as configured.
@@ -94,17 +96,38 @@ func (r *Registry) Default() (model.BaseChatModel, error) {
 // a model per conversation while reusing the provider's credentials and base URL.
 // An empty modelName falls back to the provider default.
 func (r *Registry) GetWithModel(provider, modelName string) (model.BaseChatModel, error) {
-	r.mu.RLock()
-	p, ok := r.providers[provider]
-	r.mu.RUnlock()
+	p, opts, ok := r.lookup(provider)
 	if !ok {
 		return nil, fmt.Errorf("llm: provider %q is not configured (known: %v)", provider, r.Names())
 	}
-	if strings.TrimSpace(modelName) == "" {
-		return New(p)
+	if strings.TrimSpace(modelName) != "" {
+		p.Model = modelName
 	}
-	p.Model = modelName
-	return New(p)
+	return New(p, opts...)
+}
+
+// lookup returns one provider together with the adapter options to build it
+// with, taking both under one lock so a concurrent WithOptions cannot produce a
+// model built half with retrying and half without.
+func (r *Registry) lookup(name string) (Provider, []Option, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.providers[name]
+	return p, append([]Option(nil), r.opts...), ok
+}
+
+// WithOptions attaches adapter options — today, retrying — to every model this
+// registry builds.
+//
+// It is a registry-wide setting rather than a per-provider one because the
+// question it answers ("should a transient failure be retried?") is about the
+// deployment, not about which endpoint is being called. It must be called before
+// the registry is handed to anything else; it is not a runtime toggle.
+func (r *Registry) WithOptions(opts ...Option) *Registry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.opts = append([]Option(nil), opts...)
+	return r
 }
 
 // Catalog describes every configured provider and its default model, for a UI

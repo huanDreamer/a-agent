@@ -60,6 +60,8 @@ export const ICON_PATHS = {
   terminal: 'm4 17 6-6-6-6|M12 19h8',
   layers:
     'm12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z|m6.08 9.5-3.5 1.6a1 1 0 0 0 0 1.81l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9a1 1 0 0 0 0-1.83l-3.5-1.59|m6.08 14.5-3.5 1.6a1 1 0 0 0 0 1.81l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9a1 1 0 0 0 0-1.83l-3.5-1.59',
+  // 任务看板: Lucide list-checks — 一份勾选过的清单，正是"这一轮要做的事"的形状。
+  'list-checks': 'm3 17 2 2 4-4|m3 7 2 2 4-4|M13 6h8|M13 12h8|M13 18h8',
   // 链路追踪: Lucide git-branch — one thing descending from another, which is
   // what the link from an answer to its trace means.
   'git-branch': 'M6 3v12|M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6|M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6|M18 9a9 9 0 0 1-9 9',

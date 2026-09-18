@@ -40,6 +40,11 @@ func TestSchemaDescriptions_AreNotTruncated(t *testing.T) {
 		"bash":       BashInput{},
 		"ask_user":   AskUserInput{},
 
+		"plan_create": PlanCreateInput{},
+		"plan_add":    PlanAddInput{},
+		"plan_update": PlanUpdateInput{},
+		"plan_read":   PlanReadInput{},
+
 		"bash_background": BackgroundStartInput{},
 		"bash_jobs":       BackgroundListInput{},
 		"bash_output":     BackgroundOutputInput{},

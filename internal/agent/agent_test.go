@@ -112,9 +112,9 @@ func TestAgent_ReActLoop(t *testing.T) {
 
 	st := newTestStore(t)
 	a, err := New(context.Background(), Config{
-		Model: m,
-		Tools: reg,
-		Audit: st,
+		Model:       m,
+		Tools:       reg,
+		Audit:       st,
 		SessionIDFn: func() string { return "s1" },
 		MaxSteps:    5,
 	})

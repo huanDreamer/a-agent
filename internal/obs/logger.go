@@ -3,6 +3,7 @@ package obs
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"go.uber.org/zap"
@@ -18,6 +19,20 @@ import (
 // (zap.L() and zap.S() will use it). The caller is responsible for
 // calling Sync() at shutdown.
 func NewLogger(level, format string) (*zap.Logger, error) {
+	return NewLoggerTo(os.Stdout, level, format)
+}
+
+// NewLoggerTo is NewLogger with an explicit sink.
+//
+// It exists for the commands whose standard output is a *product* rather than a
+// log: `huan-agent run` writes the model's answer to stdout so it can be piped,
+// and a log line landing in the middle of that answer would corrupt it. Those
+// commands point the logger at stderr instead, which is where everything that is
+// not the answer belongs.
+//
+// The global logger is still replaced, so packages that log through zap.L() write
+// to the same sink as the caller's own logger.
+func NewLoggerTo(w io.Writer, level, format string) (*zap.Logger, error) {
 	lvl, err := parseLevel(level)
 	if err != nil {
 		return nil, err
@@ -38,7 +53,10 @@ func NewLogger(level, format string) (*zap.Logger, error) {
 		return nil, fmt.Errorf("invalid log format %q (want json|console)", format)
 	}
 
-	core := zapcore.NewCore(enc, zapcore.Lock(os.Stdout), lvl)
+	if w == nil {
+		w = io.Discard
+	}
+	core := zapcore.NewCore(enc, zapcore.Lock(zapcore.AddSync(w)), lvl)
 	logger := zap.New(core, zap.AddCaller())
 	zap.ReplaceGlobals(logger)
 	return logger, nil

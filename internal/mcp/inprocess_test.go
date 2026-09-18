@@ -6,8 +6,10 @@ import (
 	"testing"
 	"time"
 
-	mcppkg "github.com/mark3labs/mcp-go/mcp"
+	einotool "github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/schema"
 	mcpclient "github.com/mark3labs/mcp-go/client"
+	mcppkg "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"go.uber.org/zap/zaptest"
 
@@ -176,22 +178,73 @@ func TestRegisterMCPTools_InProcess(t *testing.T) {
 	defer cleanup()
 
 	reg := tool.NewRegistry()
-	n, err := RegisterMCPTools(context.Background(), reg, c, zaptest.NewLogger(t))
+	names, skipped, err := RegisterMCPTools(context.Background(), reg, c, zaptest.NewLogger(t))
 	if err != nil {
 		t.Fatalf("RegisterMCPTools: %v", err)
 	}
-	if n != 2 {
-		t.Errorf("registered = %d, want 2", n)
+	if len(names) != 2 {
+		t.Errorf("registered = %d, want 2", len(names))
+	}
+	if len(skipped) != 0 {
+		t.Errorf("skipped = %v, want none", skipped)
 	}
 	if got := reg.Names(); len(got) != 2 {
 		t.Errorf("registry has %d tools, want 2", len(got))
 	}
 }
 
+// TestRegisterMCPTools_SkipsCollidingNames pins the per-tool rule: a name that is
+// already taken is skipped and reported, and the rest of the server's tools are
+// still registered.
+//
+// Rolling the whole server back instead would turn one name collision into "the
+// agent will not start" — which is exactly what OpenViking's own `grep` tool did
+// to `chat --tools`, while the console (whose manager always skipped) connected
+// the same server without complaint.
+func TestRegisterMCPTools_SkipsCollidingNames(t *testing.T) {
+	c, cleanup := inProcessClient(t, newEchoServer(t))
+	defer cleanup()
+
+	reg := tool.NewRegistry()
+	// Take one of the two names the echo server exposes, the way a builtin
+	// would already own "grep".
+	if err := reg.Register(namedStub{name: "echo"}); err != nil {
+		t.Fatalf("pre-register: %v", err)
+	}
+
+	names, skipped, err := RegisterMCPTools(context.Background(), reg, c, zaptest.NewLogger(t))
+	if err != nil {
+		t.Fatalf("RegisterMCPTools returned a hard error for a collision: %v", err)
+	}
+	if len(skipped) != 1 {
+		t.Fatalf("skipped = %v, want exactly one collision", skipped)
+	}
+	if len(names) != 1 || names[0] != "boom" {
+		t.Errorf("registered = %v, want [boom]", names)
+	}
+	if _, ok := reg.Get("echo"); !ok {
+		t.Error("the pre-registered tool is gone; a skip must not unregister anything")
+	}
+	if _, ok := reg.Get("boom"); !ok {
+		t.Error("the non-colliding tool was not registered")
+	}
+}
+
 func TestRegisterMCPTools_DisconnectedError(t *testing.T) {
 	reg := tool.NewRegistry()
-	_, err := RegisterMCPTools(context.Background(), reg, nil, nil)
+	_, _, err := RegisterMCPTools(context.Background(), reg, nil, nil)
 	if err == nil {
 		t.Error("expected error for nil client")
 	}
+}
+
+// namedStub is a tool.Tool that exists only to occupy a name.
+type namedStub struct{ name string }
+
+func (s namedStub) Info(context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{Name: s.name, Desc: "stub"}, nil
+}
+
+func (s namedStub) InvokableRun(context.Context, string, ...einotool.Option) (string, error) {
+	return "stub", nil
 }

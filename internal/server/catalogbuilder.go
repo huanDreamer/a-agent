@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/huan/huan-agent/internal/llm"
+	"github.com/huan/huan-agent/internal/retry"
 	"github.com/huan/huan-agent/internal/store"
 )
 
@@ -36,6 +37,10 @@ type ModelBuilderOptions struct {
 	// Logger receives the warnings a degraded catalog produces (a store read
 	// that failed, a fallback to the config registry). Nil uses a no-op logger.
 	Logger *zap.Logger
+	// Retry is the backoff every model this builder constructs is given, so a
+	// transient call failure costs a wait instead of the turn. It flows from
+	// llm.retry; the zero value means no retrying.
+	Retry retry.Policy
 }
 
 // CatalogModelBuilder is the ModelBuilder the console runs on: the database
@@ -66,6 +71,11 @@ type CatalogModelBuilder struct {
 	reg    *llm.Registry
 	ttl    time.Duration
 	logger *zap.Logger
+	// retry is the adapter option every built model is constructed with. It is
+	// held here rather than on each store row because it is a deployment
+	// setting: the question it answers is about this process, not about one
+	// provider.
+	retry retry.Policy
 
 	mu    sync.Mutex
 	cache map[string]cachedModel
@@ -94,6 +104,7 @@ func NewCatalogModelBuilder(st store.Store, reg *llm.Registry, opts ModelBuilder
 		reg:    reg,
 		ttl:    opts.TTL,
 		logger: logger,
+		retry:  opts.Retry,
 	}
 }
 
@@ -224,7 +235,7 @@ func (b *CatalogModelBuilder) buildStored(ctx context.Context, p store.Provider,
 			zapString("provider", p.ID))
 	}
 
-	built, err := llm.New(client)
+	built, err := llm.New(client, llm.WithRetry(b.retry, b.logger))
 	if err != nil {
 		return nil, fmt.Errorf("server: build %s/%s: %w", p.ID, modelName, err)
 	}

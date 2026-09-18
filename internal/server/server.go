@@ -56,6 +56,9 @@ type Config struct {
 	Tracer chatTracer
 	// Traces reads traces back for the trace UI. Nil hides the endpoints.
 	Traces TraceReader
+	// Checkpoints configures the per-turn file checkpoints. Enable=false, or an
+	// empty Dir, leaves the feature off and the endpoints unregistered.
+	Checkpoints CheckpointSettings
 	// Version is reported by /api/health and /api/meta.
 	Version string
 	// Provider and Model are the active LLM target, reported by /api/meta.
@@ -65,13 +68,25 @@ type Config struct {
 	// file recording which of them are disabled.
 	SkillsDir string
 	StatePath string
-	// ChatMaxSteps caps tool iterations per chat turn (0 = default).
-	ChatMaxSteps int
-	// ChatMaxTokens caps what one chat turn may spend, from the usage the
+	// The three budget fields below are *defaults* from config.yaml, not the
+	// budget a turn necessarily runs with: 设置 → 对话预算 may have stored an
+	// override in the database, and effectiveBudget() merges the two per field.
+	// They are named accordingly so nothing reads them as the live value and
+	// quietly reintroduces a second answer to "how many steps may this turn take".
+
+	// DefaultChatMaxSteps caps tool iterations per chat turn (0 = default).
+	DefaultChatMaxSteps int
+	// DefaultChatMaxTokens caps what one chat turn may spend, from the usage the
 	// provider reports (0 = unlimited).
-	ChatMaxTokens int
-	// ChatTurnDeadline bounds one chat turn's wall-clock time (0 = unlimited).
-	ChatTurnDeadline time.Duration
+	DefaultChatMaxTokens int
+	// DefaultChatTurnDeadline bounds one chat turn's wall-clock time (0 =
+	// unlimited).
+	DefaultChatTurnDeadline time.Duration
+	// ContextMaxTokens is the in-turn window the compressor was built with at
+	// startup. It is reported (not applied) by the budget panel, which uses it to
+	// warn that a raised step cap without compression is the combination that
+	// turns a long task into a context-limit error. 0 means compression is off.
+	ContextMaxTokens int
 	// ChatHistoryLimit bounds how many stored messages are replayed.
 	ChatHistoryLimit int
 	// ChatEnable turns the web chat endpoints on.
@@ -116,6 +131,26 @@ type Server struct {
 	// the answer, and it is per server rather than per turn because those two are
 	// different requests.
 	questions *questionHub
+
+	// checkpointSettings is what the per-workspace checkpointers are built from.
+	//
+	// The checkpointers themselves are per workspace (see checkpointFor): this
+	// process serves several, and one built at startup would resolve every path
+	// through whichever was current then.
+	checkpointSettings CheckpointSettings
+
+	// approvals holds the write/exec requests currently waiting for a decision.
+	// It is the same shape as questions and exists for the same reason; the
+	// difference is what an unanswered request means, which is decided by the
+	// approver rather than here.
+	approvals *approvalHub
+
+	// turns holds the conversations with a turn in flight.
+	//
+	// A turn belongs to its conversation rather than to the request that started
+	// it, which is what lets a browser detach — another page, another
+	// conversation, a reload — and attach again to the same running answer.
+	turns *turnHub
 
 	// mcp owns the live MCP connections and the tools they expose. It is nil
 	// when there is no tool registry to register into (chat disabled): servers
@@ -192,18 +227,32 @@ func New(cfg Config, st store.Store, table *pricing.Table, adminCfg config.Admin
 	}
 
 	s := &Server{
-		cfg:        cfg,
-		logger:     logger,
-		store:      st,
-		auth:       auth,
-		pricing:    table,
-		skillState: newSkillState(cfg.SkillsDir, cfg.StatePath),
-		chat:       cfg.Chat,
-		tracer:     cfg.Tracer,
-		traces:     cfg.Traces,
-		jobs:       cfg.Jobs,
-		questions:  newQuestionHub(),
-		startT:     time.Now(),
+		cfg:                cfg,
+		logger:             logger,
+		store:              st,
+		auth:               auth,
+		pricing:            table,
+		skillState:         newSkillState(cfg.SkillsDir, cfg.StatePath),
+		chat:               cfg.Chat,
+		tracer:             cfg.Tracer,
+		traces:             cfg.Traces,
+		jobs:               cfg.Jobs,
+		questions:          newQuestionHub(),
+		approvals:          newApprovalHub(),
+		checkpointSettings: cfg.Checkpoints,
+		turns:              newTurnHub(),
+		startT:             time.Now(),
+	}
+
+	// Checkpoints are built per workspace (see checkpointFor) because this process
+	// serves several: a single checkpointer would resolve every path through
+	// whichever workspace happened to be current when it was made. What is settled
+	// here is only whether the feature is on and where its directories live.
+	if cfg.Checkpoints.Enable && cfg.Checkpoints.Dir != "" {
+		s.logger.Info("checkpoints enabled",
+			zapString("dir", cfg.Checkpoints.Dir),
+			zapInt("keep_turns", cfg.Checkpoints.KeepTurns),
+			zapInt("max_total_mb", cfg.Checkpoints.MaxTotalMB))
 	}
 
 	// The MCP runtime writes into the same registry chat turns read, so a server
@@ -300,6 +349,10 @@ func (s *Server) registerRoutes(h *server.Hertz) {
 	authed.POST("/skills-draft", s.handleDraftSkill)
 	s.registerProviderRoutes(authed)
 	s.registerChatRoutes(authed)
+	// The per-turn budget is read and written on its own pair of routes rather
+	// than folded into /chat/models: the panel changes it while the chat page is
+	// idle, and the composer only ever reads the catalog.
+	s.registerBudgetRoutes(authed)
 	// Registered after the chat routes: /workspaces/preview must not be matched
 	// by /workspaces/:name, so the order inside that group keeps the literal
 	// path first (see registerWorkspaceRoutes).
@@ -349,6 +402,12 @@ func (s *Server) Start(ctx context.Context) error {
 	// engine's timeout (and its log) is what reports a stuck connection.
 	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout+time.Second)
 	defer cancel()
+
+	// Turns in flight are not requests, so the engine's drain does not wait for
+	// them: they are cancelled and given a moment to store what they produced,
+	// because the store is closed as soon as this returns.
+	s.turns.shutdown(shutCtx)
+
 	if err := s.hertz.Shutdown(shutCtx); err != nil && !isNotRunning(err) {
 		return fmt.Errorf("server: shutdown: %w", err)
 	}
