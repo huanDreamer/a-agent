@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -39,7 +40,18 @@ func TestRun_LongTurnStaysInsideItsWindow(t *testing.T) {
 	const steps = 40
 	turns := make([]*schema.Message, 0, steps+1)
 	for i := 0; i < steps; i++ {
-		turns = append(turns, toolCallTurn("c"))
+		// Each step calls the tool with *different* arguments. Repeating one call
+		// verbatim is a loop the guard steers and then stops, and it is not the
+		// shape this test is about: a long turn that is working looks like forty
+		// different commands, not one command forty times.
+		turns = append(turns, &schema.Message{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
+			ID:   fmt.Sprintf("c%d", i),
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      "loop",
+				Arguments: fmt.Sprintf(`{"n":%d}`, i),
+			},
+		}}})
 	}
 	turns = append(turns, &schema.Message{Role: schema.Assistant, Content: "all done"})
 

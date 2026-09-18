@@ -408,3 +408,78 @@ func TestPlanUpdateIgnoresAnEmptyNoteString(t *testing.T) {
 }
 
 var _ = einotool.InvokableTool(nil)
+
+// TestPlanCreate_RefusesToWipeWorkInProgress pins the guard added after a live
+// turn lost its own progress: the model forgot the plan it had (its window had
+// been compressed), called plan_create again, and a plan at 已完成 1/7 became
+// 已完成 0/10 — the completed tasks had to be done a second time.
+func TestPlanCreate_RefusesToWipeWorkInProgress(t *testing.T) {
+	ctx := func(p *fakePlanner) context.Context {
+		return tool.WithPlanner(context.Background(), p)
+	}
+	started := func() *fakePlanner {
+		return &fakePlanner{has: true, plan: tool.Plan{
+			Goal: "把产物功能加上",
+			Tasks: []tool.Task{
+				{ID: "t1", Title: "读齐既有实现", Status: tool.TaskDone},
+				{ID: "t2", Title: "落地 store 层", Status: tool.TaskInProgress},
+				{ID: "t3", Title: "前端抽屉", Status: tool.TaskPending},
+			},
+			Revision: 4,
+		}}
+	}
+
+	t.Run("refused", func(t *testing.T) {
+		p := started()
+		_, err := planTool(t, ctx(p), PlanCreateToolName,
+			`{"goal":"另一个目标","tasks":[{"title":"第一步"},{"title":"第二步"}]}`)
+		if err == nil {
+			t.Fatal("plan_create overwrote a plan that had progress")
+		}
+		if len(p.mirrored) != 0 {
+			t.Errorf("the plan was written anyway: %+v", p.mirrored)
+		}
+		// The refusal is the model's only clue about what to do instead, so it
+		// has to name both the plan it nearly destroyed and the tools to use.
+		for _, want := range []string{"已完成 1/3", "plan_add", "plan_update", "replace_progress"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not mention %q: %v", want, err)
+			}
+		}
+	})
+
+	t.Run("explicit discard is allowed", func(t *testing.T) {
+		p := started()
+		if _, err := planTool(t, ctx(p), PlanCreateToolName,
+			`{"goal":"重新来过","tasks":[{"title":"第一步"}],"replace_progress":true}`); err != nil {
+			t.Fatalf("plan_create with replace_progress: %v", err)
+		}
+		if len(p.mirrored) != 1 {
+			t.Fatalf("the planner was asked to store %d plans, want 1", len(p.mirrored))
+		}
+	})
+
+	t.Run("a plan of untouched tasks is just a list", func(t *testing.T) {
+		// Nothing has been done, so replacing it costs nothing: refusing here
+		// would block the model from restructuring work it has not started.
+		p := &fakePlanner{has: true, plan: tool.Plan{
+			Goal:  "old",
+			Tasks: []tool.Task{{ID: "t1", Title: "a", Status: tool.TaskPending}},
+		}}
+		if _, err := planTool(t, ctx(p), PlanCreateToolName,
+			`{"goal":"new","tasks":[{"title":"b"}]}`); err != nil {
+			t.Fatalf("plan_create over a list nobody started: %v", err)
+		}
+		if len(p.mirrored) != 1 {
+			t.Errorf("the new plan was not stored")
+		}
+	})
+
+	t.Run("no plan yet", func(t *testing.T) {
+		p := &fakePlanner{}
+		if _, err := planTool(t, ctx(p), PlanCreateToolName,
+			`{"goal":"g","tasks":[{"title":"a"}]}`); err != nil {
+			t.Fatalf("plan_create with no existing plan: %v", err)
+		}
+	})
+}

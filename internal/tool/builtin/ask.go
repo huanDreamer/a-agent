@@ -118,6 +118,16 @@ func askUser(ctx context.Context, in AskUserInput) (AskUserOutput, error) {
 		Text:     strings.TrimSpace(answer.Text),
 	}
 	out.Answer, out.Note = renderAskAnswer(out, time.Since(started))
+	// The asker's own remark rides next to the answer rather than replacing it:
+	// what was chosen and what to do about it are different things, and a
+	// repeated question needs both.
+	if n := strings.TrimSpace(answer.Note); n != "" {
+		if out.Note != "" {
+			out.Note = n + "；" + out.Note
+		} else {
+			out.Note = n
+		}
+	}
 	return out, nil
 }
 

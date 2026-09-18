@@ -216,7 +216,7 @@ func runChat(cmd *cobra.Command, _ []string) error {
 	}
 	defer closeMemory()
 
-	mem, err := newSessionMemory(cfg, cm, systemPrompt, sessionID, logger, memStore)
+	mem, err := newSessionMemory(cfg, cm, systemPrompt, sessionID, logger, memStore, adminDisplayModel(cfg))
 	if err != nil {
 		return fmt.Errorf("init memory: %w", err)
 	}

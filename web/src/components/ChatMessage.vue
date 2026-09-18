@@ -219,11 +219,6 @@ watch(
   { immediate: true },
 )
 
-/** The runner's notices about this turn, as opposed to the model's answer. */
-const contextNotices = computed(() =>
-  (props.item.notices || []).filter((note) => note && note.kind === 'context'),
-)
-
 /**
  * 步骤级重试的说明。
  *
@@ -232,6 +227,17 @@ const contextNotices = computed(() =>
  */
 const retryNotices = computed(() =>
   (props.item.notices || []).filter((note) => note && note.kind === 'retry'),
+)
+
+/**
+ * The loop guard's steering messages.
+ *
+ * They are shown because a steered turn is otherwise indistinguishable from a
+ * slow one: the reader watches an hour of tool calls and no answer, with no way
+ * to know the harness had already told the model it was going in circles.
+ */
+const steerNotices = computed(() =>
+  (props.item.notices || []).filter((note) => note && note.kind === 'steer'),
 )
 
 /**
@@ -249,6 +255,8 @@ const stopNote = computed(() => {
   if (!reason) return ''
   if (reason === 'tokens') return '本轮已达到 token 预算，回答可能不完整 · 回复「继续」可接着做'
   if (reason === 'deadline') return '本轮已达到时间上限，回答可能不完整 · 回复「继续」可接着做'
+  if (reason === 'loop') return '本轮因重复调用同一工具被提前结束 · 回复「继续」可以让它换个做法'
+  if (reason === 'idle') return '本轮因长时间只查看没有推进被提前结束 · 回复「继续」并指明要改哪里'
   return '本轮已达到步数上限，回答可能不完整 · 回复「继续」可接着做'
 })
 
@@ -576,9 +584,14 @@ async function copy() {
         </button>
       </div>
 
-      <ul v-if="contextNotices.length" class="turn-notices">
-        <li v-for="(note, i) in contextNotices" :key="i">
-          <Icon name="layers" :size="13" />
+      <ul v-if="steerNotices.length" class="turn-notices">
+        <li
+          v-for="(note, i) in steerNotices"
+          :key="'steer-' + i"
+          class="note-steer"
+          :title="note.detail || ''"
+        >
+          <Icon name="refresh" :size="13" />
           <span>{{ note.text }}</span>
         </li>
       </ul>

@@ -241,16 +241,21 @@ onMounted(refresh)
         <div v-if="snapshot.context_requires_restart" class="banner warn" role="note">
           <Icon name="circle-alert" :size="16" />
           <span class="banner-text">
-            这一轮没有开启循环内上下文压缩（<code class="md-code">context.max_tokens = 0</code>）：
+            这一轮关掉了循环内上下文压缩（<code class="md-code">context.max_tokens 是负数</code>）：
             步数调大后每一步都会重发整段历史，token 成本近似平方增长，最后会撞模型上下文上限。
-            在 <code class="md-code">config.yaml</code> 里设
-            <code class="md-code">context.max_tokens</code>（例如模型窗口的 60%~70%）并重启，是让它跑完的另一半。
+            把它改回 <code class="md-code">0</code>（按模型窗口自动计算）或一个正数并重启，是让它跑完的另一半。
           </span>
         </div>
         <p v-else class="muted-note card-foot">
-          循环内压缩已开启（<code class="md-code">context.max_tokens =
-          {{ formatCount(snapshot.context_max_tokens) }}</code>），长任务的窗口会被折叠成摘要，
-          所以上面的步数上限可以放心调大。
+          循环内压缩已开启：当前上限
+          <code class="md-code">{{ formatCount(snapshot.context_max_tokens) }} tokens</code>
+          <template v-if="snapshot.context_auto">
+            （按默认模型
+            <code class="md-code">{{ snapshot.context_model || '（未配置）' }}</code>
+            的上下文窗口自动算出；每个会话按自己选的模型各算一份），
+          </template>
+          <template v-else>（<code class="md-code">context.max_tokens</code> 固定设定），</template>
+          长任务的窗口会被折叠成摘要，所以上面的步数上限可以放心调大。
         </p>
       </AsyncBlock>
     </div>

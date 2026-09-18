@@ -170,23 +170,25 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 		logger.Warn("web chat disabled: the default model is not a chat model")
 		return server.ChatDeps{}, "", ""
 	}
-	condenser, err := turnCondenser(cfg, chatModel, logger)
+	condenser, err := turnCondenser(cfg, chatModel, logger, defModel)
 	if err != nil {
 		// Not fatal: a turn with an unbounded window still works, it just costs
 		// more the longer it runs.
 		logger.Warn("web chat: in-turn context compression disabled", zap.Error(err))
 	}
 	runner, err := chat.New(chat.Config{
-		Model:       chatModel,
-		Tools:       registry,
-		Tracer:      tracer,
-		MaxSteps:    maxSteps,
-		MaxParallel: cfg.Tools.MaxParallelOr(),
-		MaxTokens:   cfg.Chat.TurnMaxTokens,
-		Deadline:    cfg.Chat.TurnDeadline(),
-		StepRetry:   cfg.Chat.StepRetryPolicy(),
-		Condenser:   condenser,
-		Logger:      logger,
+		Model:              chatModel,
+		Tools:              registry,
+		Tracer:             tracer,
+		MaxSteps:           maxSteps,
+		MaxParallel:        cfg.Tools.MaxParallelOr(),
+		MaxTokens:          cfg.Chat.TurnMaxTokens,
+		Deadline:           cfg.Chat.TurnDeadline(),
+		StepRetry:          cfg.Chat.StepRetryPolicy(),
+		Condenser:          condenser,
+		Guard:              chatGuardFor(cfg),
+		ToolResultMaxChars: toolResultCapFor(cfg),
+		Logger:             logger,
 	})
 	if err != nil {
 		logger.Warn("web chat disabled: cannot build the runner", zap.Error(err))
@@ -206,13 +208,21 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 		zap.Duration("approval_timeout", cfg.Tools.Approval.Timeout()),
 	)
 	return server.ChatDeps{
-		Runner:       runner,
-		Builder:      builder,
-		Tools:        registry,
-		ToolsFor:     func(ctx context.Context) (*tool.Registry, error) { return bindings.forScope(ctx) },
-		Workspaces:   wsManager,
-		Condenser:    condenser,
-		SystemPrompt: cfg.Chat.SystemPrompt,
+		Runner:     runner,
+		Builder:    builder,
+		Tools:      registry,
+		ToolsFor:   func(ctx context.Context) (*tool.Registry, error) { return bindings.forScope(ctx) },
+		Workspaces: wsManager,
+		Condenser:  condenser,
+		// Per-model: the condenser follows the conversation's model, so a session
+		// on a big-window model is not compressed as if it were on a small one.
+		CondenserFor: turnCondenserFactory(cfg, logger),
+		// The in-turn loop guard and the bound on one tool result as the model
+		// sees it. Both are what keep a long turn from spending its whole budget
+		// exploring: see internal/chat/progress.go.
+		Guard:              chatGuardFor(cfg),
+		ToolResultMaxChars: toolResultCapFor(cfg),
+		SystemPrompt:       cfg.Chat.SystemPrompt,
 		// The same confinement the file tools use, so an uploaded attachment
 		// lands somewhere the agent can read it and the workspace's
 		// read-only mode and write limit apply to uploads too.
@@ -468,6 +478,12 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 		metaProvider, metaModel = chatProvider, chatModel
 	}
 
+	// What 设置 → 对话预算 reports about the in-turn window. It is resolved here
+	// because the resolution needs the model table and the config, and the server
+	// should not have to know either: it reports the number and where it came
+	// from.
+	contextCap, contextAuto, contextModel := contextBudgetForPanel(cfg, metaModel)
+
 	srv, err := server.New(server.Config{
 		Host:                    cfg.Server.Host,
 		Port:                    cfg.Server.Port,
@@ -484,10 +500,13 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 		DefaultChatMaxSteps:     cfg.Chat.MaxSteps,
 		DefaultChatMaxTokens:    cfg.Chat.TurnMaxTokens,
 		DefaultChatTurnDeadline: cfg.Chat.TurnDeadline(),
-		// The in-turn window the condenser was built with, so 设置 → 对话预算 can
-		// warn that a raised step cap without compression is the combination that
-		// turns a long task into a context-limit error partway through.
-		ContextMaxTokens: cfg.Context.MaxTokens,
+		// The in-turn window the condenser resolves to, so 设置 → 对话预算 can say
+		// what it is and where it came from — and can warn when compression is off
+		// entirely, which is the combination that turns a long task into a
+		// context-limit error partway through.
+		ContextMaxTokens: contextCap,
+		ContextAuto:      contextAuto,
+		ContextModel:     contextModel,
 		ChatHistoryLimit: cfg.Chat.HistoryLimitOr(),
 		ChatEnable:       cfg.Chat.Enable,
 		Chat:             chatDeps,

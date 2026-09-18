@@ -201,6 +201,32 @@ function retryNoticeText(event) {
   return reason ? `${head}，${wait}（${reason}）` : `${head}，${wait}`
 }
 
+/**
+ * The one-line explanation of a stop that was not the model's own answer.
+ *
+ * `reason` is the server's vocabulary (see internal/chat/budget.go). Losing one
+ * of these branches is not cosmetic: a reason the page does not know was
+ * reported as "步数上限", which told the reader the wrong thing about a turn the
+ * loop guard stopped after five identical calls.
+ */
+function budgetStopText(event) {
+  const reason = typeof event.reason === 'string' ? event.reason : ''
+  if (reason === 'tokens') return '本轮达到 token 预算，回答可能不完整 · 回复「继续」可接着做'
+  if (reason === 'deadline') return '本轮达到时间上限，回答可能不完整 · 回复「继续」可接着做'
+  if (reason === 'loop') return '本轮在重复调用同一个工具，已被提前结束 · 回复「继续」可以让它换个做法'
+  if (reason === 'idle') return '本轮连续多步只查看、没有推进，已被提前结束 · 回复「继续」并指明要改哪里'
+  return '本轮达到步数上限，回答可能不完整 · 回复「继续」可接着做'
+}
+
+/** One line about a steering message: what the model was told, and about what. */
+function steerNoticeText(event) {
+  const kind = typeof event.steer_kind === 'string' ? event.steer_kind : ''
+  if (kind === 'repeat') return '同一个工具调用重复了，已提醒模型换个做法'
+  if (kind === 'reread') return '反复读同一个文件，已提醒模型只取需要的部分'
+  if (kind === 'idle') return '连续多步只查看没有动手，已提醒模型开始推进'
+  return '已提醒模型调整做法'
+}
+
 // ------------------------------------------------------- render item model --
 
 /** Normalise a usage object (the persisted column is a JSON string). */
@@ -587,6 +613,14 @@ export async function refreshAllModels() {
   return results
 }
 
+/**
+ * Read the session list (GET /api/chat/sessions), select the newest one, and
+ * report whether the list was actually read.
+ *
+ * The boolean is what lets ensureLoaded tell "loaded" from "was refused": a 401
+ * (no session yet, or one that expired) leaves the store as empty as a fresh
+ * boot, and a caller that treated that as loaded would never try again.
+ */
 export async function loadSessions({ quiet = false, select = true } = {}) {
   if (!quiet && !chat.sessions.length) chat.sessionsStatus = 'loading'
   try {
@@ -603,31 +637,63 @@ export async function loadSessions({ quiet = false, select = true } = {}) {
     // page has not heard of would otherwise be invisible.
     if (!chat.workspaces.length) await loadWorkspaces({ quiet: true })
 
-    if (!select) return
+    if (!select) return true
     const active = list.find((s) => s && s.id === chat.activeId)
     if (active) {
       // Keep the header (model, title, count) in sync with server state.
       if (chat.session) chat.session = { ...chat.session, ...active }
-      return
+      return true
     }
     const newest = list[0]
     if (newest && newest.id) await selectSession(newest.id)
     else resetSelection()
+    return true
   } catch (err) {
-    if (err && err.status === 401) return
+    if (err && err.status === 401) return false
     chat.sessionsError = errorText(err, '无法读取会话列表')
     if (!chat.sessions.length) chat.sessionsStatus = 'error'
+    return false
   }
 }
 
-/** Boot the view: catalog + sessions, then the newest conversation. */
+/** The in-flight ensureLoaded, so concurrent callers share one load. */
+let booting = null
+
+/**
+ * Boot the view: catalog + sessions, then the newest conversation.
+ *
+ * `booted` is set **after** the list was really read, not before the request:
+ * the request fails on a deployment that requires a password and on a server
+ * that is not up, and in both cases the next call must be allowed to try again.
+ * Setting it up front is what made the console load nothing until a full page
+ * reload — the shell's probe-less first attempt consumed the one shot, the login
+ * that followed found `booted` already true, and the session and workspace lists
+ * stayed empty (they are only read from loadSessions). It also silently disabled
+ * every 重试 button in the failed states, which call this again.
+ */
 export async function ensureLoaded() {
-  if (!chat.catalog) await loadCatalog()
-  // The sidebar shows the session list on every view, so the first caller wins
-  // and later calls must not re-select a conversation over the user's choice.
-  if (chat.booted) return
-  chat.booted = true
-  await loadSessions()
+  // The two requests are independent, and booted-vs-catalog can disagree: a boot
+  // whose session list was read but whose catalog request failed is `booted` with
+  // no catalog, which is exactly the state the 模型目录 banner reports. Its 重试
+  // button calls this function, so the guard has to let that case through instead
+  // of returning on `booted` alone.
+  if (chat.booted && chat.catalog) return
+  // The shell, the chat view and the tab watcher all ask for this on mount; the
+  // first caller starts the load and the rest await it instead of firing a
+  // second round of requests.
+  if (booting) return booting
+  booting = (async () => {
+    if (!chat.catalog) await loadCatalog()
+    if (chat.booted) return
+    // Only a list that was actually read counts as booted; a 401 or a transport
+    // failure leaves this false so the caller can retry once the session exists.
+    if (await loadSessions()) chat.booted = true
+  })()
+  try {
+    await booting
+  } finally {
+    booting = null
+  }
 }
 
 function resetSelection() {
@@ -730,6 +796,11 @@ export async function createSession({ workspace = '' } = {}) {
       chat.workspace = null
       chat.items = []
       chat.stats = normalizeStats(null)
+      // 新会话还没有任何一轮，所以它不可能有计划：上一个会话的清单留在这里，
+      // 看板会挂在一个空对话的输入框上方，看起来像"这个新对话有一堆活没干"。
+      // 位置在成功分支里（不在请求之前）：新建失败时人还留在原会话，那份计划
+      // 是他的「继续执行」接续点，不能因为一次失败的创建就丢掉。
+      chat.plan = null
       chat.messagesError = ''
       chat.messagesStatus = 'ready'
       // The folder counts changed, and the grouping depends on them.
@@ -1644,13 +1715,27 @@ function handleEvent(turn, event) {
       return true
     }
 
-    // The window was condensed to stay inside the token budget. It is a notice
-    // rather than a warning: the turn carries on, with a smaller window.
+    // The window was condensed to stay inside the token budget. The page stays
+    // quiet about it on purpose: it is a detail of how a long turn is run, not
+    // something the reader can act on, so a line per compression only adds
+    // noise above an answer that is still coming. The fact is not lost — the
+    // server writes it to the session's log, which is where the window size of
+    // a long turn gets investigated anyway.
     case 'context_compressed':
+      return true
+
+    // The harness told the model how it was running the turn: it is repeating a
+    // call, rereading one file, or looking without ever acting. It is a notice
+    // rather than a failure — the model gets the same sentence as a message and
+    // usually changes course — but a turn that was steered is worth a line, or
+    // the reader cannot tell "slow" from "going in circles".
+    case 'steer':
       turn.notices.push({
-        kind: 'context',
+        kind: 'steer',
         step: numberOrNull(event.step),
-        text: typeof event.text === 'string' ? event.text : '上下文已压缩',
+        steerKind: typeof event.steer_kind === 'string' ? event.steer_kind : '',
+        text: steerNoticeText(event),
+        detail: typeof event.text === 'string' ? event.text : '',
       })
       return true
 

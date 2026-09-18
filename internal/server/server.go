@@ -82,11 +82,17 @@ type Config struct {
 	// DefaultChatTurnDeadline bounds one chat turn's wall-clock time (0 =
 	// unlimited).
 	DefaultChatTurnDeadline time.Duration
-	// ContextMaxTokens is the in-turn window the compressor was built with at
-	// startup. It is reported (not applied) by the budget panel, which uses it to
+	// ContextMaxTokens is the in-turn history budget resolved for the default
+	// model. It is reported (not applied) by the budget panel, which uses it to
 	// warn that a raised step cap without compression is the combination that
 	// turns a long task into a context-limit error. 0 means compression is off.
 	ContextMaxTokens int
+	// ContextAuto says the budget above was derived from the model's context
+	// window rather than fixed in the config, and ContextModel names the model it
+	// was derived for. The panel shows both: "91750" alone invites the reader to
+	// go looking for a 91750 in their config file, which is not there.
+	ContextAuto  bool
+	ContextModel string
 	// ChatHistoryLimit bounds how many stored messages are replayed.
 	ChatHistoryLimit int
 	// ChatEnable turns the web chat endpoints on.

@@ -18,6 +18,56 @@ import { loadMeta, state } from '../state.js'
 const meta = computed(() => state.meta || {})
 const tools = computed(() => (chat.catalog && chat.catalog.tools) || [])
 
+/**
+ * The version line, in a shape a person can act on.
+ *
+ * The server reports `e254199-dirty (commit e254199, built 2026-09-18T23:25:47Z)`,
+ * and both halves of that mislead at a glance. The build time is UTC, so a build
+ * made at 07:25 this morning reads as 23:25 — yesterday evening — to anyone east
+ * of Greenwich; and the version is `git describe`, so it does NOT move until the
+ * work is committed, which makes a freshly restarted service look stale. So the
+ * time is rendered in the reader's own timezone with a relative hint, and a
+ * `-dirty` build says out loud that the running code is not in any commit.
+ */
+const version = computed(() => parseVersion(meta.value.version))
+
+function parseVersion(raw) {
+  const text = typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : 'dev'
+  // "name (commit abc1234, built 2026-09-18T23:25:47Z)" — anything missing stays
+  // missing rather than being invented.
+  const built = text.match(/built\s+([0-9T:+-]+Z?)/)
+  const commit = text.match(/commit\s+([0-9a-f]{4,40})/i)
+  const name = text.split(' (')[0]
+  const dirty = /-dirty\b/.test(name)
+
+  let at = null
+  if (built) {
+    const parsed = new Date(built[1])
+    if (!Number.isNaN(parsed.getTime())) at = parsed
+  }
+  return {
+    name: dirty ? name.replace(/-dirty$/, '') : name,
+    dirty,
+    commit: commit ? commit[1] : '',
+    at,
+    when: at ? whenText(at) : '',
+  }
+}
+
+/** "今天 07:25" / "昨天 23:10" / "9月17日 07:25" — local time, with a hint. */
+function whenText(at) {
+  const now = new Date()
+  const clock = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+  const days = Math.floor(
+    (new Date(now.getFullYear(), now.getMonth(), now.getDate()) -
+      new Date(at.getFullYear(), at.getMonth(), at.getDate())) /
+      86400000,
+  )
+  if (days === 0) return `今天 ${clock}`
+  if (days === 1) return `昨天 ${clock}`
+  return `${at.getMonth() + 1}月${at.getDate()}日 ${clock}`
+}
+
 onMounted(() => {
   // Quiet: keep whatever is on screen while the refresh is in flight.
   loadCatalog({ quiet: true })
@@ -68,7 +118,16 @@ onMounted(() => {
         </div>
         <div class="kv-row">
           <dt>服务版本</dt>
-          <dd class="mono">{{ meta.version || 'dev' }}</dd>
+          <dd class="mono">
+            <span>{{ version.name }}</span>
+            <template v-if="version.when"> · 构建于 {{ version.when }}</template>
+            <span v-if="version.commit" class="muted-note"> · {{ version.commit }}</span>
+            <br />
+            <span v-if="version.dirty" class="muted-note">
+              工作区有未提交改动：这个版本号不会变，重启也看不出差别——提交之后才会
+            </span>
+            <span v-else class="muted-note">已提交的构建</span>
+          </dd>
         </div>
         <div class="kv-row">
           <dt>Prometheus metrics</dt>

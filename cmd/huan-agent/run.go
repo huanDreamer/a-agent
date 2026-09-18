@@ -463,6 +463,14 @@ func runOnce(cmd *cobra.Command, args []string) error {
 	case res == nil:
 		return withExitCode(exitAgentError, errors.New("run produced no result"))
 	case res.BudgetExhausted():
+		// The exit code is the same for every early stop — a caller that needs to
+		// tell a budget from the loop guard reads stop_reason — but the sentence
+		// must not, because "stopped on a budget: loop" tells the reader to raise
+		// a limit that was never reached.
+		if isGuardStop(res.StopReason) {
+			out.notice("stopped early (%s): the turn was repeating itself or only looking, not answering", res.StopReason)
+			return withExitCode(exitBudget, fmt.Errorf("stopped early: %s", res.StopReason))
+		}
 		out.notice("stopped on a budget (%s) before answering", res.StopReason)
 		return withExitCode(exitBudget, fmt.Errorf("stopped on a budget: %s", res.StopReason))
 	case runFailOnToolErr && report.ToolFailures > 0:
@@ -470,6 +478,12 @@ func runOnce(cmd *cobra.Command, args []string) error {
 		return withExitCode(exitToolFailure, fmt.Errorf("%d tool call(s) failed", report.ToolFailures))
 	}
 	return nil
+}
+
+// isGuardStop reports whether the turn was ended by the loop guard rather than by
+// a budget.
+func isGuardStop(reason string) bool {
+	return reason == chat.StopLoop || reason == chat.StopIdle
 }
 
 // runTools is the registry a one-shot run works with, plus the MCP clients whose

@@ -38,7 +38,7 @@ type sessionMemory struct {
 // mirror batches turns across sessions, so it belongs to the process. A nil
 // store means "no long-term persistence" (memory off, or no directory
 // configured) and every write becomes a no-op.
-func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, ns string, logger *zap.Logger, st memory.Store) (*sessionMemory, error) {
+func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, ns string, logger *zap.Logger, st memory.Store, modelName string) (*sessionMemory, error) {
 	m := &sessionMemory{
 		buffer:       memory.NewBuffer(cfg.Memory.MaxTurns),
 		ns:           ns,
@@ -54,13 +54,37 @@ func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, 
 		m.store = st
 		m.persist = true
 	}
-	// Context manager (auto-compression disabled when MaxTokens == 0).
+	// Context manager over the conversation this REPL keeps in memory.
+	//
+	// The window is resolved exactly as a turn's is — context.max_tokens means
+	// the same three things here (0 = derived from the model's window, > 0 =
+	// fixed, < 0 = off) — because a setting honoured on one surface and silently
+	// ignored on another is worse than one that does not exist. What differs is
+	// the scope: this bounds a conversation's history rather than the steps of
+	// one turn, so no turn ledger goes into it.
+	//
+	// A negative value must never reach the manager: Budget.Validate refuses it,
+	// and the CLI would fail to start over a setting that only asked for less
+	// compression.
+	window := cfg.Context.WindowSpecFor().Resolve(modelName)
+	capTokens := window.Cap
+	if capTokens < 0 {
+		capTokens = 0
+	}
+	if capTokens > 0 {
+		logger.Info("会话记忆窗口预算已确定",
+			zap.String("model", window.Model),
+			zap.Int("context_window", window.Tokens),
+			zap.Int("cap", capTokens),
+			zap.String("source", window.Source),
+		)
+	}
 	var summarizer gctx.Summarizer
 	if cfg.Context.Summarize && cm != nil {
 		summarizer = gctx.LLMSummarizer{Model: cm}
 	}
 	mgr, err := gctx.NewManager(gctx.Budget{
-		MaxTokens:  cfg.Context.MaxTokens,
+		MaxTokens:  capTokens,
 		KeepRecent: cfg.Context.KeepRecent,
 		Summarizer: summarizer,
 	}, nil, nil)

@@ -404,11 +404,12 @@ func (s *Server) startTurn(run turnRun) *liveTurn {
 	// is attached when the question is asked, and the answer comes back on a
 	// request of its own.
 	runCtx = tool.WithAsker(runCtx, &turnAsker{
-		hub:     s.questions,
-		session: run.session.ID,
-		timeout: s.askTimeout(),
-		logger:  s.logger,
-		emit:    emit,
+		hub:      s.questions,
+		session:  run.session.ID,
+		timeout:  s.askTimeout(),
+		logger:   s.logger,
+		emit:     emit,
+		answered: make(map[string]tool.Answer, 2),
 	})
 
 	// The approver is per turn for the same reason, and so is the set of tools

@@ -123,7 +123,8 @@ huan-agent run "..." 2>/dev/null | pbcopy # 只要答案
 }
 ```
 
-- `stop_reason` ∈ `done`（模型自己给了答案）/ `steps` / `tokens` / `deadline`。
+- `stop_reason` ∈ `done`（模型自己给了答案）/ `steps` / `tokens` / `deadline`（预算）/
+  `loop` / `idle`（循环保护：同一调用反复重放，或连续多步只看不动手，见 docs/long-tasks.md）。
 - `usage.cost.priced=false` 表示价格表里没有匹配的条目——**不是免费，是没测**。报 0 会被读成免费。
 - `steps` 与 `failures` 永远是数组，失败运行也会输出一个合法对象（`error` 字段说明原因），
   所以调用方不必判空。
@@ -179,6 +180,8 @@ esac
 - **退出码 6 且提到 `--session`**——那个会话 id 不存在。`--session` 不会新建会话。
 - **退出码 6 且提到 `does not support tool calling`**——该 provider 不支持工具调用，用 `--no-tools`
   或者换一个 provider。
-- **退出码 4 但答案看起来不完整**——`stop_reason` 是 `steps` 或 `tokens`：一轮内的预算用完了。
-  提高 `--max-steps`，或提高 `chat.turn_max_tokens`。
+- **退出码 4 但答案看起来不完整**——一轮提前停了，看 `stop_reason`：
+  `steps` / `tokens` / `deadline` 是预算用完了（提高 `--max-steps` 或 `chat.turn_max_tokens`）；
+  `loop` / `idle` 是循环保护收的手（这一轮在重复调用或只看不动手，调大 `chat.guard.*` 或把
+  `chat.guard.enable` 关掉可以放宽）。
 - **stdout 是空的但退出码是 0**——`--output json` 时答案在对象里，不在流里。

@@ -668,3 +668,100 @@ func indexOf(list []string, want string) int {
 	}
 	return -1
 }
+
+// TestTurnAsker_DoesNotAskTheSameQuestionTwice: the user answered it already.
+// The failure this prevents is a model that lost the answer (a compressed
+// window is the usual reason) and interrupts the person with the same decision
+// a second time, in the same turn.
+func TestTurnAsker_DoesNotAskTheSameQuestionTwice(t *testing.T) {
+	hub := newQuestionHub()
+	asker, rec := collectAsker(hub, 5*time.Second)
+
+	// Answering the first question, exactly as the browser does.
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if id := rec.announced(); id != "" {
+				_ = hub.resolve(id, "sess-1", tool.Answer{
+					Status: tool.AnswerAnswered, Selected: []string{"Postgres"},
+				})
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	first, err := asker.Ask(context.Background(), askQuestion())
+	if err != nil {
+		t.Fatalf("first ask: %v", err)
+	}
+	if !first.Answered() {
+		t.Fatalf("first answer = %+v, want an answer", first)
+	}
+
+	// The same question again — the same text with the whitespace and punctuation
+	// a model varies between two spellings of it, and the same options with a
+	// different description on one of them (a description is not part of the
+	// decision; the label is).
+	repeat := askQuestion()
+	repeat.Text = " 新服务用哪个数据库? "
+	repeat.Options = []tool.Option{{Label: "Postgres", Description: "换个说明"}, {Label: "SQLite"}}
+	second, err := asker.Ask(context.Background(), repeat)
+	if err != nil {
+		t.Fatalf("second ask: %v", err)
+	}
+	if !second.Answered() || len(second.Selected) != 1 || second.Selected[0] != "Postgres" {
+		t.Fatalf("second answer = %+v, want the first answer reused", second)
+	}
+	if !strings.Contains(second.Note, "已经问过") {
+		t.Errorf("the model was not told the answer is an earlier one: %q", second.Note)
+	}
+
+	// It must not have put a second card in front of the user.
+	asks := 0
+	for _, e := range rec.snapshot() {
+		if e.Type == chat.EventAsk && e.AskStatus == chat.AskPending {
+			asks++
+		}
+	}
+	if asks != 1 {
+		t.Errorf("the user was shown %d question cards, want 1", asks)
+	}
+
+	// A genuinely different question still gets through: the guard is about
+	// repeats, not about limiting how many decisions the model may ask for.
+	other := askQuestion()
+	other.Text = "产物的 URL 需要免登录吗？"
+	if _, err := asker.Ask(context.Background(), other); err != nil {
+		t.Fatalf("a different question must still be asked: %v", err)
+	}
+}
+
+// TestTurnAsker_AnUnansweredQuestionMayBeAskedAgain: nobody decided anything on
+// a timeout, so asking again later in the same turn is a legitimate second
+// attempt rather than a repeat.
+func TestTurnAsker_AnUnansweredQuestionMayBeAskedAgain(t *testing.T) {
+	hub := newQuestionHub()
+	asker, _ := collectAsker(hub, 20*time.Millisecond)
+
+	first, err := asker.Ask(context.Background(), askQuestion())
+	if err != nil {
+		t.Fatalf("first ask: %v", err)
+	}
+	if first.Status != tool.AnswerTimeout {
+		t.Fatalf("first answer = %+v, want a timeout", first)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	second, err := asker.Ask(ctx, askQuestion())
+	if err != nil {
+		t.Fatalf("second ask: %v", err)
+	}
+	if second.Status != tool.AnswerTimeout && second.Status != tool.AnswerCancelled {
+		t.Fatalf("second answer = %+v, want it asked again and to end unanswered", second)
+	}
+	if strings.Contains(second.Note, "已经问过") {
+		t.Errorf("an unanswered question was treated as answered: %q", second.Note)
+	}
+}

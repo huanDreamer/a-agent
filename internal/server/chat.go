@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/route"
@@ -90,6 +91,24 @@ type ChatDeps struct {
 	// not have to know which model summarizes: the summarizer is a deployment
 	// choice, and the runner only needs the capability.
 	Condenser chat.Condenser
+	// CondenserFor, when set, builds the condenser for one conversation's model,
+	// overriding Condenser. It is what makes the in-loop window follow the
+	// model's own context window: a conversation on a 200k model and one on a 32k
+	// model get different budgets, and switching model in the composer switches
+	// the budget with it.
+	//
+	// A nil result means "compression off" rather than an error, so a caller that
+	// cannot resolve a window does not have to fail the turn over it.
+	CondenserFor func(cm model.BaseChatModel, provider, name string) (chat.Condenser, error)
+	// Guard tunes the in-turn loop guard: the thresholds at which the model is
+	// steered for repeating itself or for reading without ever acting, and the
+	// points at which the turn is ended instead. The zero value is "on, with the
+	// defaults" — see chat.GuardConfig.
+	Guard chat.GuardConfig
+	// ToolResultMaxChars bounds one tool result as the model sees it, which is
+	// the knob with the most leverage over how often the window has to be
+	// compressed. 0 uses the runner's default; negative leaves it unbounded.
+	ToolResultMaxChars int
 	// SystemPrompt overrides the default.
 	SystemPrompt string
 	// Workspace confines the chat to one directory. It is where uploaded

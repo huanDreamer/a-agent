@@ -43,6 +43,22 @@ func (s *Server) runnerFor(ctx context.Context, sess store.ChatSession) (*chat.R
 		return nil, fmt.Errorf("server: model builder returned %T, want a chat model", built)
 	}
 
+	// The condenser follows the model, because the window it bounds is the
+	// model's: this is the difference between a fixed 60000 and a budget derived
+	// from the 128k (or 1M) window the session actually runs on.
+	condenser := s.chat.Condenser
+	if s.chat.CondenserFor != nil {
+		c, cerr := s.chat.CondenserFor(cm, sess.Provider, sess.Model)
+		if cerr != nil {
+			// Not fatal: the turn runs with the deployment's condenser, or with
+			// none at all, which is still a working turn.
+			s.logger.Warn("chat: resolving the model's context window failed; using the deployment default",
+				zapString("provider", sess.Provider), zapString("model", sess.Model), zapError(cerr))
+		} else {
+			condenser = c
+		}
+	}
+
 	r, err := chat.New(chat.Config{
 		Model: cm,
 		Tools: s.chat.Tools,
@@ -65,12 +81,15 @@ func (s *Server) runnerFor(ctx context.Context, sess store.ChatSession) (*chat.R
 		// StepRetry is not a budget: it is how the runner behaves when a step
 		// fails, so it belongs to the runner and comes from the deployment.
 		StepRetry: s.chat.StepRetry,
-		// The condenser that keeps a turn long enough to need a big step budget
-		// from resending its whole history every step is built once, from
-		// context.max_tokens, so it is the one half of the budget a console
-		// change cannot make live — the panel says so.
-		Condenser: s.chat.Condenser,
-		Logger:    s.logger,
+		// Built above, for this conversation's model: the window is a property of
+		// the model, so a runner cached per (provider, model) is also the natural
+		// place to cache its condenser.
+		Condenser: condenser,
+		// The loop guard and the tool-result bound are properties of the
+		// deployment rather than of the model, so they come from the wiring.
+		Guard:              s.chat.Guard,
+		ToolResultMaxChars: s.chat.ToolResultMaxChars,
+		Logger:             s.logger,
 	})
 	if err != nil {
 		return nil, err

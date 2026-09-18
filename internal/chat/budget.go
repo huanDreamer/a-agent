@@ -21,6 +21,15 @@ const (
 	StopTokens = "tokens"
 	// StopDeadline is the wall-clock budget.
 	StopDeadline = "deadline"
+	// StopLoop is the loop guard: the same call was made over and over with
+	// nothing changed in between, and the model kept at it after being told.
+	// It is not a budget — the turn had steps left — which is exactly why it
+	// needs its own reason: "this turn was going nowhere" is a different answer
+	// to the reader than "this turn ran out of room".
+	StopLoop = "loop"
+	// StopIdle is the loop guard's other verdict: many consecutive steps that
+	// only looked at things, with nothing changed and no plan progressed.
+	StopIdle = "idle"
 )
 
 // Condenser bounds the in-loop history. It is declared here rather than taken
@@ -103,12 +112,25 @@ func (b turnBudget) retryShare(started time.Time) time.Duration {
 	return left
 }
 
-// stopNote is the sentence that explains a budget stop: what was hit, what it
-// cost, and what the user can do about it. It is deliberately specific — "the
-// answer may be incomplete" without "you hit the 12-step cap" leaves the reader
-// with nothing to act on.
-func stopNote(reason string, b turnBudget, res *Result, elapsed time.Duration) string {
-	switch reason {
+// stopInfo is a stop and, when the guard caused it, the detail it wants to
+// report: which call was repeated, how many steps changed nothing.
+type stopInfo struct {
+	Reason string
+	Detail string
+}
+
+// stopNote is the sentence that explains a stop: what was hit, what it cost, and
+// what the user can do about it. It is deliberately specific — "the answer may be
+// incomplete" without "you hit the 12-step cap" leaves the reader with nothing to
+// act on.
+func stopNote(info stopInfo, b turnBudget, res *Result, elapsed time.Duration) string {
+	switch info.Reason {
+	case StopLoop:
+		return "本轮因为重复调用被提前结束：" + info.Detail + "，重复同样的调用不会得到新结果"
+	case StopIdle:
+		return "本轮因为空转被提前结束：" + info.Detail + "，需要的是推进而不是继续查看"
+	}
+	switch info.Reason {
 	case StopTokens:
 		return fmt.Sprintf("已达到本轮 token 预算 %d（已用 %d，共 %d 步）", b.maxTokens, res.Usage.TotalTokens, res.Steps)
 	case StopDeadline:
@@ -125,23 +147,41 @@ func stopNote(reason string, b turnBudget, res *Result, elapsed time.Duration) s
 const stopHint = "工作区里的改动已经落盘，回复「继续」可以接着做，或调大本轮的上限" +
 	"（chat.max_steps / chat.turn_max_tokens / chat.turn_deadline_seconds）"
 
+// guardHint is what to do about a loop stop. It names the knobs, because the
+// honest fix for a deliberate repeat (polling a job, re-running a flaky test) is
+// to raise the threshold rather than to argue with the guard.
+const guardHint = "回复「继续」可以让它换个做法接着做；如果这种重复本来就是刻意的" +
+	"（轮询、反复跑一个不稳定的测试），调大 chat.guard.repeat_stop / chat.guard.idle_stop_steps，" +
+	"或者直接把 chat.guard.enable 关掉"
+
+// hintFor returns the next-move sentence for one stop.
+func hintFor(reason string) string {
+	switch reason {
+	case StopLoop, StopIdle:
+		return guardHint
+	default:
+		return stopHint
+	}
+}
+
 // stopText builds the answer a budget stop returns: the last assistant text the
 // model produced, plus an explanation. Preferring that text is the difference
 // between "stopped after 12 steps with a partial answer" and "stopped after 12
 // steps with nothing", and the partial answer is usually most of the work.
-func stopText(history []*schema.Message, reason string, b turnBudget, res *Result, elapsed time.Duration) string {
-	note := stopNote(reason, b, res, elapsed)
+func stopText(history []*schema.Message, info stopInfo, b turnBudget, res *Result, elapsed time.Duration) string {
+	note := stopNote(info, b, res, elapsed)
+	hint := hintFor(info.Reason)
 	base := lastAssistantText(history)
 	if base == "" {
 		// No partial answer: the only honest claim about the workspace is that
 		// tools ran, so that is what the note offers. With none, it stays short
 		// rather than promising a continuation of work that never happened.
 		if len(res.Tools) > 0 {
-			return "（" + note + "。" + stopHint + "；未能得出最终回答。）"
+			return "（" + note + "。" + hint + "；未能得出最终回答。）"
 		}
 		return "（" + note + "，未能得出最终回答）"
 	}
-	return base + "\n\n（" + note + "。" + stopHint + "；回答可能不完整。）"
+	return base + "\n\n（" + note + "。" + hint + "；回答可能不完整。）"
 }
 
 // lastAssistantText returns the most recent assistant message that carries

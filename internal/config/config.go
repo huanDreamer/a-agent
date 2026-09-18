@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/viper"
 
+	"github.com/huan/huan-agent/internal/context"
 	"github.com/huan/huan-agent/internal/retry"
 )
 
@@ -147,6 +148,75 @@ type ChatConfig struct {
 	// Plan configures the task plan the model maintains through the plan_*
 	// tools, and the 任务看板 that renders it above the composer.
 	Plan PlanConfig `mapstructure:"plan" json:"plan"`
+	// Guard bounds the two ways a long turn wastes itself without failing: a
+	// model that keeps re-running the same call, and a model that keeps reading
+	// without ever acting on what it read. Neither is an error the provider or
+	// the step cap can see, and both end in a turn that spent its whole budget
+	// exploring.
+	//
+	// It steers before it stops: the model is told what it is repeating, which is
+	// usually enough, and the turn is ended only if it keeps going. That order
+	// matters — a guard that kills a productive turn is worse than the loop it
+	// was watching for.
+	Guard GuardConfig `mapstructure:"guard" json:"guard"`
+}
+
+// Guard defaults. They are named here as well as in internal/chat because the
+// two sides have to agree and neither may import the other: the runner must not
+// depend on the config tree, and the config tree should not depend on the chat
+// runtime. A test asserts the two sets are equal.
+const (
+	// DefaultGuardRepeatNudge / DefaultGuardRepeatStop are the identical-call
+	// thresholds.
+	DefaultGuardRepeatNudge = 3
+	DefaultGuardRepeatStop  = 5
+	// DefaultGuardIdleNudgeSteps / DefaultGuardIdleStopSteps are the
+	// no-progress thresholds, in steps.
+	DefaultGuardIdleNudgeSteps = 25
+	DefaultGuardIdleStopSteps  = 75
+	// DefaultGuardMaxSteers caps the steering messages one turn may carry.
+	DefaultGuardMaxSteers = 6
+	// DefaultGuardRereadNudge is how many times one file may be read the same way.
+	DefaultGuardRereadNudge = 5
+)
+
+// GuardConfig tunes the loop guard. Every field has a working default, so a
+// deployment only has to say what it wants to change — except Enable, which is
+// a bool and therefore defaults to "off" unless a default sets it (both Default()
+// and SetDefaults do).
+type GuardConfig struct {
+	// Enable turns the guard off. Off means a turn may burn its entire step
+	// budget reading the same file, which is what a deployment that would rather
+	// trust the model can choose.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// RepeatNudge is how many identical tool calls (same tool, same arguments)
+	// earn a steering message. 0 uses the default (3).
+	RepeatNudge int `mapstructure:"repeat_nudge" json:"repeat_nudge"`
+	// RepeatStop is how many identical calls end the turn. 0 uses the default
+	// (5). It must be above RepeatNudge: a stop the model was never warned about
+	// is a guard that failed rather than one that fired.
+	RepeatStop int `mapstructure:"repeat_stop" json:"repeat_stop"`
+	// IdleNudgeSteps is how many consecutive steps may run tools that change
+	// nothing — reads, searches, and commands that only look — before the model
+	// is told to start acting or answer. 0 uses the default (25).
+	IdleNudgeSteps int `mapstructure:"idle_nudge_steps" json:"idle_nudge_steps"`
+	// IdleStopSteps is how many such steps end the turn. 0 uses the default (75).
+	// A read-only task that legitimately needs longer says so in its answer; the
+	// guard's steering message asks for exactly that.
+	IdleStopSteps int `mapstructure:"idle_stop_steps" json:"idle_stop_steps"`
+	// MaxSteers caps how many steering messages one turn may carry. A model that
+	// ignores three of them is not going to read the fourth, and every steer is
+	// a message every later step pays for again. 0 uses the default (6).
+	MaxSteers int `mapstructure:"max_steers" json:"max_steers"`
+	// RereadNudge is how many times one file may be read *the same way* (the same
+	// path with the same offset/limit, the same grep pattern, the same sed range)
+	// before the model is told it has been there already. Reading a large file in
+	// consecutive slices does not count: the count is per (file, part). 0 uses the
+	// default (5).
+	//
+	// It exists as a knob because a deployment may legitimately re-read one file
+	// often; the alternative to raising it is turning the whole guard off.
+	RereadNudge int `mapstructure:"reread_nudge" json:"reread_nudge"`
 }
 
 // PlanConfig configures the visible task plan.
@@ -1082,9 +1152,48 @@ type MemoryConfig struct {
 
 // ContextConfig configures the LLM context-window budget and compression.
 type ContextConfig struct {
-	// MaxTokens is the hard ceiling for the assembled window. 0 disables
-	// auto-compression.
+	// MaxTokens is the ceiling for the assembled window.
+	//
+	// The three cases matter, because the default is the interesting one:
+	//
+	//   - 0 (default): derive the ceiling from the model's own context window —
+	//     window × WindowRatio − ReserveOutputTokens, with the window taken from
+	//     ModelWindows, the built-in table, or DefaultWindow. This is what a
+	//     deployment wants when one console serves several models: 60000 throws
+	//     away most of a 200k window and overflows a 32k one.
+	//   - > 0: a fixed ceiling, exactly as configured. It wins over everything
+	//     above, because an operator who wrote a number meant it.
+	//   - < 0: compression off. The whole history is resent every step, which is
+	//     only affordable for short turns.
 	MaxTokens int `mapstructure:"max_tokens" json:"max_tokens"`
+	// WindowRatio is how much of the model's window the history may fill when
+	// MaxTokens is 0. 0 uses the built-in default (0.7). The remainder absorbs
+	// the system prompt, the tool schemas, and the error in the token estimate.
+	WindowRatio float64 `mapstructure:"window_ratio" json:"window_ratio"`
+	// ReserveOutputTokens is held back from the window for the model's own
+	// output — a reasoning model spends it before writing a word of the answer.
+	// 0 uses the built-in default; a negative value reserves nothing.
+	ReserveOutputTokens int `mapstructure:"reserve_output_tokens" json:"reserve_output_tokens"`
+	// DefaultWindow is the context window assumed for a model the built-in table
+	// does not know. 0 uses the built-in default (128k). Guessing a mainstream
+	// size is the right failure: too large costs a retryable provider error,
+	// too small costs money on every step of every turn.
+	DefaultWindow int `mapstructure:"default_window" json:"default_window"`
+	// ModelWindows overrides the window for models the table gets wrong — a
+	// gateway that truncates earlier than the vendor does, a private deployment
+	// with a smaller limit. A key matches as a case-insensitive substring of the
+	// model id (the longest matching key wins), so "deepseek" covers
+	// deepseek/deepseek-v4.1-flash without naming it.
+	ModelWindows map[string]int `mapstructure:"model_windows" json:"model_windows"`
+	// ToolResultMaxChars bounds one tool result *as the model sees it*.
+	//
+	// It is the other half of the window budget: a single command that dumps
+	// 128 KiB used to arrive in the window whole, which fires a compression
+	// every couple of steps and folds away the work in progress — the failure
+	// this bound exists to prevent. The result stored for the conversation and
+	// shown in the console is never truncated; only the copy replayed to the
+	// model is. 0 uses the built-in default; a negative value does not bound it.
+	ToolResultMaxChars int `mapstructure:"tool_result_max_chars" json:"tool_result_max_chars"`
 	// KeepRecent is the number of most recent messages retained verbatim
 	// after a compression pass.
 	KeepRecent int `mapstructure:"keep_recent" json:"keep_recent"`
@@ -1092,6 +1201,51 @@ type ContextConfig struct {
 	// When true, a summarizer is wired into the agent loop (if a model is
 	// available). Otherwise older turns are dropped with a placeholder.
 	Summarize bool `mapstructure:"summarize" json:"summarize"`
+}
+
+// WindowSpecFor turns the section into the resolver the runner uses.
+//
+// It exists so the three ways of saying "how big is the window" travel together:
+// a caller that resolved the cap itself from cfg.Context.MaxTokens would ignore
+// the ratio, the reserve, and the per-model overrides — which is precisely the
+// bug that made a fixed 60000 the answer for every model.
+func (c ContextConfig) WindowSpecFor() context.WindowSpec {
+	return context.WindowSpec{
+		MaxTokens: c.MaxTokens,
+		Ratio:     c.WindowRatio,
+		Reserve:   c.ReserveOutputTokens,
+		Default:   c.DefaultWindow,
+		Overrides: c.ModelWindows,
+	}
+}
+
+// DefaultToolResultMaxChars is the bound on one tool result as the model sees
+// it, mirroring context.DefaultToolResultMaxChars (see the guard constants above
+// for why it is spelled twice).
+func DefaultToolResultMaxChars() int { return context.DefaultToolResultMaxChars }
+
+// DefaultGuardConfig is the guard configuration a deployment gets when it says
+// nothing.
+func DefaultGuardConfig() GuardConfig {
+	return GuardConfig{
+		Enable:         true,
+		RepeatNudge:    DefaultGuardRepeatNudge,
+		RepeatStop:     DefaultGuardRepeatStop,
+		IdleNudgeSteps: DefaultGuardIdleNudgeSteps,
+		IdleStopSteps:  DefaultGuardIdleStopSteps,
+		MaxSteers:      DefaultGuardMaxSteers,
+		RereadNudge:    DefaultGuardRereadNudge,
+	}
+}
+
+// FixedCap is the explicit ceiling, or 0 when the ceiling is derived from the
+// model. Callers that have no model to resolve against — the CLI's memory
+// window, which compresses a conversation rather than a turn — use it directly.
+func (c ContextConfig) FixedCap() int {
+	if c.MaxTokens <= 0 {
+		return 0
+	}
+	return c.MaxTokens
 }
 
 // FeishuConfig configures the Feishu (Lark) IM bot integration. Multiple
@@ -1273,9 +1427,20 @@ func Default() *Config {
 			Enable:   true,
 			MaxTurns: 20,
 		},
+		Chat: ChatConfig{
+			// Only the guard is defaulted here. The rest of chat.* is read
+			// through viper (SetDefaults), and a caller that builds a Config with
+			// Default() and no file must still get the guard: its Enable is a bool,
+			// so its zero value is "off", which is the failure the guard exists to
+			// catch.
+			Guard: DefaultGuardConfig(),
+		},
 		Context: ContextConfig{
-			MaxTokens:  0, // 0 = disabled (no auto-compression) by default
-			KeepRecent: 10,
+			// 0 = derive the ceiling from the model's own window. A fixed number
+			// cannot be right for a console that serves several models, which is
+			// why the default is now the model's answer rather than a guess.
+			MaxTokens:  0,
+			KeepRecent: 12, // the same 12 SetDefaults uses, so both paths agree
 			Summarize:  true,
 		},
 		Feishu: FeishuConfig{
@@ -1442,6 +1607,29 @@ func SetDefaults(v *viper.Viper) {
 	// legible while it runs and resumable after it dies.
 	v.SetDefault("chat.plan.enable", true)
 	v.SetDefault("chat.plan.max_tasks", DefaultPlanMaxTasks)
+	// The loop guard. On by default: the failure it catches (a turn that spends
+	// its whole step budget re-reading and re-deciding) leaves no other trace
+	// than a bill, and its steering thresholds are set where a normal turn never
+	// reaches them.
+	v.SetDefault("chat.guard.enable", true)
+	v.SetDefault("chat.guard.repeat_nudge", DefaultGuardRepeatNudge)
+	v.SetDefault("chat.guard.repeat_stop", DefaultGuardRepeatStop)
+	v.SetDefault("chat.guard.idle_nudge_steps", DefaultGuardIdleNudgeSteps)
+	v.SetDefault("chat.guard.idle_stop_steps", DefaultGuardIdleStopSteps)
+	v.SetDefault("chat.guard.max_steers", DefaultGuardMaxSteers)
+	v.SetDefault("chat.guard.reread_nudge", DefaultGuardRereadNudge)
+	// Context window management. These defaults live here as well as in Default()
+	// because a config file that has a `context:` section at all overrides the
+	// whole struct: without them, omitting one key would silently turn that
+	// setting to zero — and a keep_recent of 0 compresses a long turn down to a
+	// single kept message.
+	v.SetDefault("context.max_tokens", 0)
+	v.SetDefault("context.keep_recent", 12)
+	v.SetDefault("context.summarize", true)
+	v.SetDefault("context.window_ratio", context.DefaultWindowRatio)
+	v.SetDefault("context.reserve_output_tokens", context.DefaultReserveOutputTokens)
+	v.SetDefault("context.default_window", context.DefaultModelWindow)
+	v.SetDefault("context.tool_result_max_chars", context.DefaultToolResultMaxChars)
 	// One-shot runs (`huan-agent run`) are callable from a script with no
 	// config at all: no timeout unless asked for, the interactive step cap, and
 	// the answer alone on stdout.

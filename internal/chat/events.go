@@ -78,11 +78,23 @@ const (
 	// EventContextCompressed reports that the in-loop history was condensed to
 	// stay inside the token budget. It is a notice, not a failure: the turn
 	// carries on with a bounded window.
+	//
+	// The web chat page renders nothing for it on purpose — the reader cannot
+	// act on it, and the runner logs it against the session instead (see
+	// Runner.condense). The event stays in the stream for the callers that do
+	// show it, the CLI included.
 	EventContextCompressed EventType = "context_compressed"
-	// EventBudgetStop reports that the turn ended on a budget rather than on an
-	// answer. It is emitted before EventDone, and Result.StopReason carries the
-	// same reason for callers that never see events.
+	// EventBudgetStop reports that the turn ended short of an answer — on a
+	// budget, or because the loop guard stopped a turn that was going nowhere.
+	// It is emitted before EventDone, and Result.StopReason carries the same
+	// reason for callers that never see events.
 	EventBudgetStop EventType = "budget_stop"
+	// EventSteer reports that the harness told the model how it was running the
+	// turn: it is repeating a call, rereading one file, or looking without ever
+	// acting. It is a notice to the reader, not a failure — the model gets the
+	// same sentence as a message and usually changes course — and it is the one
+	// place a user can see that a turn was steered rather than merely slow.
+	EventSteer EventType = "steer"
 	// EventDone ends the run successfully.
 	EventDone EventType = "done"
 	// EventError ends the run with a failure.
@@ -135,6 +147,10 @@ type Event struct {
 	Usage *Usage `json:"usage,omitempty"`
 	// Plan is set on plan events: the plan as it stands after the change.
 	Plan *tool.Plan `json:"plan,omitempty"`
+	// SteerKind, SteerStop and Text are set on steer events: what the model was
+	// told, and the stop reason it will carry if it ignores the message.
+	SteerKind string `json:"steer_kind,omitempty"`
+	SteerStop string `json:"steer_stop,omitempty"`
 	// Attempt, MaxAttempts, DelayMs and Error are set on step_retry: which
 	// attempt is about to run, how many the runner will make in total, how long
 	// it waits first, and what went wrong. Attempt counts the run that is about

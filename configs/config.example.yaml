@@ -146,18 +146,32 @@ memory:
 #   HUAN_CONTEXT_KEEP_RECENT=10
 #   HUAN_CONTEXT_SUMMARIZE=true
 context:
-  # 0 = disabled. When it is set, compression runs twice over: once per turn on
-  # the assembled history (CLI / 飞书), and once before every model call inside a
-  # turn (all three surfaces, including the web console) — which is what keeps a
-  # long task from resending its whole transcript on every step. Compression
-  # always keeps the system prompt and the last user message verbatim, and rolls
-  # the middle into a summary. Pick something like 60%~70% of the model's window.
-  # 60000 is roughly 60%~70% of a 128k window, which is what makes a 60-step turn
-  # affordable: without it every step resends the whole history, so cost grows
-  # about quadratically and a long task ends in a context-limit error instead.
-  # 设置 → 对话预算 reports this value and warns when it is 0, but does not change
-  # it: the compressor is built once, at startup.
-  max_tokens: 60000
+  # 循环内的窗口预算（这一节的 auto 模式只作用于「轮内」这一遍）。
+  #
+  # 轮内压缩：talk 界面的每一轮里，每次模型调用之前压一次——这是长任务不会每步
+  # 重发整段对话的原因。它永远逐字保留系统提示、最后一条用户消息和本轮台账，中间
+  # 折成摘要。
+  #
+  # CLI（huan-agent chat）与飞书那种「整段对话」记忆窗口是另一遍，也用 max_tokens，
+  # 但它没有模型可解析、也不带台账：那里 max_tokens 只认正数，0 和负数都等于关闭。
+  #
+  # max_tokens 的三种取值：
+  #   0   = 按模型自己的上下文窗口算（默认）：窗口 × window_ratio − reserve_output_tokens。
+  #         控制台同时服务多个模型，一个固定数字对它们必然有对有错。
+  #   > 0 = 写死的上限，优先于一切。
+  #   < 0 = 关闭压缩：每步重发整段历史，只有很短的轮次负担得起。
+  max_tokens: 0
+  window_ratio: 0.7       # 自动模式下历史可占窗口的比例（0 = 用默认 0.7）
+  reserve_output_tokens: 8192  # 留给模型自己输出的空间；负数表示不留
+  default_window: 131072  # 内置表不认识的模型按这个窗口估（0 = 用默认 128k）
+  # 按模型覆盖窗口：key 是模型 id 的子串（不区分大小写，最长匹配优先）。
+  # 网关提前截断、私有部署窗口更小的时候用它。
+  model_windows: {}
+  # 单次工具结果进入模型上下文的字符上限。这是对窗口影响最大的一个开关：
+  # 一条输出 128 KiB 的命令会让窗口每两步就触发一次压缩，把正在做的事折掉。
+  # 控制台里显示的、落库的都是完整输出，只有回放给模型的那份会被截断。
+  # 0 = 用默认 16000；负数 = 不限制。
+  tool_result_max_chars: 16000
   keep_recent: 12         # messages kept verbatim after a compression pass
   summarize: true         # use the LLM to summarize rolled-up turns (else drop + placeholder)
 
@@ -302,6 +316,18 @@ chat:
                            # prompt in internal/prompt (see docs/prompt.md); a value
                            # here replaces it in the web console and in the Feishu
                            # bot (the CLI uses --system / --skill instead)
+  # 循环保护：一轮里"没有失败但也没有进展"的两种情形——同一个调用反复重放、
+  # 一直只看不动手。步数/token/时间三个预算都看不见这两种，它们只会安静地把整轮
+  # 预算烧光。保护先提醒、再收手：先给模型一条说明（它通常会改做法），只有它继续
+  # 打转才结束这一轮。
+  guard:
+    enable: true
+    repeat_nudge: 3        # 同一个工具+同一份参数重复几次开始提醒
+    repeat_stop: 5         # 重复几次结束这一轮（只对只读调用生效）
+    idle_nudge_steps: 25   # 连续多少步没有任何改动开始提醒
+    idle_stop_steps: 75    # 连续多少步没有改动结束这一轮（会先提醒过）
+    max_steers: 6          # 一轮最多注入多少条提醒
+
   # ask_user 的交互卡片等多久算超时（秒）；0 = 默认 600。
   # 等待发生在这一轮之内，所以要明显小于 turn_deadline_seconds，否则等到答案时
   # 这一轮已经没有预算继续了。超时不算失败：模型收到「用户没有回答」后自行收口。
@@ -352,16 +378,28 @@ run:
   max_steps: 0             # 0 = 继承 chat.max_steps，让两种跑法的上限不会各自漂移
   default_output: "text"   # text = stdout 上只有答案；json = 一个对象
 
-# 长任务（几十步、十几分钟）：这四个开关要一起调，别只调 max_steps ——
+# 长任务（几十步、十几分钟）：这几个开关要一起调，别只调 max_steps ——
 # 只把步数调大的结果是每一步都重发整段历史，token 成本近似平方增长，
-# 最后撞模型上下文上限报错；context.max_tokens 才是让它跑完的那一半。
+# 最后撞模型上下文上限报错；循环内压缩才是让它跑完的那一半（默认已开启）。
 #
 #   chat:
 #     max_steps: 60
 #     turn_max_tokens: 6000000      # 这一轮最多烧多少 token（压缩开启后按 1~2M/60 步估）
 #     turn_deadline_seconds: 3600   # 这一轮最多跑多久
+#     guard:                        # 只读不改 / 反复重放时先提醒、必要时收手
+#       enable: true
+#       repeat_nudge: 3             # 同一个只读调用重复几次开始提醒
+#       repeat_stop: 5              # 重复几次收手（0/负值会被抬到 nudge+1）
+#       idle_nudge_steps: 25        # 连续多少步没有任何改动开始提醒
+#       idle_stop_steps: 75         # 连续多少步没有改动收手（低于 nudge 时按 nudge×3 计）
+#       reread_nudge: 5             # 同一个文件「同一种读法」读几次开始提醒
+#       max_steers: 6               # 一轮最多注入多少条提醒
 #   context:
-#     max_tokens: 60000             # 循环内窗口上限，建议取模型窗口的 60%~70%
+#     max_tokens: 0                 # 0 = 按模型窗口自动（>0 写死，<0 关闭压缩）
+#     window_ratio: 0.7             # 自动模式下历史可占窗口的比例
+#     reserve_output_tokens: 8192   # 留给模型输出的空间
+#     tool_result_max_chars: 16000  # 单条工具结果进入上下文的上限（负值 = 不限）
+#     model_windows: {}             # 按模型 id 子串覆盖窗口，例如 { deepseek: 65536 }
 #     keep_recent: 12               # 最近几步逐字保留，更早的折叠成摘要
 #     summarize: true
 #   tools:

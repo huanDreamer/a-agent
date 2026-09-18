@@ -118,7 +118,15 @@ type Config struct {
 	// Nil means the history is sent whole, which is only safe for short turns:
 	// every step resends everything the turn has accumulated so far.
 	Condenser Condenser
-	Logger    *zap.Logger
+	// Guard bounds the two ways a turn wastes itself without failing: repeating
+	// one call, and never acting on what it read. The zero value is "on, with
+	// the defaults"; GuardConfig.Disable is how a deployment turns it off.
+	Guard GuardConfig
+	// ToolResultMaxChars bounds one tool result as the model sees it. 0 uses the
+	// built-in default; negative leaves it unbounded. The stored and displayed
+	// result is never truncated — this is the copy replayed on every later step.
+	ToolResultMaxChars int
+	Logger             *zap.Logger
 }
 
 // Runner drives a streaming tool-calling conversation.
@@ -133,6 +141,8 @@ type Runner struct {
 	deadline    time.Duration
 	stepRetry   retry.Policy
 	condenser   Condenser
+	guard       GuardConfig
+	toolResult  int
 	logger      *zap.Logger
 }
 
@@ -175,6 +185,8 @@ func New(cfg Config) (*Runner, error) {
 		deadline:    cfg.Deadline,
 		stepRetry:   cfg.StepRetry,
 		condenser:   cfg.Condenser,
+		guard:       cfg.Guard,
+		toolResult:  resolvedToolResultCap(cfg.ToolResultMaxChars),
 		logger:      logger,
 	}, nil
 }
@@ -320,6 +332,11 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		}
 	}
 
+	// The guard and the ledger are per turn: their whole value is that they
+	// accumulate inside it, and a runner is reused across turns and sessions.
+	progress := newTurnProgress(r.guard)
+	ledger := newTurnLedger(goalText(req.Messages))
+
 	history := append([]*schema.Message(nil), req.Messages...)
 	// The head is computed once, from the window the caller sent: those are the
 	// rules of the turn (the system prompt and whatever it prepended to it).
@@ -353,14 +370,26 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		// another model call, not after: the point of a budget is to stop before
 		// the money is spent, and a step that ran is already paid for.
 		if reason := budget.expired(started, res); reason != "" {
-			return r.stopOnBudget(req, res, emit, history, reason, budget, started)
+			return r.stopOnBudget(req, res, emit, history, stopInfo{Reason: reason}, budget, started)
 		}
 		// Bound the window before the model sees it. Every step adds an assistant
 		// message and its tool results, so an unbounded loop resends a growing
 		// history: the cost per step rises while the answer is still being
 		// worked out, which is what turns "a long task" into a context-limit
 		// error twenty steps in.
-		history = r.condense(ctx, res, emit, history, head)
+		// The ledger goes back in after every compression: the summary keeps what
+		// happened, and what a long turn re-derives — and pays for twice — is what
+		// was already settled.
+		//
+		// The assignment is deliberately not a :=: inside the loop body that would
+		// declare a second history local to the body, and every message appended
+		// below would be discarded at the end of each iteration — the model would
+		// never see its own tool results.
+		var folded bool
+		history, folded = r.condense(ctx, req, res, emit, history, head)
+		if folded {
+			history = withLedger(history, head, ledger.render())
+		}
 
 		res.Steps = step
 		emit(Event{Type: EventStepStart, Step: step})
@@ -421,10 +450,35 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 			calls = append(calls, run)
 			history = append(history, &schema.Message{
 				Role:       schema.Tool,
-				Content:    toolResultContent(run),
+				Content:    capToolResult(toolResultContent(run), r.toolResult),
 				ToolCallID: msg.ToolCalls[i].ID,
 				ToolName:   msg.ToolCalls[i].Function.Name,
 			})
+		}
+
+		ledger.observe(runs)
+
+		// The guard runs after the tools, before the next model call: it is the
+		// last thing that knows what this step did, and the message it writes is
+		// what the next step reads.
+		if s := progress.observe(reg, runs); !s.empty() {
+			if s.Kind != "" {
+				emit(Event{
+					Type: EventSteer, Step: step, SteerKind: s.Kind,
+					SteerStop: s.StopReason, Text: s.Text,
+				})
+			}
+			if s.StopReason != "" {
+				return r.stopOnBudget(req, res, emit, history, stopInfo{Reason: s.StopReason, Detail: s.Detail}, budget, started)
+			}
+			// A system message, not a user one, for two reasons. It is not the
+			// user speaking — a model that reads it as a new instruction from the
+			// person is being misled about who asked for what. And the condenser
+			// pins the most recent *user* message on every pass, so a steering
+			// message in that role would evict the actual request from the pinned
+			// slot. Mid-window system messages are already how the compressor
+			// inserts its summary, so this is the established shape.
+			history = append(history, &schema.Message{Role: schema.System, Content: s.Text})
 		}
 		res.Plan = append(res.Plan, Step{
 			Index:     step,
@@ -436,7 +490,7 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 
 	// The step budget is exhausted: the loop's own bound is the check, so
 	// reaching here means the model asked for another tool call at the cap.
-	return r.stopOnBudget(req, res, emit, history, StopSteps, budget, started)
+	return r.stopOnBudget(req, res, emit, history, stopInfo{Reason: StopSteps}, budget, started)
 }
 
 // stopOnBudget ends the turn with what it has, plus a reason the caller and the
@@ -449,14 +503,14 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 // that only shows up as a sentence inside the answer cannot be counted,
 // alerted on, or seen again after a page reload.
 func (r *Runner) stopOnBudget(req Request, res *Result, emit Emitter,
-	history []*schema.Message, reason string, budget turnBudget, started time.Time) (*Result, error) {
+	history []*schema.Message, info stopInfo, budget turnBudget, started time.Time) (*Result, error) {
 
 	elapsed := time.Since(started)
-	res.StopReason = reason
-	res.Text = stopText(history, reason, budget, res, elapsed)
+	res.StopReason = info.Reason
+	res.Text = stopText(history, info, budget, res, elapsed)
 
-	r.logger.Warn("chat: turn stopped on its budget",
-		zap.String("reason", reason),
+	r.logger.Warn("chat: turn stopped short of an answer",
+		zap.String("reason", info.Reason),
 		zap.Int("steps", res.Steps),
 		zap.Int("tokens", res.Usage.TotalTokens),
 		zap.Duration("elapsed", elapsed),
@@ -467,7 +521,7 @@ func (r *Runner) stopOnBudget(req Request, res *Result, emit Emitter,
 	emit(Event{
 		Type:      EventBudgetStop,
 		Step:      res.Steps,
-		Reason:    reason,
+		Reason:    info.Reason,
 		Tokens:    res.Usage.TotalTokens,
 		ElapsedMs: elapsed.Milliseconds(),
 		Text:      res.Text,
@@ -487,9 +541,14 @@ func (r *Runner) stopOnBudget(req Request, res *Result, emit Emitter,
 // A failure to condense is not a failure of the turn: the model call may still
 // succeed with a bigger window, and aborting a long task over a summary call
 // would be the wrong trade.
-func (r *Runner) condense(ctx context.Context, res *Result, emit Emitter, history []*schema.Message, head int) []*schema.Message {
+//
+// The session log is the record of it. A compression is how a long turn is run,
+// not something the reader has to act on, so the web chat page renders nothing
+// for the event — which makes this line the only place the window size of a
+// turn can be read back afterwards, hence the session id on it.
+func (r *Runner) condense(ctx context.Context, req Request, res *Result, emit Emitter, history []*schema.Message, head int) ([]*schema.Message, bool) {
 	if r.condenser == nil {
-		return history
+		return history, false
 	}
 	before := len(history)
 
@@ -497,10 +556,10 @@ func (r *Runner) condense(ctx context.Context, res *Result, emit Emitter, histor
 	if err != nil {
 		r.logger.Warn("chat: condensing the history failed; sending it whole",
 			zap.Int("step", res.Steps+1), zap.Int("messages", before), zap.Error(err))
-		return history
+		return history, false
 	}
 	if len(out) == before && summary == "" {
-		return history
+		return history, false
 	}
 
 	r.logger.Info("chat: condensed the in-loop history",
@@ -508,14 +567,15 @@ func (r *Runner) condense(ctx context.Context, res *Result, emit Emitter, histor
 		zap.Int("messages_before", before),
 		zap.Int("messages_after", len(out)),
 		zap.Int("tokens_so_far", res.Usage.TotalTokens),
+		zap.String("session", req.SessionID),
 	)
 	emit(Event{
 		Type:   EventContextCompressed,
 		Step:   res.Steps + 1,
 		Tokens: res.Usage.TotalTokens,
-		Text:   fmt.Sprintf("上下文已压缩：%d 条消息 → %d 条（保留系统提示与本轮目标）", before, len(out)),
+		Text:   fmt.Sprintf("上下文已压缩：%d 条消息 → %d 条（保留系统提示、本轮目标与本轮台账）", before, len(out)),
 	})
-	return out
+	return out, true
 }
 
 // streamStep performs one step's model call, retrying it while the failure looks

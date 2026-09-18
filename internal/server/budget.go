@@ -140,6 +140,11 @@ type consoleBudget struct {
 	HasOverride       bool   `json:"has_override"`
 	RestartForContext bool   `json:"context_requires_restart"`
 	ContextMaxTokens  int    `json:"context_max_tokens"`
+	// ContextAuto and ContextModel explain where ContextMaxTokens came from: a
+	// cap derived from the model's window is not a number anyone typed, and the
+	// panel has to say so or the operator goes looking for it in config.yaml.
+	ContextAuto  bool   `json:"context_auto"`
+	ContextModel string `json:"context_model"`
 }
 
 // snapshotBudget renders the effective budget plus its defaults and limits.
@@ -180,11 +185,14 @@ func (s *Server) snapshotBudget(ctx context.Context) consoleBudget {
 	out.HasOverride = out.SourceMaxSteps == budgetFromConsole ||
 		out.SourceMaxTokens == budgetFromConsole ||
 		out.SourceDeadline == budgetFromConsole
-	// The in-turn condenser is built once, from context.max_tokens at startup.
-	// Raising the step cap without it is the combination that turns a long task
-	// into a context-limit error, so the panel says so instead of letting the
-	// operator find out twenty steps in.
+	// The in-turn condensation budget, resolved at startup from context.* and the
+	// default model's window (see turnCondenser). Raising the step cap with
+	// compression off is the combination that turns a long task into a
+	// context-limit error, so the panel says so instead of letting the operator
+	// find out twenty steps in.
 	out.ContextMaxTokens = s.cfg.ContextMaxTokens
+	out.ContextAuto = s.cfg.ContextAuto
+	out.ContextModel = s.cfg.ContextModel
 	out.RestartForContext = s.cfg.ContextMaxTokens <= 0
 	return out
 }

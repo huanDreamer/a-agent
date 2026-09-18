@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"go.uber.org/zap"
@@ -131,6 +132,16 @@ type turnAsker struct {
 	hub     *questionHub
 	session string
 	timeout time.Duration
+	// answered remembers the questions this turn already put to the user, keyed
+	// by the question itself, so asking the same thing twice hands back the
+	// answer instead of asking again.
+	//
+	// It is per turn (built in turns.go, once per run): the same question in a
+	// later turn is a
+	// new conversation about a new task, and answering it from an old reply would
+	// be answering something the user has not been asked.
+	mu       sync.Mutex
+	answered map[string]tool.Answer
 	// emit writes onto the turn's event channel. It is the same channel the
 	// runner reports tool calls on, which is what makes the card appear in the
 	// conversation at the moment the model asks rather than after it finishes.
@@ -150,6 +161,20 @@ func (a *turnAsker) Ask(ctx context.Context, q tool.Question) (tool.Answer, erro
 	// and taking the process down from inside a tool call.
 	if a.hub == nil {
 		return tool.Answer{}, errors.New("server: question registry is not initialized")
+	}
+	// A question this turn already got an answer to is not asked again. The
+	// failure it prevents is a model that lost the answer to a compaction (or
+	// simply forgot) and interrupts the user a second time with the same
+	// decision: the person has already decided, and the useful reply is the
+	// decision, not another card.
+	if prev, ok := a.recall(q); ok {
+		if a.logger != nil {
+			a.logger.Info("chat: repeated question answered with this turn's earlier answer",
+				zap.String("session", a.session),
+				zap.String("question", truncateForLog(q.Text, 80)),
+			)
+		}
+		return prev, nil
 	}
 	id, err := newQuestionID()
 	if err != nil {
@@ -190,6 +215,10 @@ func (a *turnAsker) Ask(ctx context.Context, q tool.Question) (tool.Answer, erro
 		AskStatus: string(answer.Status),
 		AskAnswer: answeredOnly(answer),
 	})
+
+	if answer.Answered() {
+		a.remember(q, answer)
+	}
 
 	waited := time.Since(pending.askedAt)
 	if a.logger != nil {
@@ -349,4 +378,71 @@ func unknownOption(selected []string, options []tool.Option) string {
 		}
 	}
 	return ""
+}
+
+// askKey identifies a question by what was asked, ignoring the whitespace and
+// punctuation a model varies between two spellings of the same question.
+func askKey(q tool.Question) string {
+	var b strings.Builder
+	for _, r := range q.Text {
+		if unicode.IsSpace(r) || strings.ContainsRune("，。！？；：、,.!?;:\"'（）()【】[]", r) {
+			continue
+		}
+		b.WriteRune(unicode.ToLower(r))
+	}
+	labels := make([]string, 0, len(q.Options))
+	for _, o := range q.Options {
+		labels = append(labels, o.Label)
+	}
+	// The options are part of the identity: "which database?" with Postgres vs
+	// MySQL offered is a different decision from the same sentence with two other
+	// choices, and reusing the first answer for it would be wrong. So is the
+	// cardinality — the same sentence asked as a multiple-choice question after
+	// being asked as a single-choice one is a different question, and handing back
+	// a multi-selection as a single answer would misreport what the user chose.
+	shape := "single"
+	if q.MultiSelect {
+		shape = "multi"
+	}
+	return b.String() + "\x00" + shape + "\x00" + strings.Join(labels, "|")
+}
+
+// recall returns the answer this turn already gave for a question.
+func (a *turnAsker) recall(q tool.Question) (tool.Answer, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.answered) == 0 {
+		return tool.Answer{}, false
+	}
+	prev, ok := a.answered[askKey(q)]
+	if !ok {
+		return tool.Answer{}, false
+	}
+	prev.Note = "这个问题本轮已经问过，用户也已经回答过：答案就是上面这个，请直接按它继续，不要再问一遍"
+	return prev, true
+}
+
+// remember records an answer so a repeat of the same question can be answered
+// from it. A timeout is deliberately not remembered: nobody decided anything,
+// and asking again later in the turn is a legitimate second attempt.
+func (a *turnAsker) remember(q tool.Question, answer tool.Answer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.answered == nil {
+		a.answered = make(map[string]tool.Answer, 4)
+	}
+	// Bound the map: a turn that asks more than this many distinct questions has
+	// a different problem, and every entry is a small struct.
+	if len(a.answered) >= 16 {
+		return
+	}
+	a.answered[askKey(q)] = answer
+}
+
+// truncateForLog bounds a question in a log line.
+func truncateForLog(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }

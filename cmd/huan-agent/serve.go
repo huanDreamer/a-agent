@@ -251,7 +251,7 @@ func (h *botHandler) session(uid string) *botSession {
 		return s
 	}
 	sid := uuid.NewString()
-	mem, err := newSessionMemory(h.cfg, h.cm, h.systemPrompt(), sid, h.logger, h.memStore)
+	mem, err := newSessionMemory(h.cfg, h.cm, h.systemPrompt(), sid, h.logger, h.memStore, adminDisplayModel(h.cfg))
 	if err != nil {
 		h.logger.Error("new session memory", zap.Error(err))
 		mem = nil
@@ -748,23 +748,27 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		}
 		defer tooling.close()
 
-		condenser, cErr := turnCondenser(cfg, cm, logger)
+		// The bot answers on the deployment's default model, so its window is the
+		// one to resolve.
+		condenser, cErr := turnCondenser(cfg, cm, logger, adminDisplayModel(cfg))
 		if cErr != nil {
 			// Not fatal: the bot keeps answering, with a window that grows with
 			// the turn instead of being condensed.
 			logger.Warn("feishu: in-turn context compression disabled", zap.Error(cErr))
 		}
 		runner, rerr := chat.New(chat.Config{
-			Model:       cm,
-			Tools:       tooling.base,
-			ToolsFor:    tooling.bindings.forScope,
-			MaxSteps:    cfg.Chat.MaxSteps,
-			MaxParallel: cfg.Tools.MaxParallelOr(),
-			MaxTokens:   cfg.Chat.TurnMaxTokens,
-			Deadline:    cfg.Chat.TurnDeadline(),
-			StepRetry:   cfg.Chat.StepRetryPolicy(),
-			Condenser:   condenser,
-			Logger:      logger,
+			Model:              cm,
+			Tools:              tooling.base,
+			ToolsFor:           tooling.bindings.forScope,
+			MaxSteps:           cfg.Chat.MaxSteps,
+			MaxParallel:        cfg.Tools.MaxParallelOr(),
+			MaxTokens:          cfg.Chat.TurnMaxTokens,
+			Deadline:           cfg.Chat.TurnDeadline(),
+			StepRetry:          cfg.Chat.StepRetryPolicy(),
+			Condenser:          condenser,
+			Guard:              chatGuardFor(cfg),
+			ToolResultMaxChars: toolResultCapFor(cfg),
+			Logger:             logger,
 		})
 		if rerr != nil {
 			return fmt.Errorf("feishu agent runner: %w", rerr)

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -96,15 +97,30 @@ func DefaultEstimator(msgs []*schema.Message) int {
 }
 
 // Budget is the concrete compression manager.
+//
+// A Manager is safe for concurrent use and holds no per-call state. That is not
+// decoration: one manager is shared by every conversation running on the same
+// model (the web console builds a runner — and with it a condenser — per
+// (provider, model)), so two browser sessions can compress at the same instant.
+// Anything remembered between calls would be a data race and, worse, a leak of
+// one conversation's behaviour into another's.
 type Manager struct {
-	budget    Budget
-	estimate  Estimator
-	lastState state
-	logOnce   func(string)
+	budget   Budget
+	estimate Estimator
+	// logged fires the one-shot "compression is happening" line, at most once
+	// per manager and safely from several goroutines.
+	logged  sync.Once
+	logOnce func(string)
 }
 
-type state struct {
-	compressed bool
+// budgetOr returns the budget with its zero values resolved, without touching
+// the receiver.
+func (m *Manager) budgetOr() Budget {
+	b := m.budget
+	if b.KeepRecent <= 0 {
+		b.KeepRecent = 1 // always keep at least the latest turn
+	}
+	return b
 }
 
 // NewManager builds a context manager. summarizer may be nil (fall back to a
@@ -205,9 +221,10 @@ func (m *Manager) CompressWith(ctx context.Context, msgs []*schema.Message, pin 
 	if !m.ShouldCompress(msgs) {
 		return msgs, "", nil
 	}
-	if m.budget.KeepRecent <= 0 {
-		m.budget.KeepRecent = 1 // always keep at least the latest turn
-	}
+	// A local copy rather than a fix-up of the receiver: the manager is shared
+	// across conversations, and writing to it here raced with every other
+	// conversation compressing at the same time.
+	budget := m.budgetOr()
 
 	head := pin.Head
 	if head < 0 {
@@ -217,13 +234,13 @@ func (m *Manager) CompressWith(ctx context.Context, msgs []*schema.Message, pin 
 		head = len(msgs)
 	}
 	rest := msgs[head:]
-	if m.budget.KeepRecent >= len(rest) {
+	if budget.KeepRecent >= len(rest) {
 		// Nothing worth dropping; return unchanged to avoid an empty window.
 		return msgs, "", nil
 	}
 
-	keep := rest[len(rest)-m.budget.KeepRecent:]
-	middle := rest[:len(rest)-m.budget.KeepRecent]
+	keep := rest[len(rest)-budget.KeepRecent:]
+	middle := rest[:len(rest)-budget.KeepRecent]
 
 	// The split above is a plain slice boundary, and it can land in the middle
 	// of a tool exchange: the assistant message that carried tool_calls falls
@@ -261,8 +278,8 @@ func (m *Manager) CompressWith(ctx context.Context, msgs []*schema.Message, pin 
 	// message that summarizes nothing is noise in the window.
 	var summary string
 	if len(middle) > 0 {
-		if m.budget.Summarizer != nil {
-			s, err := m.budget.Summarizer.Summarize(ctx, middle)
+		if budget.Summarizer != nil {
+			s, err := budget.Summarizer.Summarize(ctx, middle)
 			if err != nil {
 				// Fall back to a placeholder so compression still bounds the window.
 				summary = fmt.Sprintf("(Previous context summarized but summarization failed: %v)", err)
@@ -274,11 +291,12 @@ func (m *Manager) CompressWith(ctx context.Context, msgs []*schema.Message, pin 
 		}
 	}
 
-	if m.logOnce != nil && !m.lastState.compressed {
-		m.logOnce(fmt.Sprintf("context compressed: %d older messages rolled into a summary (%d pinned)",
-			len(middle), head+pinnedCount(pinned)))
+	if m.logOnce != nil {
+		m.logged.Do(func() {
+			m.logOnce(fmt.Sprintf("context compressed: %d older messages rolled into a summary (%d pinned)",
+				len(middle), head+pinnedCount(pinned)))
+		})
 	}
-	m.lastState.compressed = true
 
 	out := make([]*schema.Message, 0, head+2+len(keep))
 	out = append(out, msgs[:head]...)

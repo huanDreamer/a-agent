@@ -1570,9 +1570,9 @@ table.data tbody tr.selected {
   color: var(--warning-soft);
 }
 
-/* 上下文已压缩: a quiet fact about the turn, listed above its footer. Deliberately
-   not a banner — the turn carried on normally, and a banner would read as a
-   failure. */
+/* 这一轮的说明行，列在 footer 上方（目前只有步骤级重试）。Deliberately not a
+   banner — the turn carried on normally, and a banner would read as a failure。
+   上下文压缩也用过这份列表，现在只在会话日志里留痕，不再占页面。 */
 .turn-notices {
   list-style: none;
   margin: 8px 0 0;
@@ -1601,6 +1601,12 @@ table.data tbody tr.selected {
    图标用，小字正文在气泡底色上不保证对比度。 */
 .turn-notices li.note-retry {
   color: var(--warning);
+}
+
+/* 循环保护的提醒：既不是失败也不是重试，只是"这一轮怎么跑"的一条说明。它跟随
+   列表本身的次要色，只靠图标和文案区别于重试（重试是 warning 色）。 */
+.turn-notices li.note-steer {
+  color: var(--muted-foreground);
 }
 
 /* ------------------------------------------------------- turn steps -- */

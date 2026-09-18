@@ -70,6 +70,15 @@ type Answer struct {
 	Status   AnswerStatus `json:"status"`
 	Selected []string     `json:"selected,omitempty"`
 	Text     string       `json:"text,omitempty"`
+	// Note is the Asker's own remark about this answer, carried through to the
+	// model next to it.
+	//
+	// It exists because not every answer was asked: a surface may recognize a
+	// question it has already put to this person in this turn and hand back the
+	// answer they already gave rather than interrupting them a second time. The
+	// model then has to be told that it is looking at an earlier answer, or it
+	// will read a reply to a question it did not ask as a fresh one.
+	Note string `json:"note,omitempty"`
 }
 
 // Answered reports whether a person actually answered. A timeout and a

@@ -51,7 +51,8 @@ func planCreateDescription() string {
 		"需要多步、多次工具调用或改动多个文件的任务，动手之前先调用它：goal 用一句话写清最后要交付什么，tasks 拆成 3-10 条能独立完成、能判断做完没做完的条目（按执行顺序）。" +
 		"一步就能答完的问题、闲聊、纯问答不要调用它。" +
 		"计划建立之后，每完成一条就立刻用 plan_update 把它标成 done 并写上结果；不要等到全部做完再一次性补记。" +
-		"任务 id 由系统分配，请使用返回的 checklist 里的真实 id，不要自己编。"
+		"任务 id 由系统分配，请使用返回的 checklist 里的真实 id，不要自己编。" +
+		"已经有计划而且已经开工（有任务标成 done / in_progress）时不要再用它：那会覆盖并丢掉已完成的进度，改用 plan_add 追加、plan_update 调整。"
 }
 
 func planAddDescription() string {
@@ -82,6 +83,15 @@ type PlanTaskInput struct {
 type PlanCreateInput struct {
 	Goal  string          `json:"goal" jsonschema:"description=这次任务的总体目标：一句话，从用户的角度说清最后要交付什么,required"`
 	Tasks []PlanTaskInput `json:"tasks" jsonschema:"description=任务清单，3-10 条，按执行顺序排列；每条都应是能独立判断完成与否的动作,required"`
+	// ReplaceProgress is how a model says "yes, throw the current plan away".
+	//
+	// It exists because plan_create replaces the plan wholesale, and a model that
+	// has lost track (a compressed window is the usual reason) used to wipe a
+	// half-finished plan without noticing: 已完成 1/7 became 已完成 0/10, and the
+	// work that was already done had to be done again. With this flag the discard
+	// is a decision the model has to make on purpose, and the refusal it gets
+	// otherwise names the plan it was about to overwrite.
+	ReplaceProgress bool `json:"replace_progress,omitempty" jsonschema:"description=仅当确实要放弃当前计划的全部进度、重开一份计划时才设为 true。默认 false：当前计划还有已完成/进行中的任务时，plan_create 会被拒绝并提示改用 plan_add / plan_update"`
 }
 
 // PlanAddInput is the parameter schema for plan_add.
@@ -177,12 +187,60 @@ func planCreate(ctx context.Context, in PlanCreateInput) (PlanOutput, error) {
 	if err != nil {
 		return PlanOutput{}, err
 	}
+
+	// Refuse to throw away work unless the model says so. The check is here, in
+	// the tool, rather than in the planner: it is a rule about what plan_create
+	// means to a model, and the planner is also written to by plan_add and
+	// plan_update, which must keep working.
+	if !in.ReplaceProgress {
+		if current, ok, err := p.Current(ctx); err != nil {
+			return PlanOutput{}, err
+		} else if ok && hasProgress(current) {
+			return PlanOutput{}, fmt.Errorf(
+				"当前计划已经开工（%s，进行中：%s），plan_create 会把它整份覆盖掉："+
+					"要继续这份计划就用 plan_add 追加新任务、用 plan_update 调整某一条；"+
+					"如果确实要放弃已完成的进度重新立计划，把 replace_progress 设为 true 再调一次",
+				current.Summary(), unfinishedTitles(current))
+		}
+	}
+
 	plan, err := p.Replace(ctx, tool.Plan{Goal: goal, Tasks: tasks})
 	if err != nil {
 		return PlanOutput{}, err
 	}
 	return planOutput("created", plan,
 		"计划已建立。开始第一条时用 plan_update 把它标成 in_progress。"), nil
+}
+
+// hasProgress reports whether a plan has anything worth protecting: a task that
+// is done, in progress, or failed. A plan whose tasks are all still pending is
+// just a list, and replacing it costs nothing.
+func hasProgress(p tool.Plan) bool {
+	for _, t := range p.Tasks {
+		switch t.Status {
+		case tool.TaskDone, tool.TaskInProgress, tool.TaskFailed:
+			return true
+		}
+	}
+	return false
+}
+
+// unfinishedTitles names the open work, for the refusal.
+func unfinishedTitles(p tool.Plan) string {
+	out := make([]string, 0, len(p.Tasks))
+	for _, t := range p.Tasks {
+		if t.Status == tool.TaskDone || t.Status == tool.TaskSkipped {
+			continue
+		}
+		out = append(out, t.Title)
+	}
+	if len(out) == 0 {
+		return "（无）"
+	}
+	if len(out) > 3 {
+		out = append(out[:3], "…")
+	}
+	return strings.Join(out, "、")
 }
 
 // planAdd appends tasks to the plan that exists.

@@ -8,6 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/viper"
+
+	"github.com/huan/huan-agent/internal/chat"
+	"github.com/huan/huan-agent/internal/context"
 	"github.com/huan/huan-agent/internal/retry"
 )
 
@@ -1022,5 +1026,145 @@ func TestLoad_RetryAndPlanDefaultsAreOn(t *testing.T) {
 	}
 	if got := c.Chat.Plan.MaxTasksOr(); got != DefaultPlanMaxTasks {
 		t.Errorf("plan max tasks = %d, want %d", got, DefaultPlanMaxTasks)
+	}
+}
+
+// TestContextWindowSpecFor: the three ways of saying "how big is the window"
+// have to travel together, or the caller that resolved the cap itself ignores
+// the ratio, the reserve and the per-model overrides.
+func TestContextWindowSpecFor(t *testing.T) {
+	c := ContextConfig{
+		MaxTokens:           0,
+		WindowRatio:         0.5,
+		ReserveOutputTokens: 1024,
+		DefaultWindow:       65536,
+		ModelWindows:        map[string]int{"deepseek": 32768},
+	}
+	spec := c.WindowSpecFor()
+	if spec.MaxTokens != 0 || spec.Ratio != 0.5 || spec.Reserve != 1024 || spec.Default != 65536 {
+		t.Fatalf("spec = %+v", spec)
+	}
+	got := spec.Resolve("deepseek/deepseek-v4.1-flash")
+	if got.Tokens != 32768 {
+		t.Errorf("window = %d, want the override 32768", got.Tokens)
+	}
+	if want := int(32768*0.5) - 1024; got.Cap != want {
+		t.Errorf("cap = %d, want %d", got.Cap, want)
+	}
+	if got.Source != context.WindowSourceConfig {
+		t.Errorf("source = %q, want %q", got.Source, context.WindowSourceConfig)
+	}
+
+	// A fixed value wins over everything, and a negative one switches
+	// compression off — the two escape hatches a deployment needs.
+	fixed := ContextConfig{MaxTokens: 60000, WindowRatio: 0.5, ModelWindows: map[string]int{"deepseek": 1}}
+	if got := fixed.WindowSpecFor().Resolve("deepseek/x"); got.Cap != 60000 {
+		t.Errorf("a fixed max_tokens was overridden: %+v", got)
+	}
+	off := ContextConfig{MaxTokens: -1}
+	if got := off.WindowSpecFor().Resolve("claude-sonnet-4"); got.Cap != 0 {
+		t.Errorf("a negative max_tokens must disable compression: %+v", got)
+	}
+	if got := (ContextConfig{MaxTokens: -1}).FixedCap(); got != 0 {
+		t.Errorf("FixedCap(-1) = %d, want 0 (the memory window stays uncompressed)", got)
+	}
+	if got := (ContextConfig{MaxTokens: 1234}).FixedCap(); got != 1234 {
+		t.Errorf("FixedCap(1234) = %d", got)
+	}
+	if got := (ContextConfig{}).FixedCap(); got != 0 {
+		t.Errorf("FixedCap(auto) = %d, want 0: the caller has no model to resolve against", got)
+	}
+}
+
+// TestSetDefaultsCoversTheContextBlock guards a trap in how this config is
+// loaded: a config file that has a `context:` section at all replaces the whole
+// struct, so a key the file omits keeps whatever the viper default says — and a
+// keep_recent of 0 compresses a long turn down to a single kept message.
+func TestSetDefaultsCoversTheContextBlock(t *testing.T) {
+	v := viper.New()
+	SetDefaults(v)
+	for _, key := range []string{
+		"context.max_tokens",
+		"context.keep_recent",
+		"context.summarize",
+		"context.window_ratio",
+		"context.reserve_output_tokens",
+		"context.default_window",
+		"context.tool_result_max_chars",
+		"chat.guard.enable",
+		"chat.guard.repeat_nudge",
+		"chat.guard.repeat_stop",
+		"chat.guard.idle_nudge_steps",
+		"chat.guard.idle_stop_steps",
+		"chat.guard.max_steers",
+		"chat.guard.reread_nudge",
+	} {
+		if !v.IsSet(key) {
+			t.Errorf("%s has no default: a config file that omits it silently gets zero", key)
+		}
+	}
+	if got := v.GetInt("context.tool_result_max_chars"); got != context.DefaultToolResultMaxChars {
+		t.Errorf("context.tool_result_max_chars = %d, want %d", got, context.DefaultToolResultMaxChars)
+	}
+	if got := v.GetFloat64("context.window_ratio"); got != context.DefaultWindowRatio {
+		t.Errorf("context.window_ratio = %v, want %v", got, context.DefaultWindowRatio)
+	}
+	if got := v.GetInt("context.default_window"); got != context.DefaultModelWindow {
+		t.Errorf("context.default_window = %d, want %d", got, context.DefaultModelWindow)
+	}
+	if got := v.GetInt("context.reserve_output_tokens"); got != context.DefaultReserveOutputTokens {
+		t.Errorf("context.reserve_output_tokens = %d, want %d", got, context.DefaultReserveOutputTokens)
+	}
+	if !v.GetBool("chat.guard.enable") {
+		t.Error("the loop guard is off by default, which is the failure it exists to catch")
+	}
+}
+
+// TestGuardDefaultsAreOrdered: a stop the model was never warned about is a
+// guard firing rather than one that works.
+func TestGuardDefaultsAreOrdered(t *testing.T) {
+	c := Default().Chat.Guard
+	if c.RereadNudge != DefaultGuardRereadNudge {
+		t.Errorf("reread_nudge = %d, want %d", c.RereadNudge, DefaultGuardRereadNudge)
+	}
+	if !c.Enable {
+		t.Error("guard.enable defaults to false")
+	}
+	if c.RepeatStop <= c.RepeatNudge {
+		t.Errorf("repeat_stop %d <= repeat_nudge %d", c.RepeatStop, c.RepeatNudge)
+	}
+	if c.IdleStopSteps <= c.IdleNudgeSteps {
+		t.Errorf("idle_stop_steps %d <= idle_nudge_steps %d", c.IdleStopSteps, c.IdleNudgeSteps)
+	}
+	if c.MaxSteers <= 0 {
+		t.Errorf("max_steers = %d", c.MaxSteers)
+	}
+}
+
+// TestGuardDefaultsMatchTheRunner: the numbers exist twice because neither side
+// may import the other, and a drift would mean the config describing a guard the
+// runner does not implement — or worse, a console that reports thresholds that
+// are not the ones in force.
+func TestGuardDefaultsMatchTheRunner(t *testing.T) {
+	cases := []struct {
+		config int
+		runner int
+		name   string
+	}{
+		{DefaultGuardRepeatNudge, chat.DefaultRepeatNudge, "repeat_nudge"},
+		{DefaultGuardRepeatStop, chat.DefaultRepeatStop, "repeat_stop"},
+		{DefaultGuardIdleNudgeSteps, chat.DefaultIdleNudgeSteps, "idle_nudge_steps"},
+		{DefaultGuardIdleStopSteps, chat.DefaultIdleStopSteps, "idle_stop_steps"},
+		{DefaultGuardMaxSteers, chat.DefaultMaxSteers, "max_steers"},
+		{DefaultGuardRereadNudge, chat.DefaultRereadNudge, "reread_nudge"},
+	}
+	for _, tc := range cases {
+		if tc.config != tc.runner {
+			t.Errorf("guard %s: config says %d, the runner says %d", tc.name, tc.config, tc.runner)
+		}
+	}
+	if DefaultToolResultMaxChars() != context.DefaultToolResultMaxChars {
+		t.Errorf("tool result cap: config %d, context %d",
+			DefaultToolResultMaxChars(), context.DefaultToolResultMaxChars)
 	}
 }
