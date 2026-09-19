@@ -132,6 +132,13 @@ func (s *Server) handleProbeModelFacts(ctx context.Context, c *app.RequestContex
 		}
 	}
 
+	// A probe can change a window, and a window is read when a Runner is built —
+	// so the cache has to go, or the change waits for a restart. See the same
+	// reset in handleUpsertModel.
+	if answered > 0 {
+		s.runnerCache.reset()
+	}
+
 	// Read back so the caller can render the result without a second request.
 	after, err := s.store.ListModels(ctx, providerID)
 	if err != nil {

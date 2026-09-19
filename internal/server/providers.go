@@ -555,6 +555,13 @@ func (s *Server) handleUpsertModel(ctx context.Context, c *app.RequestContext) {
 			return
 		}
 	}
+	// A model's window and capabilities are read when a Runner is built for it,
+	// and Runners are cached per (provider, model) — so a write here has to drop
+	// the cached one, or the conversation that is already open keeps compressing
+	// to the window it was built with until the process restarts. The panel that
+	// changes the per-turn budget resets the same cache for the same reason.
+	s.runnerCache.reset()
+
 	saved, err := s.store.GetModel(ctx, providerID, modelID)
 	if err != nil {
 		s.fail(c, "read back model", err)

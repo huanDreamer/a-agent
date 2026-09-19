@@ -81,6 +81,43 @@ export function parseWindowInput(raw) {
   return Math.round(value)
 }
 
+/**
+ * A window as people say it: 100k, 128k, 1M.
+ *
+ * Vendors round in two different directions — "128k" is 131072 (128 × 1024) while
+ * "200k" is 200000 — so both are tried and the one that comes out whole wins.
+ * A value that is round in neither (a hand-typed 83558) is shown as "≈84k": the
+ * exact number lives in the tooltip, and nothing rounds it in storage.
+ *
+ * Returns '' for a model nobody has described, which is what the tables render as
+ * 未知 rather than as 0.
+ */
+export function formatWindow(tokens) {
+  const n = Number(tokens) || 0
+  if (n <= 0) return ''
+  const pretty = (value) => {
+    for (const [size, suffix] of [[1_000_000_000, 'G'], [1_000_000, 'M'], [1_000, 'k']]) {
+      if (value % size === 0) return `${value / size}${suffix}`
+    }
+    return ''
+  }
+  // The decimal reading wins when it is whole — 128000 is "128k" to everyone —
+  // and the power-of-two one covers the rest: 131072 is also "128k", and 1048576
+  // is "1M". Trying them in the other order turns 128000 into "125k", which is
+  // true only in a sense nobody uses.
+  if (n % 1000 === 0) {
+    const decimal = pretty(n)
+    if (decimal) return decimal
+  }
+  if (n % 1024 === 0) {
+    const k = n / 1024
+    if (k % 1024 === 0) return `${k / 1024}M`
+    if (k % 1000 === 0) return `${k / 1000}M`
+    return `${k}k`
+  }
+  return `≈${Math.round(n / 1000)}k`
+}
+
 /** The one-or-two character form used inside the table cells. */
 export function windowSourceShort(source) {
   if (source === 'api') return '接口'

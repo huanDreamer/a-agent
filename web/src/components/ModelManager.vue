@@ -37,6 +37,7 @@ import {
   checkBaseUrl,
   checkProviderId,
   normalizeCapabilities,
+  formatWindow,
   parseWindowInput,
   windowSourceLabel as capabilitySourceLabelForWindow,
   windowSourceShort,
@@ -430,6 +431,41 @@ function describeProbe(target, res) {
   return `${target}：问了 ${formatCount(asked)} 个模型，更新了 ${formatCount(recorded)} 个${tail}`
 }
 
+/**
+ * The window field's text, and why it is a draft rather than the model's value.
+ *
+ * It displays 1M where the stored number is 1000000, so binding it directly to
+ * the model would send "1M" back on the next save of an unrelated field (a
+ * renamed model, a toggled capability) and, worse, would do it lossily:
+ * formatWindow(131072) is "128k", which parses back as 128000. The draft holds
+ * what the operator typed; the save sends the stored number unless the draft
+ * actually changed.
+ */
+const windowDrafts = reactive({})
+
+function windowDraftOf(model) {
+  const key = modelKey(model)
+  if (windowDrafts[key] === undefined) {
+    windowDrafts[key] = formatWindow(model.context_window)
+  }
+  return windowDrafts[key]
+}
+
+function setWindowDraft(model, value) {
+  windowDrafts[modelKey(model)] = value
+}
+
+function windowValueForSave(model) {
+  const key = modelKey(model)
+  const draft = windowDrafts[key]
+  if (draft === undefined || draft === formatWindow(model.context_window)) {
+    // Untouched: send exactly what is stored, so a display format can never
+    // change the value.
+    return Number(model.context_window) || 0
+  }
+  return parseWindowInput(draft)
+}
+
 function hasCapability(model, key) {
   return Array.isArray(model.capabilities) && model.capabilities.includes(key)
 }
@@ -457,8 +493,9 @@ async function saveModel(model, { quiet = false } = {}) {
       // which puts the built-in table back in charge rather than keeping a
       // number that was just deleted. A value here is recorded as theirs, and
       // the automatic askers then leave it alone.
-      context_window: parseWindowInput(model.context_window),
+      context_window: windowValueForSave(model),
     })
+    delete windowDrafts[key]
     if (!quiet) setFlash(`${model.model_id} 已保存`)
     // A capability change decides whether the chat offers this model, and a
     // window change decides how much history a turn may carry: both are read
@@ -1141,7 +1178,8 @@ const inferredCount = computed(
                  清空它会退回内置表估算，而不是留着一个刚被删掉的数字。 -->
             <span class="model-window">
               <input
-                v-model="model.context_window"
+                :value="windowDraftOf(model)"
+                @input="setWindowDraft(model, $event.target.value)"
                 class="input mono model-window-input"
                 type="text"
                 inputmode="numeric"

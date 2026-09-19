@@ -15,11 +15,15 @@ import (
 	"github.com/huan/huan-agent/internal/store"
 )
 
-// windowLookupTTL is how long a catalog read is reused. The value changes only
-// when the model list is refreshed, and a refresh is a human action; a turn
-// asking the database on every step would be a query per step for a number that
-// has not moved.
-const windowLookupTTL = 30 * time.Second
+// windowLookupTTL is how long a catalog read is reused. The value only changes
+// when the model list is refreshed, a probe runs, or an operator edits a model —
+// all human actions — and a turn asking the database on every step would be a
+// query per step for a number that has not moved.
+//
+// Five seconds rather than thirty so that "I just typed the real window size"
+// reaches the next turn promptly: the cache is also dropped on those writes (see
+// runnerCache.reset), and a stale map behind a fresh Runner would undo that.
+const windowLookupTTL = 5 * time.Second
 
 // longTurnSteps is the step count above which a turn is treated as long enough
 // to need a bounded window. It is a heuristic for one warning, not a limit:

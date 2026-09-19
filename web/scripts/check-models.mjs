@@ -11,6 +11,7 @@
 import {
   catalogEntry,
   capabilitySourceLabel,
+  formatWindow,
   parseWindowInput,
   windowSourceLabel,
   windowSourceShort,
@@ -43,6 +44,28 @@ check('a negative clears rather than going negative', parseWindowInput('-5') ===
 check('zero clears', parseWindowInput('0') === 0)
 check('null clears', parseWindowInput(null) === 0 && parseWindowInput(undefined) === 0)
 check('a number input value passes through', parseWindowInput(200000) === 200000)
+
+// --- how a window is shown ------------------------------------------------
+
+// A window is read the way people say it, not as a digit count: 100k, 128k, 1M.
+check('a million is 1M', formatWindow(1000000) === '1M')
+check('a power-of-two million is 1M too', formatWindow(1048576) === '1M')
+check('200000 is 200k', formatWindow(200000) === '200k')
+check('a decimal 128k is 128k', formatWindow(128000) === '128k')
+check('a vendor 128k is 128k too', formatWindow(131072) === '128k')
+check('128000 is not 125k', formatWindow(128000) !== '125k')
+check('a vendor 256k is 256k', formatWindow(262144) === '256k')
+check('32768 is 32k', formatWindow(32768) === '32k')
+check('100000 is 100k', formatWindow(100000) === '100k')
+check('a billion is 1G', formatWindow(1000000000) === '1G')
+// An odd value is shown as approximate rather than silently rounded in storage.
+check('an odd value is marked approximate', formatWindow(83558) === '≈84k')
+check('an empty window formats as nothing', formatWindow(0) === '' && formatWindow(null) === '')
+
+// The round trip that matters: the table shows 128k for 131072, and saving the
+// row without touching the field must keep 131072 rather than store 128000.
+check('the display is lossy, so the value must not be re-parsed', parseWindowInput(formatWindow(131072)) === 128000)
+check('a hand-typed 128k does mean 128000', parseWindowInput('128k') === 128000)
 
 // --- where a value came from ---------------------------------------------
 

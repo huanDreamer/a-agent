@@ -19,7 +19,7 @@ import {
   loadCatalog,
   maxSteps,
 } from '../chatStore.js'
-import { capabilityLabel, modelOptionHint, windowSourceLabel, windowSourceShort } from '../llm.js'
+import { capabilityLabel, formatWindow, modelOptionHint, windowSourceLabel, windowSourceShort } from '../llm.js'
 import { formatAbsolute, formatCount, formatRelative } from '../format.js'
 
 /** The catalog's models, groups and provider summaries, as the composer sees them. */
@@ -52,7 +52,7 @@ function windowHint(entry) {
     return '还没有记录窗口大小：在下面的「模型管理」里点「重新询问」，或不填让它按内置表估算'
   }
   const how = source ? `${source}` : '来源不明'
-  return `${formatCount(entry.contextWindow)} tokens（${how}）。agent 一轮的窗口预算 = 这个数 × context.window_ratio − reserve_output_tokens；要改就在下面的「模型管理」里填`
+  return `${entry.contextWindow.toLocaleString()} token（${how}）。agent 一轮的窗口预算 = 这个数 × context.window_ratio − reserve_output_tokens；要改就在下面的「模型管理」里填。注意 config.yaml 里的 context.model_windows 优先级更高，会盖过这里的一切`
 }
 </script>
 
@@ -115,7 +115,7 @@ function windowHint(entry) {
                   </td>
                   <td class="mono nowrap" :title="windowHint(entry)">
                     <template v-if="entry.contextWindow > 0">
-                      {{ formatCount(entry.contextWindow) }}
+                      {{ formatWindow(entry.contextWindow) }}
                       <span class="tag" :class="entry.contextWindowSource === 'user' ? 'purple' : ''">
                         {{ windowSourceShort(entry.contextWindowSource) }}
                       </span>

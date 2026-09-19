@@ -1041,6 +1041,19 @@ exist for a script, but the console has no control for them.
 谁覆盖谁：**你手填的值谁也改不动**（存储层遇到 `user` 来源就放弃），包括强制重新询问；
 清空则退回"没人说"，内置表接着估。provider 接口报的窗口同样不被模型自报覆盖。
 
+**唯一的例外是 config.yaml 里的 `context.model_windows`**：它是排查故障时的逃生门（网关限制、
+私有部署窗口更小），所以优先级最高，会盖过控制台里手填的值。要确认某个会话到底用了哪个数，
+看启动/首次用该模型那一轮的日志：
+
+```
+上下文窗口预算已确定  {"model": "MiniMaxAI/MiniMax-M2.5", "context_window": 200000,
+                      "in_loop_cap": 131808, "source": "model", "derivation": "0.7 × 200000 − 8192"}
+```
+
+`source` 是 `model` 就表示这个数来自模型目录（接口/自报/你手填），`config` 表示来自
+`model_windows`，`known` 是内置表，`default` 是兜底。**改完窗口不需要重启**：写目录（手改或询问）
+会作废缓存的 runner，下一轮就按新值构建（目录读取本身有 5 秒缓存）。
+
 接口：`PUT /api/llm/models` 增加 `context_window`（正数=手填，0=清空）；
 新增 `POST /api/llm/models/probe`，body 是 `{provider_id, model_id?, force?}`，
 同步返回 `{asked, recorded, remaining, models}` —— 一次点击问了几个、真正改了几个、还剩几个。

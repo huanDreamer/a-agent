@@ -16,6 +16,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/store"
 )
@@ -923,5 +924,68 @@ func TestUpsertModel_WindowIsTheOperatorsAndStays(t *testing.T) {
 	cleared, _ := st.GetModel(context.Background(), "p", "m")
 	if cleared.ContextWindow != 0 || cleared.ContextWindowSource != "" {
 		t.Errorf("window = %d (%s), want it cleared", cleared.ContextWindow, cleared.ContextWindowSource)
+	}
+}
+
+// TestWindowWriteDropsTheCachedRunner: a window is read when a Runner is built,
+// and Runners are cached per (provider, model). Without the reset, an operator
+// who typed the real window size kept talking to a conversation that was still
+// compressing to the old one — the edit looked saved and did nothing until the
+// process restarted.
+func TestWindowWriteDropsTheCachedRunner(t *testing.T) {
+	h := newHarness(t, nil)
+	h.login(t)
+	st := h.store
+	if err := st.UpsertProvider(context.Background(), store.Provider{ID: "p", Enabled: true}); err != nil {
+		t.Fatalf("UpsertProvider: %v", err)
+	}
+	if err := st.UpsertModel(context.Background(), store.Model{ProviderID: "p", ModelID: "m", Enabled: true}); err != nil {
+		t.Fatalf("UpsertModel: %v", err)
+	}
+
+	// Stand in for a built runner: the cache is what the reset has to clear.
+	h.srv.runnerCache.put("p\x00m", &chat.Runner{})
+	if _, ok := h.srv.runnerCache.get("p\x00m"); !ok {
+		t.Fatal("the fixture runner was not cached, so this test proves nothing")
+	}
+
+	resp := h.putJSON(t, "/api/llm/models", map[string]any{
+		"provider_id": "p", "model_id": "m", "capabilities": []string{"chat"}, "context_window": 131_072,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+	if _, ok := h.srv.runnerCache.get("p\x00m"); ok {
+		t.Error("a window write left the cached runner in place: the next turn would use the old window")
+	}
+
+	// The probe path resets it too — but only when it actually recorded
+	// something. The model above has an operator's window now, which the probe
+	// may not overwrite, so this uses a second, undescribed model.
+	if err := st.UpsertModel(context.Background(), store.Model{ProviderID: "p", ModelID: "m2", Enabled: true}); err != nil {
+		t.Fatalf("UpsertModel: %v", err)
+	}
+	h.srv.runnerCache.put("p\x00m2", &chat.Runner{})
+	h.srv.chat.Builder = probeBuilder{window: 200_000, caps: map[store.Capability]bool{store.CapChat: true}}
+	resp = h.postJSON(t, "/api/llm/models/probe", map[string]any{"provider_id": "p", "model_id": "m2", "force": true})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("probe status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+	if _, ok := h.srv.runnerCache.get("p\x00m2"); ok {
+		t.Error("a probe that recorded facts left the cached runner in place")
+	}
+
+	// And a probe that changes nothing leaves the cache alone — no reason to
+	// rebuild a Runner that is already correct.
+	h.srv.runnerCache.put("p\x00m", &chat.Runner{})
+	resp = h.postJSON(t, "/api/llm/models/probe", map[string]any{"provider_id": "p", "model_id": "m", "force": true})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("probe status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+	if _, ok := h.srv.runnerCache.get("p\x00m"); !ok {
+		t.Error("a probe that recorded nothing dropped a valid cached runner")
 	}
 }
