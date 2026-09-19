@@ -53,6 +53,51 @@ make run-admin
 
 Then open <http://127.0.0.1:8080> and sign in.
 
+### One instance at a time
+
+A start is a restart. On startup the long-running commands (`admin serve` and
+`serve`) record their pid in `.huan-agent.pid` in the working directory, and the
+next start stops whatever that file names before opening the database or binding
+the port:
+
+```
+INFO  pidfile/pidfile.go  stopping the previous instance        {"pid": 43886, "grace": 10}
+INFO  instance.go         previous instance stopped; this process is taking over  {"previous_pid": 43886, "killed": false}
+INFO  instance.go         instance registered                   {"pid": 43890, "pid_file": "/path/.huan-agent.pid"}
+```
+
+The old instance gets SIGTERM and ten seconds to exit cleanly (in-flight turns
+are cancelled and the store is closed); if it is still there after that, SIGKILL.
+Two instances therefore never fight over the SQLite file or the port. The two
+commands share one pid file, so starting the bot stops the console and vice
+versa — the Feishu long connection is a second copy of the same service, and two
+of them answer each message twice. On a clean exit the file is removed; after a
+crash or a SIGKILL it is left behind and the next start reports it as stale.
+
+If the file names a live process that is **not** huan-agent, that process is left
+alone and the reason is logged as a warning — the file is only read, never
+trusted:
+
+```
+WARN  pidfile/pidfile.go  pid file names a process that is not huan-agent; leaving it running
+      {"pid": 44426, "reason": "it is \"sleep\", not this program", "hint": "if this file is stale ... delete it"}
+```
+
+Two limits worth knowing:
+
+- **Only the long-running commands are guarded.** `run` is a one-shot command
+  with an exit-code contract (`docs/run.md`); guarding it would make two scripts
+  kill each other.
+- **Two simultaneous cold starts are not prevented.** The guard is a pid file,
+  not a lock file, and deliberately so: a pid file survives a crash or a SIGKILL
+  and is recognised as stale by the next start, whereas an exclusive lock is
+  released automatically in exactly the case where it should not be. The cost is
+  the race where both processes look at a file that does not exist yet. Restarts —
+  a file that already holds a pid — are always caught.
+
+Use `--pid-file <path>` (or leave it defaulted) to point the guard somewhere
+else, e.g. to keep several deployments apart in one directory.
+
 ## Endpoints
 
 Unauthenticated:
@@ -77,6 +122,10 @@ Authenticated (session cookie):
 | `GET /api/usage/by-day?days=30` | daily trend |
 | `GET /api/usage/recent?limit=20` | most recent calls |
 | `GET /api/audit?tool=&user=` | tool invocation audit log |
+| `GET /api/artifacts?session=` | artifacts, newest first; `session` narrows it to one conversation, omitting it lists every session's |
+| `GET /api/artifacts/{id}` | one artifact's row |
+| `DELETE /api/artifacts/{id}` | delete the row and then the file |
+| `GET /api/artifacts/files/{path}` | an artifact's bytes. On the unauthenticated group, and requires the session itself unless `tools.artifacts.public_urls` is on. Served with `nosniff` and, for HTML/SVG, a sandbox CSP. |
 | `GET /api/skills` | skills, with their file, size and declared tools |
 | `POST /api/skills/{name}` | `{"enabled": true|false}` |
 | `GET /api/skills/{name}` | one skill's markdown body |
@@ -717,6 +766,96 @@ removing the settings panel hides nothing.
 With `tools.enable_background: false` the drawer says the feature is off rather
 than showing an empty list, and the four tools are not offered to the model at
 all.
+
+## Artifacts (产物)
+
+An artifact is a resource the agent *produced*: a generated page, a report, a
+chart. The model saves one with the `save_artifact` tool, the bytes land in a
+directory of the server's own — `tools.artifacts.root`, defaulting to an
+`artifacts/` directory beside the database file — and the console reaches them
+over HTTP.
+
+It is deliberately not an attachment. An attachment is something a *person*
+uploaded, its bytes live in the workspace, and the workspace is what makes it
+reachable. An artifact is something the *agent* produced, its bytes live on the
+server, and the recording in the database is only an index into them: the file is
+the truth, the row is how it gets listed.
+
+### Where they show up
+
+| Surface | What it shows |
+|---|---|
+| Conversation header → 产物 | This conversation's artifacts, newest first. The chip carries the count (`N 个产物`) and is hidden while the conversation has none. |
+| 统计监控 → 产物中心 | Every session's artifacts, with the owning session on each row, a kind filter and a session filter. Artifacts from a surface with no session (a one-shot `huan-agent run`) say so rather than showing a blank cell. |
+
+Each row offers 打开 (a new tab), 下载, and 删除. Deleting asks first: it removes
+the database row and then the file, and a file that refuses to go is reported —
+the row is already gone at that point, and a listing entry that 404s is worse
+than an honest warning in the log.
+
+The tool is registered on every surface, but only the console can hand back a
+URL: a CLI (`huan-agent chat`) or one-shot (`huan-agent run`) process serves no
+HTTP, so `save_artifact` there reports the path it wrote and says the URL is not
+available. The console still lists those artifacts, because the store is shared.
+
+### Configuration
+
+```yaml
+tools:
+  artifacts:
+    enable: true          # false = the tool refuses and every endpoint says so
+    root: ""              # empty = an artifacts/ directory beside the database
+    public_urls: false    # true = artifact files are served without a login
+    max_bytes: 0          # one artifact's cap; 0 = 32 MiB
+```
+
+The accepted types are a whitelist — `html`, `md`, `txt`, `csv`, `json`, `xml`,
+`png`, `jpg`, `gif`, `webp`, `pdf` — and an extension outside it is refused
+rather than stored and worried about later.
+
+### `public_urls` and why the default is off
+
+Artifact bytes are authored by the model, and the model is steered by whatever
+text reached it. So:
+
+- Files are served **behind the admin session** by default. `public_urls: true`
+  serves them to anyone holding the link — including a page the agent read from
+  the workspace and pasted into an artifact. A non-loopback bind with
+  `public_urls: true` logs a warning at startup.
+- An HTML artifact is served with `Content-Security-Policy: sandbox` (without
+  `allow-same-origin`), so it runs in an opaque origin: it cannot read the
+  console's cookie, its `localStorage` or its API. That is the difference between
+  "the agent can show me a page" and "the agent can hand itself my session".
+  Scripts, forms and downloads still work, which is what keeps a generated
+  dashboard useful.
+- `X-Content-Type-Options: nosniff` prevents a browser from re-interpreting the
+  bytes as something other than the recorded type.
+- The serving route resolves `path` under the configured root **and nowhere
+  else** — absolute paths, `..` and symlink escapes are refused. (In practice an
+  unencoded `..` never reaches the handler: Hertz normalises it before route
+  matching. The check that provably fires is the symlink one, which was verified
+  against a real server; see `internal/server/artifacts_test.go`.)
+
+### Design notes for maintainers
+
+Full rationale is in `openspec/changes/phase-25-artifacts/` (proposal, spec,
+tasks). The four things worth knowing before changing this feature:
+
+- **The files are the truth, the row is an index.** `artifacts.path` is both the
+  address and the identity: the serving route resolves exactly that string under
+  the root and nowhere else, so a corrupted row cannot become a read of the
+  server's filesystem. A file whose row is gone is simply not listed.
+- **Bytes are written first and the row second.** A file with no row is bytes
+  nothing lists (harmless, `ls`-visible); a row with no file is a listing entry
+  that 404s. So a failed insert deletes the file it just wrote. Deletion runs the
+  other way round, for the same reason: the row first, because a row is not
+  reversible.
+- **The model chooses a name, never a path.** The extension whitelist decides
+  what may be stored, and it is refused at write time rather than served as an
+  opaque download later.
+- **A served document is in an opaque origin.** The sandbox CSP is what makes
+  "the agent can show me a page" different from "the agent can hand itself my
+  session". If you relax it, say so here and in the change record.
 
 ## Web UI
 

@@ -9,6 +9,7 @@
 // Each sub-view is a plain content panel: it renders its own loading / empty /
 // error states, and this page owns the head and the single scroll container.
 import { computed } from 'vue'
+import ArtifactsView from './ArtifactsView.vue'
 import AuditView from './AuditView.vue'
 import ByModelView from './ByModelView.vue'
 import ByUserView from './ByUserView.vue'
@@ -25,6 +26,7 @@ const PANELS = {
   user: ByUserView,
   recent: RecentView,
   audit: AuditView,
+  artifacts: ArtifactsView,
   traces: TraceView,
 }
 
@@ -35,6 +37,7 @@ const NOTES = {
   user: () => `${rangeNote.value} · 用户维度用量（key 为飞书 open_id）`,
   recent: () => `${rangeNote.value} · 最新在前 · 悬停时间可查看绝对时间`,
   audit: () => '工具调用审计 · 最新在前 · 可按工具名与用户过滤',
+  artifacts: () => '全部会话保存的网页 / 文档 / 图片，存在服务端并按 URL 访问',
   traces: () => '对话与工具调用的 trace 记录在本机数据库，无需外部服务',
 }
 
@@ -46,8 +49,10 @@ const note = computed(() => {
 
 /**
  * The time range only means something for the usage queries
- * (/api/usage/*?since=…&days=…): 审计日志 has no time filter of its own and
- * 链路追踪 uses session / name / user instead, so both get 刷新 alone.
+ * (/api/usage/*?since=…&days=…): 审计日志 has no time filter of its own, 产物中心
+ * is bounded by count rather than by date (a saved page is always worth listing,
+ * however old), and 链路追踪 uses session / name / user instead — so those three
+ * get 刷新 alone.
  */
 const usageSubTab = computed(() =>
   ['dashboard', 'model', 'user', 'recent'].includes(state.monitor),

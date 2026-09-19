@@ -424,6 +424,14 @@ func (s *Server) startTurn(run turnRun) *liveTurn {
 	})
 	runCtx = tool.WithTurnAllowances(runCtx)
 
+	// The artifact store is per turn because it stores under the session that
+	// asked, and it is installed here rather than resolved by the tool for the
+	// same reason the planner is: the save_artifact tool is built once at
+	// startup and knows nothing about sessions or about which deployment is
+	// serving. A server with the feature off publishes nothing, and the tool
+	// says so rather than failing obscurely.
+	runCtx = s.withTurnArtifacts(runCtx, run.session.ID)
+
 	// The plan store is per turn for the same reason, and it is installed here
 	// rather than resolved by the tools because only the surface knows where a
 	// plan lives (here: the database, so it survives the turn) and where it is

@@ -523,6 +523,15 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 			KeepTurns:  cfg.Tools.Checkpoint.KeepTurnsOr(),
 			MaxTotalMB: cfg.Tools.Checkpoint.MaxTotalMBOr(),
 		},
+		// Artifacts: where the resources the agent produces live, and whether the
+		// console serves them without a login. The store itself is built by the
+		// server, which owns its lifetime and reports a bad root at startup.
+		Artifacts: server.ArtifactSettings{
+			Enable:     cfg.Tools.Artifacts.Enable,
+			Root:       artifactRoot(cfg),
+			PublicURLs: cfg.Tools.Artifacts.PublicURLs,
+			MaxBytes:   cfg.Tools.Artifacts.MaxBytes,
+		},
 		Logger: logger,
 	}, st, pricingTable(cfg), cfg.Admin)
 	if err != nil {

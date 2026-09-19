@@ -93,6 +93,17 @@ type Store interface {
 	ListMediaAssets(ctx context.Context, sessionID string) ([]MediaAsset, error)
 	FindMediaAssetBySHA256(ctx context.Context, sessionID, digest string) (MediaAsset, error)
 
+	// Artifacts the agent produced (Phase 25): an HTML page, a report, a chart,
+	// a picture. The bytes live in the artifact store on the server and are
+	// served over HTTP; these rows are what a session and the 产物中心 list.
+	CreateArtifact(ctx context.Context, a Artifact) error
+	GetArtifact(ctx context.Context, id string) (Artifact, error)
+	// ListArtifacts returns a session's artifacts when sessionID is set, and
+	// every artifact in the store when it is empty — the two questions behind
+	// 会话的产物 and 产物中心 are the same query with and without the filter.
+	ListArtifacts(ctx context.Context, sessionID string) ([]Artifact, error)
+	DeleteArtifact(ctx context.Context, id string) error
+
 	// Workspaces (Phase 9): the directories the agent can be pointed at, and
 	// which one each scope (a conversation, a Feishu user) is in.
 	UpsertWorkspace(ctx context.Context, w Workspace) error

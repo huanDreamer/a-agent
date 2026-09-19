@@ -19,6 +19,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/common/hlog"
 	"go.uber.org/zap"
 
+	"github.com/huan/huan-agent/internal/artifact"
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/jobs"
 	"github.com/huan/huan-agent/internal/mcp"
@@ -59,6 +60,10 @@ type Config struct {
 	// Checkpoints configures the per-turn file checkpoints. Enable=false, or an
 	// empty Dir, leaves the feature off and the endpoints unregistered.
 	Checkpoints CheckpointSettings
+	// Artifacts configures the store of what the agent produced. Enable=false
+	// leaves save_artifact refusing every call and the endpoints answering
+	// `enabled: false` rather than 404ing.
+	Artifacts ArtifactSettings
 	// Version is reported by /api/health and /api/meta.
 	Version string
 	// Provider and Model are the active LLM target, reported by /api/meta.
@@ -144,6 +149,16 @@ type Server struct {
 	// process serves several, and one built at startup would resolve every path
 	// through whichever was current then.
 	checkpointSettings CheckpointSettings
+
+	// artifacts is the store of the resources the agent produced: bytes on the
+	// server's disk, indexed in the database, served over
+	// /api/artifacts/files. Nil is the feature turned off, which every artifact
+	// endpoint reports rather than failing.
+	//
+	// One store for the whole process, unlike the checkpointer: an artifact
+	// belongs to a session, not to a workspace, so there is nothing
+	// per-workspace to resolve.
+	artifacts *artifact.Store
 
 	// approvals holds the write/exec requests currently waiting for a decision.
 	// It is the same shape as questions and exists for the same reason; the
@@ -248,6 +263,29 @@ func New(cfg Config, st store.Store, table *pricing.Table, adminCfg config.Admin
 		checkpointSettings: cfg.Checkpoints,
 		turns:              newTurnHub(),
 		startT:             time.Now(),
+	}
+
+	// The artifact store is built once for the process: it belongs to sessions
+	// rather than to workspaces, so there is nothing per-workspace to resolve.
+	// A root that was configured but cannot be created refuses startup, because
+	// the feature was asked for and starting without it would leave save_artifact
+	// failing for the life of the process (see newArtifactStore).
+	artifactStore, err := newArtifactStore(cfg.Artifacts)
+	if err != nil {
+		return nil, err
+	}
+	s.artifacts = artifactStore
+	if s.artifacts != nil {
+		logger.Info("artifacts enabled",
+			zapString("root", s.artifacts.Root()),
+			zapBool("public_urls", cfg.Artifacts.PublicURLs),
+			zapInt64("max_bytes", s.artifacts.MaxBytes()))
+		if cfg.Artifacts.PublicURLs && !config.LoopbackHost(cfg.Host) {
+			logger.Warn("artifact files are served without a login on a non-loopback bind",
+				zapString("root", s.artifacts.Root()),
+				zapString("hint", "tools.artifacts.public_urls=true serves whatever the model wrote to "+
+					"anyone who can reach this port — sandboxed, but readable."))
+		}
 	}
 
 	// Checkpoints are built per workspace (see checkpointFor) because this process
@@ -368,6 +406,10 @@ func (s *Server) registerRoutes(h *server.Hertz) {
 	s.registerMCPRoutes(authed)
 	s.registerOpenVikingRoutes(authed)
 	s.registerJobRoutes(authed)
+	// The artifact routes are registered before the UI: the file route is on the
+	// open group and asks for a session itself, because whether it needs one is
+	// artifacts.public_urls.
+	s.registerArtifactRoutes(api, authed)
 
 	s.registerUI(h)
 }

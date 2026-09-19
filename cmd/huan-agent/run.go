@@ -415,7 +415,13 @@ func runOnce(cmd *cobra.Command, args []string) error {
 	// The system message goes in the request rather than into a stored history:
 	// a one-shot run has no history, and the prompt is this process's business,
 	// not something to persist next to the conversation.
-	res, runErr := runner.Run(ctx, chat.Request{
+	//
+	// The artifact store is published on the context the same way: save_artifact
+	// files what it writes under this run's session, so a script that produced a
+	// page leaves it in the store the console lists — under the session it was
+	// told to attach to, when it was told one.
+	runCtx := withCommandArtifacts(ctx, newCommandArtifactStore(cfg, logger), st, sessionID, logger)
+	res, runErr := runner.Run(runCtx, chat.Request{
 		Messages: []*schema.Message{
 			{Role: schema.System, Content: systemPrompt},
 			schema.UserMessage(p),

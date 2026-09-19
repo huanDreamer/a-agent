@@ -18,6 +18,7 @@
 // stream survives leaving and re-entering this view.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AsyncBlock from './AsyncBlock.vue'
+import ArtifactsDrawer from './ArtifactsDrawer.vue'
 import ChatComposer from './ChatComposer.vue'
 import ChatMessage from './ChatMessage.vue'
 import DrawerButton from './DrawerButton.vue'
@@ -41,6 +42,13 @@ import {
   submitApproval,
   submitAsk,
 } from '../chatStore.js'
+import { artifactChipLabel, artifactHintText } from '../artifactsChip.js'
+import {
+  artifactsCount,
+  artifactsEnabled,
+  loadArtifactsFor,
+  noteArtifactToolRan,
+} from '../artifactsStore.js'
 import { pendingApprovals } from '../approval.js'
 import { formatCount } from '../format.js'
 import { planResumable } from '../plan.js'
@@ -73,6 +81,8 @@ const composer = ref(null)
 const pinned = ref(true)
 /** Whether the background-process drawer is open beside the conversation. */
 const jobsOpen = ref(false)
+/** Whether the 产物 drawer is open beside the conversation. */
+const artifactsOpen = ref(false)
 
 const session = computed(() => chat.session)
 const items = computed(() => chat.items)
@@ -133,6 +143,22 @@ const jobsHint = computed(() => {
   return parts.join(' · ')
 })
 
+/**
+ * 产物 — what this conversation produced.
+ *
+ * It sits beside the subagent chip because it answers the same shape of question
+ * about the same conversation, with one difference that decides its rendering
+ * rule: an artifact is finished the moment it exists, so there is no liveness to
+ * lead with and no reason for a permanent zero. It appears once the conversation
+ * has one (or once the reader has opened it), exactly like the two chips next to
+ * it.
+ */
+const artifactsVisible = computed(
+  () => (artifactsEnabled.value && artifactsCount.value > 0) || artifactsOpen.value,
+)
+const artifactsLabel = computed(() => artifactChipLabel())
+const artifactsHint = computed(() => artifactHintText())
+
 // The chip and the drawer read the same store, and the store reads whichever
 // conversation is selected: switching sessions must never leave the previous
 // conversation's count under the new one's title.
@@ -145,6 +171,9 @@ watch(
     // screen, and a run left over from the previous one would be attributed to the
     // wrong reader.
     loadSubagentsFor(id)
+    // And again for 产物: the button counts this conversation's artifacts, so a
+    // count left over from the previous conversation would be a lie about this one.
+    loadArtifactsFor(id)
   },
   { immediate: true },
 )
@@ -161,11 +190,16 @@ watch(
     const tools = turn && Array.isArray(turn.tools) ? turn.tools : []
     // A run is worth a reload when a spawn appeared or one just finished; polling
     // then takes over while anything is live.
+    //
+    // save_artifact is handled in the same pass rather than in a watcher of its
+    // own: the trigger is the same event, and the store has no poller to fall back
+    // on, so this is the only signal that an artifact appeared mid-turn.
     for (const tool of tools) {
       if (tool.name === 'spawn_agent') {
         refreshSubagents()
-        return
+        continue
       }
+      noteArtifactToolRan(tool.name)
     }
   },
 )
@@ -609,6 +643,22 @@ onBeforeUnmount(stopSettling)
           {{ subagentsLabel }}
         </button>
 
+        <!-- What this conversation produced. It sits with the two chips above
+             because it is the same kind of fact — state this conversation made
+             — and it is the only way to reach an artifact's bytes: they live on
+             the server, not in the workspace and not in the transcript. -->
+        <button
+          v-if="artifactsVisible"
+          type="button"
+          class="chip chip-btn"
+          :title="artifactsHint"
+          :aria-expanded="artifactsOpen"
+          @click="artifactsOpen = !artifactsOpen"
+        >
+          <Icon name="package" :size="13" />
+          {{ artifactsLabel }}
+        </button>
+
         <!-- The session-level way in: every turn this conversation recorded,
              with the panel's session filter already applied. The per-answer 链路
              button is the precise route; this one is the discoverable one, and it
@@ -714,6 +764,11 @@ onBeforeUnmount(stopSettling)
       <div v-if="jobsOpen" class="jobs-backdrop" @click="jobsOpen = false" />
       <JobsDrawer v-if="jobsOpen" @close="jobsOpen = false" />
       <SubagentsDrawer v-if="subagentsOpen" @close="subagentsOpen = false" />
+      <!-- The resources this conversation produced. Beside it rather than inside
+           the transcript for the same reason the two above are: a 32 MiB page has
+           no place in a message, and the file outlives the turn that wrote it. -->
+      <div v-if="artifactsOpen" class="jobs-backdrop" @click="artifactsOpen = false" />
+      <ArtifactsDrawer v-if="artifactsOpen" @close="artifactsOpen = false" />
     </template>
 
     <!-- no conversation selected yet -->

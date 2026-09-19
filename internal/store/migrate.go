@@ -416,6 +416,38 @@ var migrations = []migration{
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
 	},
+	{
+		version: 15,
+		name:    "create_artifacts",
+		// 产物：agent 在干活过程中产出的、不是代码也不是项目文档的东西 —— 一个 HTML
+		// 页面、一份报告、一张图。
+		//
+		// It is a table of its own rather than more rows in media_assets because the
+		// direction is reversed. A media asset is something a *person* uploaded, its
+		// bytes live in the workspace, and the question asked of it is "show this to
+		// the model". An artifact is something the *agent* produced, its bytes live in
+		// the artifact store on the server, and the question asked of it is "give me
+		// a URL". Folding them together would mean every media query carrying a
+		// filter for which kind of thing it wanted.
+		//
+		// path is the artifact's location under the store's root and is also its
+		// identity: the serving route resolves exactly this string, so a corrupted
+		// row cannot become a read outside the root (see internal/artifact).
+		up: `CREATE TABLE IF NOT EXISTS artifacts (
+			id         TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL DEFAULT '',
+			title      TEXT NOT NULL DEFAULT '',
+			kind       TEXT NOT NULL DEFAULT '',
+			path       TEXT NOT NULL,
+			mime       TEXT NOT NULL DEFAULT '',
+			bytes      INTEGER NOT NULL DEFAULT 0,
+			source     TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
+		CREATE INDEX IF NOT EXISTS idx_artifacts_created ON artifacts(created_at);`,
+	},
+
 }
 
 // Migrate applies any pending migrations idempotently.

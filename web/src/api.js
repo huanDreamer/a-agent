@@ -367,6 +367,20 @@ export function assetUrl({ id, url } = {}) {
   return `${apiBase()}${path}`
 }
 
+/**
+ * The URL that opens an artifact.
+ *
+ * The server builds it (artifact.URL) and sends it as `url`, so the console and
+ * the tool call output the model was given show the same address. It just has to
+ * go through `apiBase()` like every other path, for a deployment behind a prefix.
+ */
+export function artifactUrl(artifact) {
+  const path = artifact && typeof artifact.url === 'string' ? artifact.url : ''
+  if (path === '') return ''
+  if (/^https?:\/\//i.test(path)) return path
+  return `${apiBase()}${path}`
+}
+
 /** Optional usage filters: since/until are RFC3339, the rest are exact matches. */
 function usageQuery(filters = {}) {
   return {
@@ -562,6 +576,20 @@ export const api = {
   stopJob: (id, { signal = 'term' } = {}) =>
     request(`/api/jobs/${encodeURIComponent(id)}/stop`, { method: 'POST', body: { signal } }),
   forgetJob: (id) => request(`/api/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  // --- artifacts (what the agent produced) --------------------------------
+  // An artifact is a resource the agent wrote to the server's own store: a page,
+  // a report, an image. Its bytes are not in the workspace and not in a message —
+  // they are behind /api/artifacts/files/…, which the URL field already points at.
+  //
+  // One listing route answers both surfaces: `session` narrows it to a
+  // conversation (the 产物 drawer), omitting it returns every session's (产物中心).
+  // Every route answers 200 with `enabled: false` and a message when the feature
+  // is off, because "not configured" is a state the console renders rather than
+  // an error it reports — a 404 would be indistinguishable from a broken server.
+  listArtifacts: ({ session } = {}) => request('/api/artifacts', { query: { session } }),
+  artifact: (id) => request(`/api/artifacts/${encodeURIComponent(id)}`),
+  deleteArtifact: (id) => request(`/api/artifacts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   // --- meta -------------------------------------------------------------
   meta: () => request('/api/meta'),

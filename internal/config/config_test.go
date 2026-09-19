@@ -1168,3 +1168,88 @@ func TestGuardDefaultsMatchTheRunner(t *testing.T) {
 			DefaultToolResultMaxChars(), context.DefaultToolResultMaxChars)
 	}
 }
+
+// TestTools_ArtifactsYAML checks the artifact keys are wired to the config file.
+// A typo here would leave SaveArtifact pointing at the default directory while the
+// operator's configured one stayed empty — and the failure would only show up as
+// files landing somewhere unexpected.
+func TestTools_ArtifactsYAML(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	yaml := "tools:\n  artifacts:\n    root: \"/tmp/artifacts-here\"\n    public_urls: true\n    max_bytes: 1048576\n"
+	if err := os.WriteFile(cfgFile, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Tools.Artifacts.Root != "/tmp/artifacts-here" {
+		t.Errorf("root = %q, want /tmp/artifacts-here", cfg.Tools.Artifacts.Root)
+	}
+	if !cfg.Tools.Artifacts.PublicURLs {
+		t.Error("public_urls: true did not reach the struct")
+	}
+	if cfg.Tools.Artifacts.MaxBytes != 1048576 {
+		t.Errorf("max_bytes = %d, want 1048576", cfg.Tools.Artifacts.MaxBytes)
+	}
+	// enable is absent from the file, so the default must survive: an operator who
+	// only says where artifacts go should not have to also say the feature is on.
+	if !cfg.Tools.Artifacts.Enable {
+		t.Error("artifacts.enable defaulted to false")
+	}
+	if got, _ := cfg.Tools.ArtifactsRootOrDefault("/var/db/huan.db"); got != "/tmp/artifacts-here" {
+		t.Errorf("resolved to %q, want the configured root", got)
+	}
+}
+
+// TestTools_ArtifactsRootOrDefault covers the fallback. The store must land
+// beside the database rather than in the process working directory: the working
+// directory is the workspace, and artifacts written there would turn up in the
+// model's own greps and in the user's git status.
+func TestTools_ArtifactsRootOrDefault(t *testing.T) {
+	t.Run("explicit root wins", func(t *testing.T) {
+		c := ToolsConfig{Artifacts: ArtifactsConfig{Root: "/tmp/a"}}
+		got, ok := c.ArtifactsRootOrDefault("/var/db/huan.db")
+		if !ok || got != "/tmp/a" {
+			t.Errorf("got (%q, %v), want (/tmp/a, true)", got, ok)
+		}
+	})
+	t.Run("blank goes beside the database, not to the working directory", func(t *testing.T) {
+		got, ok := (ToolsConfig{}).ArtifactsRootOrDefault("/var/db/huan.db")
+		if !ok {
+			t.Fatal("blank root should still resolve")
+		}
+		if want := filepath.Join("/var/db", DefaultArtifactsSubdir); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		for _, blank := range []string{"", "  "} {
+			c := ToolsConfig{Artifacts: ArtifactsConfig{Root: blank}}
+			if got, _ := c.ArtifactsRootOrDefault("/var/db/huan.db"); got != filepath.Join("/var/db", DefaultArtifactsSubdir) {
+				t.Errorf("root %q resolved to %q", blank, got)
+			}
+		}
+	})
+	t.Run("public URLs default to off", func(t *testing.T) {
+		// The default has to be the safe one: the console serves artifact bytes
+		// from its own origin, so serving them without a login is XSS against
+		// whoever opens the link. A config file that says nothing about artifacts
+		// at all is the case that has to get it right.
+		cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(cfgFile, []byte("tools:\n  read_only: true\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(cfgFile)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Tools.Artifacts.PublicURLs {
+			t.Error("artifacts.public_urls defaults to true")
+		}
+		// Leaving the whole section out must not switch the feature off either:
+		// a bool zero value would, if the default were only in Default().
+		if !cfg.Tools.Artifacts.Enable {
+			t.Error("omitting the artifacts section disabled artifacts")
+		}
+	})
+}

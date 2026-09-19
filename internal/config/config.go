@@ -656,6 +656,9 @@ type ToolsConfig struct {
 	// Checkpoint keeps the pre-image of every file a turn changes, so a turn can
 	// be undone without git.
 	Checkpoint CheckpointConfig `mapstructure:"checkpoint" json:"checkpoint"`
+	// Artifacts configures where the resources the agent produces (pages,
+	// documents, images) are stored and who may fetch them.
+	Artifacts ArtifactsConfig `mapstructure:"artifacts" json:"artifacts"`
 }
 
 // WebConfig configures the fetch_url tool.
@@ -831,6 +834,52 @@ func (c CheckpointConfig) MaxTotalMBOr() int {
 		return c.MaxTotalMB
 	}
 	return DefaultCheckpointMaxTotalMB
+}
+
+// ArtifactsConfig configures the artifact store: the resources the agent makes
+// that are not code and not project documentation — a generated page, a report,
+// a screenshot — written to the server's disk and served back over a URL.
+//
+// It is deliberately separate from the workspace. An artifact is not a file the
+// agent edited in the project; it is a deliverable, and the console has to be able
+// to fetch it later. Putting it under the workspace would also make it show up in
+// the model's own greps and in the user's git status, which is exactly what it is
+// not.
+type ArtifactsConfig struct {
+	// Enable registers save_artifact and serves the artifact routes. It defaults
+	// to on: the store is one directory beside the database, the tool is bounded
+	// by MaxBytes, and a deployment that cannot store an artifact cannot show the
+	// user the page it just wrote.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// Root is the directory artifacts are written to. Empty puts an "artifacts"
+	// directory beside the database file (see ArtifactsRootOrDefault).
+	Root string `mapstructure:"root" json:"root"`
+	// PublicURLs serves artifact files without a console login, which is what a
+	// link shared with somebody who has no account needs.
+	//
+	// Off by default, and the default is the safe one: artifact bytes are
+	// whatever the model wrote and they are served from the console's own origin,
+	// so an unauthenticated artifact URL is stored XSS against whoever opens it.
+	// On is a deliberate choice by an operator who knows the store holds nothing
+	// private and wants the link to work for outsiders.
+	PublicURLs bool `mapstructure:"public_urls" json:"public_urls"`
+	// MaxBytes caps one artifact. 0 uses the default (32 MiB).
+	MaxBytes int64 `mapstructure:"max_bytes" json:"max_bytes"`
+}
+
+// DefaultArtifactsSubdir is where artifacts are written, relative to the database
+// file, when tools.artifacts.root is empty.
+const DefaultArtifactsSubdir = "artifacts"
+
+// ArtifactsRootOrDefault resolves where artifacts are written.
+//
+// Beside the database for the same reason job logs and checkpoints are: the store
+// is the deployment's data, not the project's.
+func (c ToolsConfig) ArtifactsRootOrDefault(databasePath string) (string, bool) {
+	if root := strings.TrimSpace(c.Artifacts.Root); root != "" {
+		return root, true
+	}
+	return dirBesideDatabase(databasePath, DefaultArtifactsSubdir), true
 }
 
 // ApprovalConfig configures the approval gate.
@@ -1676,6 +1725,13 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("tools.checkpoint.dir", "")
 	v.SetDefault("tools.checkpoint.keep_turns", DefaultCheckpointKeepTurns)
 	v.SetDefault("tools.checkpoint.max_total_mb", DefaultCheckpointMaxTotalMB)
+	// Artifacts default on: the agent writing a page for the user to look at is
+	// the point of the feature, and the store is one bounded directory. The
+	// public-URL switch is off, because that one is a security decision.
+	v.SetDefault("tools.artifacts.enable", true)
+	v.SetDefault("tools.artifacts.root", "")
+	v.SetDefault("tools.artifacts.public_urls", false)
+	v.SetDefault("tools.artifacts.max_bytes", 0)
 	// Subagents are on by default (the tool is useful and bounded); the bounds are
 	// what make that safe.
 	v.SetDefault("tools.web.enable", true)

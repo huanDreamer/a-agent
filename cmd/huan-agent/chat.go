@@ -243,6 +243,11 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		logger.Warn("checkpoints disabled", zap.Error(cpErr))
 	}
 
+	// Artifacts: the resources this session produces that are not code. No URL
+	// comes back on this surface — the address the console serves — because this
+	// process is not one; the tool says where the file landed and says so.
+	artifactStore := newCommandArtifactStore(cfg, logger)
+
 	// Build the agent if tools are enabled. Tool registry + MCP clients live
 	// for the duration of the REPL.
 	var (
@@ -370,6 +375,10 @@ func runChat(cmd *cobra.Command, _ []string) error {
 			// every file this turn writes is attributed to it.
 			turnCtx, endTurn := beginCheckpointTurn(ctx, checkpointer, sessionID, logger)
 			turnCtx = tool.WithApprover(tool.WithTurnAllowances(turnCtx), approver)
+			// This REPL's session id owns whatever it saves, so the 产物 list of
+			// that conversation shows it even though this process has no HTTP
+			// server to serve it.
+			turnCtx = withCommandArtifacts(turnCtx, artifactStore, st, sessionID, logger)
 			runErr = agentOnce(turnCtx, ag, &history)
 			endTurn()
 		} else {
@@ -570,6 +579,9 @@ func registerBuiltinTools(reg *tool.Registry, cfg *config.Config, st store.Store
 		}
 	}
 	if err := registerDocumentTool(reg, cfg, svc); err != nil {
+		return err
+	}
+	if err := registerArtifactTool(reg, cfg); err != nil {
 		return err
 	}
 

@@ -251,24 +251,31 @@ func (a *authenticator) sessionCount() int {
 	return len(a.sessions)
 }
 
+// allows reports whether this caller may read a resource that needs a session,
+// answering the same question requireSession does but without writing a
+// response. A handler that needs to decide for itself — the artifact file route,
+// where whether a session is required at all is a configuration setting — asks
+// this instead of duplicating the rules.
+func (a *authenticator) allows(c *app.RequestContext) bool {
+	if a.skipsPassword(c.RemoteAddr()) {
+		return true
+	}
+	return a.valid(string(c.Cookie(SessionCookieName)))
+}
+
 // requireSession is Hertz middleware rejecting unauthenticated requests.
 //
 // It lets a caller through when this deployment has nothing to ask them:
 // login disabled entirely, or — with trust_loopback — a request that arrived
 // over the loopback interface.
 func (a *authenticator) requireSession(ctx context.Context, c *app.RequestContext) {
-	if a.skipsPassword(c.RemoteAddr()) {
+	if a.allows(c) {
 		c.Next(ctx)
 		return
 	}
-	token := string(c.Cookie(SessionCookieName))
-	if !a.valid(token) {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{
-			"error": "unauthorized",
-		})
-		return
-	}
-	c.Next(ctx)
+	c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{
+		"error": "unauthorized",
+	})
 }
 
 // setSessionCookie writes the session cookie. httpOnly is always on; Secure is

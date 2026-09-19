@@ -55,6 +55,16 @@ tools:
   # match will run. The approval gate (tools.approval.mode) is the gate; this is
   # the bump.
   deny_patterns: []
+
+  # Artifacts: the resources the agent produced — generated pages, reports,
+  # images. Their bytes live in a directory of their own on the server (not in a
+  # workspace: a deliverable has to survive the working copy), and the console
+  # serves them over HTTP. See "Artifacts" below.
+  artifacts:
+    enable: true          # false = save_artifact refuses and the console says so
+    root: ""              # empty = an "artifacts" directory beside the database
+    public_urls: false    # true = artifact files need no login (see docs/admin.md)
+    max_bytes: 0          # one artifact's cap; 0 = 32 MiB
 ```
 
 ## The tools
@@ -79,6 +89,7 @@ tools:
 | `bash_jobs` | exec | Lists this workspace's background jobs: status, pid, command, run time, log file. Finished jobs stay listed until their record is dropped, which is how a server that crashed while nobody was looking is found. |
 | `bash_output` | exec | Reads a job's output by byte offset (`from` → `next`), optionally waiting up to `wait_ms` for new lines. Reports bytes the bound no longer holds instead of pretending the stream is continuous. |
 | `bash_stop` | exec | Signals a job's whole process group: SIGTERM, then SIGKILL after the grace. `forget` also deletes the record and the log, and is refused while the job runs. |
+| `save_artifact` | write | Stores a resource the agent produced — a page, a report, an image — on the server, in the artifact store rather than in a workspace, and returns a URL the console serves it from. See "Artifacts" below. |
 | `time`, `calc`, `echo` | read | The original utility tools. |
 | `skill` | read | Loads one enabled skill's instructions. The conversation's system prompt lists the enabled skills by name and description, and the model calls this to pull in a body only when a task matches — so a set of skills costs a few lines of prompt rather than their full text. Managed in 设置 → 技能. |
 | `save_document` | read | Stores a document (report, summary, note) in the OpenViking context database, where it stays searchable in later conversations. Registered only when `openviking.documents.enable` is on — the destination is the operator's configuration, so the model passes a title and a body, never a path. See `docs/openviking.md`. |
@@ -491,6 +502,44 @@ The four tools follow the same policy as `bash`: a read-only workspace refuses,
 `deny_patterns` refuses before anything runs, `cwd` is resolved inside the
 workspace, and with `enable_bash: false` or `enable_background: false` they are
 not registered at all.
+
+## Artifacts
+
+Not everything the agent makes is a file in the project. A page it generated for
+you to look at, a report it compiled, a chart it drew — those are **deliverables**,
+and their defining feature is that you want them after the workspace they were
+made in is gone. `save_artifact` is the tool for them:
+
+```
+save_artifact  kind="html"  title="巡检报告"  content="<!doctype html>…"  path="report.html"
+               → stored, url=/api/artifacts/files/<session>/1770000000-report.html
+save_artifact  kind="image" path="./charts/q3.png"      → stored from a file, not from content
+```
+
+What it does:
+
+- Writes the bytes into the **artifact store on the server** — `tools.artifacts.root`,
+  defaulting to an `artifacts/` directory beside the database file — and records a
+  row that indexes them. Not into the workspace: an artifact that vanished with
+  the working copy would not be an artifact.
+- Files by **kind and extension from a whitelist** (`html`, `md`, `txt`, `csv`,
+  `json`, `xml`, `png`, `jpg`, `gif`, `webp`, `pdf`). Anything else is refused
+  rather than stored and worried about later; the tool tells the model which types
+  were accepted so it can pick a different one.
+- Accepts either `content` (inline text, for HTML/markdown/CSV the model just
+  wrote) or `path` (an existing file inside the workspace, read and copied), and
+  refuses both at once — the ambiguity has exactly one right answer and it must
+  not be guessed.
+- Returns the **URL** when the surface serving it has an HTTP server, so the model
+  can hand you a link. A CLI (`huan-agent chat`) or one-shot (`huan-agent run`)
+  process serves no HTTP: there it reports the path it wrote and says a URL is not
+  available, rather than handing out an address nothing answers.
+- Caps one artifact at `tools.artifacts.max_bytes` (default 32 MiB). A file over
+  the cap is refused before it is written, not truncated after.
+
+Where it shows up, and the security rules behind it, are in
+`docs/admin.md` → Artifacts: a conversation's header lists its own, 统计监控 →
+产物中心 lists every session's, and the file route refuses to leave the store root.
 
 ## Workspaces
 

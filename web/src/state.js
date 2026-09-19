@@ -44,6 +44,7 @@ export const MONITOR_TABS = [
   { key: 'user', label: '按用户' },
   { key: 'recent', label: '调用记录' },
   { key: 'audit', label: '审计日志' },
+  { key: 'artifacts', label: '产物中心' },
   { key: 'traces', label: '链路追踪' },
 ]
 
