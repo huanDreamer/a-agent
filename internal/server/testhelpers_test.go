@@ -177,9 +177,17 @@ type buildOpts struct {
 	// The zero value covers a deployment with the feature off, which is why the
 	// endpoints are absent in most tests.
 	checkpoints CheckpointSettings
+	// claudeCodeFor builds the ClaudeCode compatibility mode once the store
+	// exists, so it is wired in one pass instead of assigned to a running server.
+	claudeCodeFor func(store.Store) *claudecode.Service
 	// claudeCode, when set, is the ClaudeCode compatibility mode the console
 	// switches. Nil covers a deployment that never configured it, which is the
 	// state most tests want.
+	//
+	// It must be set here rather than assigned to the running server: a server
+	// field written after Start is read by an HTTP handler on another goroutine,
+	// which is a data race the detector reports (and a real one the moment two
+	// handlers disagree about it).
 	claudeCode *claudecode.Service
 	// approvalMode is tools.approval.mode, which hooks read as Claude Code's
 	// permission_mode.
@@ -201,6 +209,9 @@ func buildServerWith(t *testing.T, opts buildOpts) (*Server, store.Store) {
 	}
 	if opts.seed != nil {
 		opts.seed(st)
+	}
+	if opts.claudeCodeFor != nil {
+		opts.claudeCode = opts.claudeCodeFor(st)
 	}
 
 	hash, err := HashPassword(adminPassword)

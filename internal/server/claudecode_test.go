@@ -39,20 +39,33 @@ func newClaudeHarness(t *testing.T, srv *Server) *harness {
 	return h
 }
 
-// claudeHarnessWithChat builds the harness with the chat routes registered.
+// claudeHarnessWithChat builds the harness with the chat routes registered and
+// the mode wired from a settings file.
 //
 // The mode's two request-level hooks (SessionStart and UserPromptSubmit) only
 // exist on a deployment with chat enabled — without a runner those routes are
 // not registered at all — so a test of them has to wire a chat, and a scripted
 // model is enough: neither hook runs a turn.
-func claudeHarnessWithChat(t *testing.T, svc *claudecode.Service) (*harness, store.Store) {
+//
+// The mode is built through buildOpts.claudeCodeFor rather than assigned to the
+// server afterwards: the harness starts the HTTP engine, and a field written
+// after that is read by a handler goroutine — a data race the detector rightly
+// reports.
+func claudeHarnessWithChat(t *testing.T, path string, enable bool) (*harness, store.Store, *claudecode.Service) {
 	t.Helper()
 	runner, err := chat.New(chat.Config{Model: &scriptedModel{}, Logger: zap.NewNop()})
 	if err != nil {
 		t.Fatalf("chat.New: %v", err)
 	}
-	srv, st := buildServerWith(t, buildOpts{chat: ChatDeps{Runner: runner}, claudeCode: svc})
-	return newClaudeHarness(t, srv), st
+	var svc *claudecode.Service
+	srv, st := buildServerWith(t, buildOpts{
+		chat: ChatDeps{Runner: runner},
+		claudeCodeFor: func(st store.Store) *claudecode.Service {
+			svc = newClaudeService(t, st, path, enable)
+			return svc
+		},
+	})
+	return newClaudeHarness(t, srv), st, svc
 }
 
 // claudeSettings writes a settings file with the given env and hooks block and
@@ -334,9 +347,7 @@ func TestSessionStartHookNamesANewConversation(t *testing.T) {
 	path := claudeSettings(t, `{`+usableEnv+`,"hooks":{"SessionStart":[{"matcher":"startup","hooks":[
 		{"type":"command","command":"`+script+`","timeout":10}]}]}}`)
 
-	h, st := claudeHarnessWithChat(t, nil)
-	svc := newClaudeService(t, st, path, true)
-	h.srv.claudeCode = svc
+	h, _, svc := claudeHarnessWithChat(t, path, true)
 
 	resp := h.postJSON(t, "/api/chat/sessions", map[string]any{})
 	var body struct {
@@ -375,9 +386,7 @@ exit 2`)
 	path := claudeSettings(t, `{`+usableEnv+`,"hooks":{"UserPromptSubmit":[{"matcher":"*","hooks":[
 		{"type":"command","command":"`+script+`","timeout":10}]}]}}`)
 
-	h, st := claudeHarnessWithChat(t, nil)
-	svc := newClaudeService(t, st, path, true)
-	h.srv.claudeCode = svc
+	h, st, _ := claudeHarnessWithChat(t, path, true)
 	srv := h.srv
 
 	ctx := context.Background()
