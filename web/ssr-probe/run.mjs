@@ -35,6 +35,7 @@ import {
   renderBudgetPanel,
   renderChatHeader,
   renderClaudeCodePanel,
+  renderClaudeRibbon,
   renderDirPicker,
   renderLogin,
   renderMessageBubble,
@@ -266,10 +267,12 @@ check('compression off raises the warning', html.includes('context.max_tokens'))
 check('the warning names the cost', html.includes('近似平方增长'))
 check('unlimited values render as 不限', html.includes('不限'))
 
-// 13. 对话 header: the totals line sits in front of the message count, and a
-//     conversation that has run nothing shows one number instead of a row of
-//     zeros. Both are asserted because the header is always in view: a wrong
-//     number here is seen on every turn.
+// 13. 对话 header: one line of totals — how much conversation there is (轮数 ·
+//     消息条数) then what it cost (模型 · 工具 · token) — and a conversation that
+//     has run nothing shows its two counts instead of a row of zeros. Both are
+//     asserted because the header is always in view: a wrong number here is seen
+//     on every turn, and the tool numbers in particular must match the per-turn
+//     执行过程 line rather than being counted from somewhere else.
 html = await renderChatHeader({
   session: { id: 's1', title: '统计会话', message_count: 120 },
   stats: {
@@ -285,17 +288,29 @@ html = await renderChatHeader({
   },
 })
 check('the header shows the turn count', html.includes('轮 7'), html.slice(0, 120))
+check('the header shows the message count beside it', html.includes('共 120 条消息'))
+// The hover text repeats the numbers, so the ordering has to be read off the
+// visible line rather than off the document (the title attribute comes first in
+// the markup, and it is not what a reader reads).
+const headerText = html.replace(/title="[^"]*"/g, '')
+check(
+  'the counts come first, the costs after them',
+  headerText.indexOf('轮 7') < headerText.indexOf('共 120 条消息') &&
+    headerText.indexOf('共 120 条消息') < headerText.indexOf('模型 23 次'),
+  headerText.slice(0, 200),
+)
 check('the header shows model calls with their duration', html.includes('模型 23 次 · 3m04s'))
 check('the header shows tool calls with their duration', html.includes('工具 41 次 · 5.2s'))
 check('the header shows the token total', html.includes('854K tokens'))
-check('the message count is still there', html.includes('共 120 条消息'))
 check('the totals carry their explanation', html.includes('不是这段对话的墙钟长度'))
+check('the tool total says where it is counted', html.includes('与每条回答下面那行「执行过程」同一份数据'))
 
 html = await renderChatHeader({
   session: { id: 's2', title: '新对话', message_count: 0 },
   stats: { turns: 0 },
 })
 check('an unused conversation shows 轮 0', html.includes('轮 0'))
+check('an unused conversation still shows 共 0 条消息', html.includes('共 0 条消息'))
 check('an unused conversation shows no token segment', !html.includes('tokens<'), html.slice(0, 200))
 check('an unused conversation shows no tool segment', !html.includes('工具 0 次'))
 
@@ -1254,7 +1269,7 @@ check(
   check('the footer says where to change a window', html.includes('模型管理'), '')
 }
 
-/* ------------------------------------ ClaudeCode 兼容模式（面板 + 徽标） -- */
+/* ---------------------------------- ClaudeCode 兼容模式（面板 + 角落丝带） -- */
 
 // 15. The mode that makes this agent run on Claude Code's own model configuration.
 //     The probe exists for the four facts this panel could quietly get wrong, all of
@@ -1265,9 +1280,10 @@ check(
 //       * the token is masked, and an env row marked `secret` must not print the key
 //         it was given even when the server does send one;
 //       * an event or handler this agent cannot dispatch is never shown as working;
-//       * and the sidebar badge, which reads the same store, must render nothing at
-//         all until that store has an answer — a wrong 本机模式 next to a running
-//         conversation is the one thing it must never flash.
+//       * and the corner ribbon, which reads the same store, appears only while the
+//         mode is on. That is the whole point of the ribbon replacing the old sidebar
+//         badge: the default state ("mode off") is not a state worth a label, and the
+//         ribbon must never flash before the store has an answer.
 {
   const ccStatus = {
     mode: 'claudecode',
@@ -1518,34 +1534,55 @@ check(
     '',
   )
 
-  // --- the sidebar badge ------------------------------------------------
+  // --- the corner ribbon ------------------------------------------------
 
-  // Before the probe answers, nothing renders: 本机模式 there would be a claim about
-  // every conversation in the list below it.
+  // Before the probe answers, nothing renders — the ribbon is a claim that the mode
+  // is on, and the store has not said so yet.
   setClaudeCode(null, { status: 'loading' })
-  html = await renderSidebar()
-  check('an unanswered probe renders no mode badge', !html.includes('side-mode'), '')
-  check('an unanswered probe never claims 本机模式', !html.includes('本机模式'), '')
+  html = await renderClaudeRibbon()
+  check('an unanswered probe renders no ribbon', !html.includes('cc-ribbon'), html.slice(0, 120))
 
+  // The mode's default state needs no label: that is what makes the ribbon a
+  // signal rather than permanent furniture.
   setClaudeCode({ ...ccStatus, compat: false, mode: 'native' })
-  html = await renderSidebar()
-  check('the badge names 本机模式 when the mode is off', html.includes('本机模式'), '')
-  check('the badge names the model the last message ran on', html.includes('deepseek-chat'), '')
+  html = await renderClaudeRibbon()
+  check('the mode off draws no ribbon', !html.includes('cc-ribbon'), html.slice(0, 120))
+  check('the mode off claims nothing about 本机模式', !html.includes('本机模式'), '')
 
+  // On: a marker across the corner, naming the mode — and nothing more. It is not
+  // a control, so the checks below are as much about what it must *not* be: no
+  // button, no click handler, no link into 设置 that a reader could mistake for the
+  // switch itself, and no hover text (it cannot receive a hover — see the class,
+  // it is `pointer-events: none` so the 新建对话 button under its corner keeps
+  // every click). What the mode actually runs is in the label, which is what a
+  // screen reader reads where a sighted reader reads two words.
+  setClaudeCode(ccStatus)
+  html = await renderClaudeRibbon()
+  check('the mode on draws the ribbon', html.includes('cc-ribbon'), html.slice(0, 120))
+  check(
+    'the ribbon says ClaudeCode and nothing else',
+    html.replace(/<[^>]*>/g, '').trim() === 'ClaudeCode',
+    html.slice(0, 160),
+  )
+  check('the ribbon is not a button', !html.includes('<button'), html.slice(0, 160))
+  check('the ribbon has no click handler to fire', !html.includes('onClick'), '')
+  check('the ribbon offers no hover text it could never show', !html.includes('title='), '')
+  check('the ribbon label names the mode', html.includes('兼容模式已开启'), '')
+  check('the ribbon label names the model the mode actually runs', html.includes('deepseek-flash[1m]'), '')
+  check('the ribbon label says the mode overrides every conversation', html.includes('覆盖每个对话'), '')
+  check('the ribbon label says where the switch is, not that it is one', html.includes('在 设置 → ClaudeCode 里切换'), '')
+  check('the ribbon carries no 本机模式 claim', !html.includes('本机模式'), '')
+
+  // A read that failed is not a mode either: guessing "on" would decorate a console
+  // that is not in the mode, and the panel is where the reason belongs.
+  setClaudeCode(null, { status: 'error', error: '无法连接到服务器，请确认服务正在运行' })
+  html = await renderClaudeRibbon()
+  check('a failed mode read draws no ribbon', !html.includes('cc-ribbon'), html.slice(0, 120))
+
+  // The sidebar no longer carries any of this: the mode is the shell's business.
   setClaudeCode(ccStatus)
   html = await renderSidebar()
-  check('the badge names ClaudeCode 兼容 when it is on', html.includes('ClaudeCode 兼容'), '')
-  check(
-    'the badge leads with the model the mode actually runs',
-    html.includes('deepseek-flash[1m]') && !html.includes('deepseek-chat'),
-    '',
-  )
-
-  // A read that failed is stated rather than hidden: a badge that disappeared would
-  // read as "nothing to see here".
-  setClaudeCode(null, { status: 'error', error: '无法连接到服务器，请确认服务正在运行' })
-  html = await renderSidebar()
-  check('a failed mode read shows as unknown', html.includes('模式未知'), '')
+  check('the sidebar carries no mode badge any more', !html.includes('side-mode'), '')
 }
 
 console.log(failures === 0 ? '\nALL PROBES PASSED' : `\n${failures} PROBE(S) FAILED`)

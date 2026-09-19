@@ -2,7 +2,9 @@
 
 兼容模式让 huan-agent 直接跑在 Claude Code 的配置上：读 `~/.claude/settings.json`，
 把模型换成那里的端点与模型，把那五个事件上注册的 hook 挂在真实触发点上。
-开关在 **设置 → ClaudeCode**，侧边栏「新建对话」下面会写明当前是哪一种模式。
+开关在 **设置 → ClaudeCode**；兼容模式开着时，窗口左上角斜浮一条 `ClaudeCode` 丝带
+（只是标识：不占位置、不响应点击、也不会挡住它盖住的那块内容），关掉时什么都不显示
+——默认状态不需要标注。
 
 一句话概括它解决的问题：一台机器上已经为 Claude Code 配好了端点、凭据、模型和 hook，
 兼容模式让这些配置原样生效，而不是让你把它们再抄一份到 `config.yaml` 里、然后两边慢慢发散。
@@ -19,7 +21,7 @@
 
 | 项 | 说明 |
 | :--- | :--- |
-| 开在哪里 | 设置 → ClaudeCode；侧边栏徽章显示当前模式与生效模型，点它跳到这个 tab |
+| 开在哪里 | 设置 → ClaudeCode；兼容模式开着时窗口左上角斜浮一条 `ClaudeCode` 丝带。它不占布局（页面照旧，不被挤开）、不接收点击（`pointer-events: none`，所以它盖住的那一角按钮照样能点），也不显示悬停提示——实际跑的模型在面板里看。窗口窄于 900px（侧边栏变成抽屉）时丝带不显示 |
 | 存在哪里 | 数据库 `app_settings.claudecode.mode`（`native` / `claudecode`）。没写过这个键时，用 `config.yaml` 的 `claudecode.enable` |
 | 何时生效 | 下一条消息。切换会作废缓存的 runner，所以已建的对话也会跟着换 |
 | 影响谁 | **所有对话**。兼容模式开着时，每轮都跑 `model.effective_model`，覆盖会话里单独选的模型；关掉后恢复本机模型 |
@@ -251,7 +253,7 @@ Stop              matcher=*                                  value=         exit
 
 | 症状 | 原因 |
 | :--- | :--- |
-| 侧边栏一直显示「模式未知」 | `GET /api/claudecode` 没通（服务未起、或版本里没有这个路由） |
+| 兼容模式开着但左上角没有丝带 | `GET /api/claudecode` 没通（服务未起、或版本里没有这个路由）：丝带只在读到的状态是「开着」时出现，读不到就不猜。面板里会写明原因 |
 | 开关点不动 / 显示不可用 | `model.problem`：settings.json 缺 `ANTHROPIC_BASE_URL`、缺凭据、或没有任何模型名 |
 | 开关打开了但模型没变 | `model.ready` 为 false 时每轮仍跑本机模型，面板上写着原因；修好 settings.json 后点「重新读取」 |
 | hook 一个都没跑 | 兼容模式没开、`claudecode.hooks` 为 false、`disableAllHooks: true`、或 settings.json 里没配 hook —— 面板的 `hooks.reason` 按这个顺序给出第一个原因 |

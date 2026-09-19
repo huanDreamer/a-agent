@@ -13,6 +13,7 @@ import ModelPanel from '../src/components/ModelPanel.vue'
 import ArtifactsView from '../src/components/ArtifactsView.vue'
 import ApprovalCard from '../src/components/ApprovalCard.vue'
 import ClaudeCodePanel from '../src/components/ClaudeCodePanel.vue'
+import ClaudeRibbon from '../src/components/ClaudeRibbon.vue'
 import TaskBoard from '../src/components/TaskBoard.vue'
 import { api } from '../src/api.js'
 import { askFromEvent, askFromTool, applyAskOutcome, askAnswerLine, isAskTool } from '../src/ask.js'
@@ -507,11 +508,19 @@ export async function renderClaudeCodePanel(snapshot, { status = 'ready', error 
 }
 
 /**
- * Seed the mode store for the sidebar badge, which is the other half of the same
- * store — and the one that must render *nothing* until it has an answer.
+ * Seed the mode store — the same one the panel and the ribbon read.
+ *
+ * The ribbon is the console's only word about 兼容模式 outside 设置, and the half
+ * that must render *nothing* until the store has an answer, so the probe seeds the
+ * store here and then renders whichever surface it is asking about.
  */
 export function setClaudeCode(snapshot, { status = 'ready', error = '' } = {}) {
   Object.assign(claudeCode, { snapshot, status, error, busy: false })
+}
+
+/** Render the shell's ClaudeCode corner ribbon (ClaudeRibbon.vue). */
+export async function renderClaudeRibbon() {
+  return renderWithTeleports(ClaudeRibbon, {})
 }
 
 

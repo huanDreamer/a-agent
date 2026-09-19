@@ -9,6 +9,13 @@
 // Only inner panes scroll — the document itself never does. Below 900px the
 // sidebar turns into an overlay drawer driven by ui.drawerOpen.
 //
+// The shell also draws the ClaudeCode sash (ClaudeRibbon.vue), because 兼容模式 is
+// a fact about the whole app rather than about the conversation on screen. It is
+// fixed to the viewport's top-left corner and takes no room in this grid — no
+// padding, no modifier class, nothing here knows it is up — so the two columns
+// below are laid out exactly as they were before it existed, whether or not the
+// mode is on.
+//
 // Three surfaces: 对话 (the primary one), 设置 and 统计监控 — the latter two
 // are the only sidebar menu entries.
 //
@@ -20,6 +27,7 @@
 import { computed, onMounted, watch } from 'vue'
 import AppSidebar from './components/AppSidebar.vue'
 import ChatView from './components/ChatView.vue'
+import ClaudeRibbon from './components/ClaudeRibbon.vue'
 import LoginView from './components/LoginView.vue'
 import MonitorView from './components/MonitorView.vue'
 import SettingsView from './components/SettingsView.vue'
@@ -89,6 +97,8 @@ watch(
   <LoginView v-else-if="needsLogin" @signed-in="onSignedIn" />
 
   <div v-else class="app">
+    <ClaudeRibbon />
+
     <div class="side" :class="{ open: ui.drawerOpen }">
       <AppSidebar @select="ui.drawerOpen = false" />
     </div>

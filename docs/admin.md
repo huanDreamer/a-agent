@@ -426,11 +426,17 @@ Behaviour worth knowing:
 - The first message auto-titles an untitled session.
 
 Stored assistant rows carry `content` (the answer), `reasoning` (the turn's whole
-thinking), `tool_calls` (a flat list of every call, for the audit and the
-statistics) and `steps` — a JSON array of `{index, reasoning, text, tools[]}`
+thinking), `tool_calls` (a flat list of every call, for the audit and for clients
+that read no steps) and `steps` — a JSON array of `{index, reasoning, text,
+tools[]}`
 where `text` of the last step is the answer and every earlier one is process. A
 row written before `steps` existed reads back with it empty, and the console
-rebuilds a single process block from `reasoning` + `tool_calls`.
+rebuilds a single process block from `reasoning` + `tool_calls`. The chat header
+counts its `工具` totals off the same `steps` the transcript renders — falling
+back to `tool_calls` for those older rows — so the header can never report no
+tool calls while the answers under it each list one. The header's line reads
+`轮 N · 共 M 条消息 · 模型 N 次 · <耗时> · 工具 N 次 · <耗时> · N tokens`, with the
+segments that have nothing to say left out.
 
 ### Asking the user (the `ask_user` card)
 

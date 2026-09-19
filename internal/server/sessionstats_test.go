@@ -180,3 +180,102 @@ type emptyStatsStore struct {
 func (emptyStatsStore) QueryInvocationTotals(context.Context, string) (store.InvocationTotals, error) {
 	return store.InvocationTotals{}, nil
 }
+
+// TestSessionStats_CountsTheToolsTheTranscriptShows is the regression test for a
+// header that said a conversation had called no tools while every answer in it
+// listed one: the count used to be read from the flat tool_calls column only, and
+// a turn stored before that column was filled — or before steps were kept —
+// carries its calls in the steps alone.
+//
+// The number has to come from the same place the console renders, so the header
+// and the per-turn 执行过程 line can never disagree.
+func TestSessionStats_CountsTheToolsTheTranscriptShows(t *testing.T) {
+	srv := &Server{logger: zap.NewNop()}
+	srv.store = emptyStatsStore{}
+	got := srv.sessionStatsFor(context.Background(), "s", []store.ChatMessage{
+		{Role: store.RoleUser, Content: "做点事"},
+		{
+			// No tool_calls column, no audit rows: the steps are the only account
+			// of this turn, exactly as the browser sees it.
+			Role: store.RoleAssistant,
+			Steps: `[{"index":1,"tools":[{"id":"c1","name":"bash","duration_ms":45},` +
+				`{"id":"c2","name":"read_file"}]},` +
+				`{"index":2,"tools":[{"id":"c3","name":"apply_patch","duration_ms":120}]}]`,
+			UsageJSON: `{"total_tokens":50,"duration_ms":900}`,
+		},
+	})
+	if got.ToolCalls != 3 {
+		t.Errorf("tool_calls = %d, want 3 from the steps", got.ToolCalls)
+	}
+	if got.ToolDurationMs != 165 {
+		t.Errorf("tool_duration_ms = %d, want 45+120 from the steps", got.ToolDurationMs)
+	}
+
+	// A turn with both accounts of the same calls must not be counted twice: the
+	// steps are the source, the flat column is only the fallback.
+	got = srv.sessionStatsFor(context.Background(), "s", []store.ChatMessage{
+		{
+			Role:      store.RoleAssistant,
+			Steps:     `[{"index":1,"tools":[{"id":"c1","name":"bash","duration_ms":10}]}]`,
+			ToolCalls: `[{"id":"c1","name":"bash"},{"id":"c2","name":"bash"}]`,
+		},
+	})
+	if got.ToolCalls != 1 {
+		t.Errorf("tool_calls = %d, want 1 (the steps, not the steps plus the flat list)", got.ToolCalls)
+	}
+
+	// A turn that kept no steps at all is still counted: that is what the flat
+	// column is for.
+	got = srv.sessionStatsFor(context.Background(), "s", []store.ChatMessage{
+		{
+			Role:      store.RoleAssistant,
+			ToolCalls: `[{"id":"c1","name":"bash"},{"id":"c2","name":"bash"}]`,
+		},
+	})
+	if got.ToolCalls != 2 {
+		t.Errorf("tool_calls = %d, want 2 from the flat list", got.ToolCalls)
+	}
+}
+
+// TestSessionStats_FallsBackToTheAuditLogForTiming: a conversation whose steps
+// recorded no timing still gets its tool duration from the audit log, and a
+// conversation whose steps did record one keeps the steps' number — the two are
+// one quantity, so one of them is chosen, never both.
+func TestSessionStats_FallsBackToTheAuditLogForTiming(t *testing.T) {
+	newServer := func(totals store.InvocationTotals) *Server {
+		srv := &Server{logger: zap.NewNop()}
+		srv.store = fixedStatsStore{totals: totals}
+		return srv
+	}
+	silentSteps := []store.ChatMessage{{
+		Role:      store.RoleAssistant,
+		Steps:     `[{"index":1,"tools":[{"id":"c1","name":"bash"}]}]`,
+		ToolCalls: `[{"id":"c1","name":"bash"}]`,
+	}}
+
+	got := newServer(store.InvocationTotals{Calls: 1, DurationMs: 700}).sessionStatsFor(
+		context.Background(), "s", silentSteps)
+	if got.ToolDurationMs != 700 {
+		t.Errorf("tool_duration_ms = %d, want 700 from the audit log", got.ToolDurationMs)
+	}
+
+	got = newServer(store.InvocationTotals{Calls: 9, DurationMs: 9999}).sessionStatsFor(
+		context.Background(), "s", []store.ChatMessage{{
+			Role:      store.RoleAssistant,
+			Steps:     `[{"index":1,"tools":[{"id":"c1","name":"bash","duration_ms":45}]}]`,
+			ToolCalls: `[{"id":"c1","name":"bash"}]`,
+		}})
+	if got.ToolDurationMs != 45 {
+		t.Errorf("tool_duration_ms = %d, want 45 from the steps", got.ToolDurationMs)
+	}
+}
+
+// fixedStatsStore answers the aggregate query with one fixed answer.
+type fixedStatsStore struct {
+	store.Store
+	totals store.InvocationTotals
+}
+
+func (f fixedStatsStore) QueryInvocationTotals(context.Context, string) (store.InvocationTotals, error) {
+	return f.totals, nil
+}

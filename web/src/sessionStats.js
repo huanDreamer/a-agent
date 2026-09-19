@@ -43,9 +43,14 @@ export function normalizeStats(raw) {
  * which is more informative than four zeros competing for the same line.
  *
  * `turns` is always present — it is the one number that is meaningful at 0, and
- * the line's anchor.
+ * the line's anchor — and `messageCount` (the session's own count, passed in by
+ * the header) sits directly behind it: together they say how much conversation
+ * there is, before the segments that say what it cost. It is not read from the
+ * payload because the session row carries it and it is the number the sidebar
+ * counts; a header whose message count disagreed with the list would be worse
+ * than one without it.
  */
-export function statsSegments(raw) {
+export function statsSegments(raw, { messageCount } = {}) {
   const s = normalizeStats(raw)
   const segments = [
     {
@@ -54,6 +59,17 @@ export function statsSegments(raw) {
       title: `共 ${formatCount(s.turns)} 轮：你发起的请求数`,
     },
   ]
+  // A number is rendered even at 0 — like `turns`, "no messages yet" is a fact
+  // worth the four characters. Absent (a caller that has no session) means the
+  // segment is not this module's to invent.
+  const messages = Number(messageCount)
+  if (Number.isFinite(messages) && messages >= 0) {
+    segments.push({
+      key: 'messages',
+      text: `共 ${formatCount(messages)} 条消息`,
+      title: `共 ${formatCount(messages)} 条消息：你说的每一句和模型写下的每一段都算一条`,
+    })
+  }
   if (s.llmCalls > 0) {
     segments.push({
       key: 'llm',
@@ -69,7 +85,7 @@ export function statsSegments(raw) {
       text: `工具 ${formatCount(s.toolCalls)} 次 · ${formatDuration(s.toolDurationMs)}`,
       title:
         `工具调用 ${formatCount(s.toolCalls)} 次，实测耗时合计 ${formatDuration(s.toolDurationMs)}` +
-        '（来自工具调用审计日志）',
+        '（来自每一轮存下来的过程记录，与每条回答下面那行「执行过程」同一份数据）',
     })
   }
   if (s.totalTokens > 0) {
@@ -90,9 +106,9 @@ export function statsSegments(raw) {
  * statsTitle is the whole line's tooltip: the segments' own titles, plus the one
  * caveat a reader would otherwise read as a bug.
  */
-export function statsTitle(raw) {
+export function statsTitle(raw, options) {
   return [
-    ...statsSegments(raw).map((segment) => segment.title),
+    ...statsSegments(raw, options).map((segment) => segment.title),
     '两个耗时都不是这段对话的墙钟长度：排队、步与步之间的思考、以及你本人停顿的时间都不计在内。',
   ].join('\n')
 }

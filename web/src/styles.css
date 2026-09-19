@@ -272,14 +272,13 @@ samp {
 
 /* ------------------------------------------------------------- sidebar --- */
 
-/* Four regions, in this order: 新建对话 with the run-mode badge under it, the
-   session list (which takes every remaining pixel and scrolls), the two pinned
-   menu items, and — only where the deployment enforces a password — the account.
-   Nothing sits above the button — no brand, no theme control — and nothing follows
-   the menu except that account. The one line under the button says which mode the
-   next message runs on: it is not a control over conversations like the rows below
-   it, but a fact about all of them (turning 兼容 on overrides the model each one
-   picked), and it is switched one click away in 设置 → ClaudeCode. */
+/* Four regions, in this order: 新建对话, the session list (which takes every
+   remaining pixel and scrolls), the two pinned menu items, and — only where the
+   deployment enforces a password — the account. Nothing sits above the button — no
+   brand, no theme control — and nothing follows the menu except that account.
+   Which mode the next message runs on is not here at all: 兼容模式 is a fact about
+   the whole app, so the shell draws it as the corner ribbon (.cc-ribbon) and the
+   sidebar's first slot belongs to the one button that starts a conversation. */
 .side-panel {
   display: flex;
   flex-direction: column;
@@ -4984,94 +4983,70 @@ table.data tbody tr.row-click:focus-visible {
   font-size: 12px;
 }
 
-/* --------------------------------------------------- 运行模式（侧栏） ---- */
+/* --------------------------------------------------- 运行模式（角落丝带） -- */
 
-/* The badge under 新建对话: which mode the next message runs on, and which model
-   that mode resolves to. It is the second element of the sidebar and the only one
-   besides the list that is not a control over conversations, because turning
-   ClaudeCode 兼容 on overrides the model every conversation in that list picked —
-   a fact about the whole app, shown where the whole app is listed.
+/* ClaudeCode 兼容模式, as a diagonal sash floating over the window's top-left
+   corner — the only thing the console says about the mode outside 设置.
 
-   It is a button rather than a label: the mode is switched in 设置 → ClaudeCode,
-   and this is the shortest way there. The two lines are sized so the model name,
-   which is the part that changes, does not move the row above it. */
-.side-mode {
-  appearance: none;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  width: 100%;
-  min-width: 0;
-  margin-top: 6px;
-  padding: 6px 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--muted-foreground);
-  text-align: left;
-  transition: background 0.15s ease, border-color 0.15s ease;
-}
+   It replaces a two-line purple badge that used to sit under 新建对话: that badge
+   took the sidebar's first slot (competing with the one button that is actually
+   clicked there) and rendered while the mode was *off* too, so the default state
+   was permanent furniture. The sash is two words in a corner and it exists only
+   while the mode is on. It is a marker, not a control: no click, no focus, no
+   cursor, and no layout.
 
-.side-mode:hover {
-  background: var(--muted);
-  border-color: var(--border-strong);
-}
+   That last part is the whole design. The sash floats: it pushes nothing aside and
+   the page underneath is exactly where it would be without it, so the corner it
+   crosses is the 新建对话 button's top-left end. Two consequences, both deliberate:
 
-.side-mode-line {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--foreground);
-}
+     - `pointer-events: none`. It has to be, or the ribbon would eat the clicks on
+       the part of that button it covers. A marker that answers no clicks must not
+       swallow them either — which also means no hover text: what the mode actually
+       runs is in 设置 → ClaudeCode, where the switch is.
+     - The layout knows nothing about it. There is no padding, no reserved strip
+       and no `.app` modifier; a deployment in the default (non-compat) mode has
+       the same CSS reachable as one in 兼容模式.
 
-.side-mode-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.side-mode-model {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--muted-foreground);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* 兼容模式 is the state that is *not* the default, so it is the one that is
-   coloured. Text uses --accent-purple rather than --accent-purple-soft: the soft
-   variants are for borders and icons only (see the token block at the top). */
-.side-mode.compat {
-  border-color: var(--accent-purple-soft);
+   One element, rotated -45° about a point on the corner diagonal. Its ends land
+   off the top and left edges of the window and the viewport clips them there,
+   which is exactly the shape wanted: a band laid across the corner, cut by the
+   window rather than by a wrapper, so there is no clipping box either. `top`/`left`
+   are the *centre* of the band and the negative margins centre the unrotated box on
+   it; those two numbers are how far from the corner the sash sits. */
+.cc-ribbon {
+  position: fixed;
+  top: 26px;
+  left: 26px;
+  z-index: 40;
+  width: 132px;
+  height: 18px;
+  margin: -9px 0 0 -66px;
+  transform: rotate(-45deg);
   background: var(--accent-purple-fill);
-}
-
-.side-mode.compat:hover {
-  border-color: var(--accent-purple);
-}
-
-.side-mode.compat .side-mode-line {
+  border-bottom: 1px solid var(--accent-purple-soft);
   color: var(--accent-purple);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  line-height: 17px;
+  text-align: center;
+  white-space: nowrap;
+  /* Nothing under the sash may lose a click to it — see the note above. */
+  pointer-events: none;
+  /* Only the two ends hang off the window, so nothing here may scroll or clip. */
+  overflow: visible;
 }
 
-.side-mode.compat .side-mode-model {
-  color: var(--accent-purple-soft);
-}
-
-/* The probe failed. Dashed rather than coloured: nothing is known about the mode,
-   and a badge that read as a state would be the one thing this must not do. */
-.side-mode.unknown {
-  border-style: dashed;
-  border-color: var(--warning-soft);
-}
-
-.side-mode.unknown .side-mode-line {
-  color: var(--warning-soft);
+/* Narrow windows: the sidebar leaves the layout and becomes an overlay drawer
+   (≤900px), so the window's top-left corner belongs to the chat header's
+   显示会话列表 button instead — the one corner where a floating sash would sit on
+   top of a control that has no room left around it. Dropped there; the mode is
+   still named in 设置 → ClaudeCode, which is where it is switched. */
+@media (max-width: 900px) {
+  .cc-ribbon {
+    display: none;
+  }
 }
 
 /* --------------------------------------------- ClaudeCode 兼容模式 ------- */

@@ -259,26 +259,27 @@ export const needsLogin = computed(
 /**
  * ClaudeCode 兼容模式 — one reactive answer for the whole console.
  *
- * Two surfaces show the mode and they are never on screen in a state where one
- * could ask the server and the other could not: the sidebar badge (which mode the
- * next message runs on, on every screen) and 设置 → ClaudeCode. So the answer lives
- * here rather than inside either of them.
+ * Two surfaces read the mode and they are never on screen in a state where one
+ * could ask the server and the other could not: the corner ribbon (the only place
+ * the console says the mode is on, on every screen) and 设置 → ClaudeCode. So the
+ * answer lives here rather than inside either of them.
  *
- *   snapshot  the server's own status payload, verbatim — the badge and the panel
+ *   snapshot  the server's own status payload, verbatim — the ribbon and the panel
  *             read the same fields, so they cannot render two different modes;
  *   status    'loading' | 'error' | 'ready', for AsyncBlock in the panel;
- *   error     why the last read failed (the badge says so instead of guessing);
+ *   error     why the last read failed (the panel says so instead of guessing);
  *   busy      a mutation is in flight — the switch and 重新读取 settings.json both
  *             disable on it, whichever one was used.
  *
- * `snapshot === null` means the probe has not answered. The badge renders nothing
- * in that state on purpose: "本机模式" is a claim about every conversation in the
- * list, and it would be wrong exactly when the mode was switched from another tab.
+ * `snapshot === null` means the probe has not answered, and the console draws
+ * nothing about the mode then (see `claudeCompat`): the mode's own default is
+ * "off", and a claim about every conversation would be wrong exactly when the mode
+ * was switched from another tab.
  *
  * Mutations (`setClaudeCodeMode` / `reloadClaudeCodeSettings`) throw on failure and
  * adopt the server's answer on success, the way `saveBudget` does: the panel shows
- * the server's own words, and the badge is updated from the same object rather than
- * from what the button asked for.
+ * the server's own words, and `claudeCompat` follows the same object rather than
+ * what the button asked for.
  */
 export const claudeCode = reactive({
   snapshot: null,
@@ -286,6 +287,17 @@ export const claudeCode = reactive({
   error: '',
   busy: false,
 })
+
+/**
+ * Whether 兼容模式 is on — the one fact the console draws outside 设置.
+ *
+ * It is a computed of its own because the sash is not the only reader that wants
+ * exactly this boolean rather than the payload: the mode's *default* state needs no
+ * label, so every surface that would draw something has to ask this first, and none
+ * of them should re-derive it from `snapshot.compat`. Nothing about it is layout —
+ * the sash floats, so no shell rule depends on this value.
+ */
+export const claudeCompat = computed(() => Boolean(claudeCode.snapshot && claudeCode.snapshot.compat))
 
 /** Read the mode's status. `quiet` keeps whatever is on screen while it reloads. */
 export async function loadClaudeCode({ quiet = false } = {}) {

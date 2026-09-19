@@ -50,7 +50,6 @@ import {
   noteArtifactToolRan,
 } from '../artifactsStore.js'
 import { pendingApprovals } from '../approval.js'
-import { formatCount } from '../format.js'
 import { planResumable } from '../plan.js'
 import { subagentChipLabel, subagentHintText } from '../subagentsChip.js'
 import {
@@ -88,16 +87,21 @@ const session = computed(() => chat.session)
 const items = computed(() => chat.items)
 
 /**
- * The header's statistics line: 轮数 · 模型调用 · 工具调用 · token.
+ * The header's statistics line: 轮数 · 消息条数 · 模型调用 · 工具调用 · token.
  *
  * The values are the server's aggregate (chat.stats), which the authoritative
  * reload at the end of every turn refreshes — so they are already current by the
  * time a turn's output stops moving, and they are the same numbers after a
- * reload. A conversation that has not run anything yet renders the turn count
- * alone rather than a row of zeros.
+ * reload. A conversation that has not run anything yet renders the turn and
+ * message counts alone rather than a row of zeros.
+ *
+ * The message count comes from the session row rather than the aggregate: it is
+ * the number the sidebar counts, and it is there even for a conversation the
+ * aggregate has nothing to say about.
  */
-const statSegments = computed(() => statsSegments(chat.stats))
-const statsDetail = computed(() => statsTitle(chat.stats))
+const messageCount = computed(() => (session.value ? session.value.message_count : undefined))
+const statSegments = computed(() => statsSegments(chat.stats, { messageCount: messageCount.value }))
+const statsDetail = computed(() => statsTitle(chat.stats, { messageCount: messageCount.value }))
 
 /**
  * The background-process chip in the header.
@@ -593,20 +597,19 @@ onBeforeUnmount(stopSettling)
              folder, and repeating it in the header only took room from what the
              header is actually for. A conversation is now placed in a workspace
              when it is created (the folder's + button) and stays there. -->
-        <!-- The conversation's totals, in front of the message count because they
-             are what a long conversation is actually judged by: how many turns
-             went into it, what the model cost, what the tools cost, and how many
-             tokens it all came to. Each segment carries its own explanation on
-             hover, including the one caveat that matters — neither duration is
-             the conversation's wall-clock length. -->
+        <!-- The conversation's totals, from how much conversation there is
+             (轮数 · 消息条数) to what it cost (模型 · 工具 · token) — the numbers a
+             long conversation is actually judged by. They are one group rather
+             than a group plus a trailing count, so the message count keeps its
+             place beside the turn count and each segment carries its own
+             explanation on hover, including the one caveat that matters —
+             neither duration is the conversation's wall-clock length. -->
         <span class="muted-note nowrap chat-stats" :title="statsDetail">
           <template v-for="(segment, index) in statSegments" :key="segment.key">
             <span v-if="index > 0" class="dimmer" aria-hidden="true">·</span>
             <span>{{ segment.text }}</span>
           </template>
         </span>
-        <span class="dimmer nowrap" aria-hidden="true">·</span>
-        <span class="muted-note nowrap">共 {{ formatCount(session.message_count) }} 条消息</span>
 
         <!-- This conversation's background processes. The count is conversation
              state, so it lives on the conversation's own header rather than in
