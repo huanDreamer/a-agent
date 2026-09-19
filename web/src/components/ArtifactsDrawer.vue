@@ -22,7 +22,7 @@ import { computed, ref } from 'vue'
 import AsyncBlock from './AsyncBlock.vue'
 import Icon from './Icon.vue'
 import { artifactUrl } from '../api.js'
-import { artifactLabel, extensionOf, kindIcon, kindLabel } from '../artifactsChip.js'
+import { artifactLabel, fileName, extensionOf, kindIcon, kindLabel } from '../artifactsChip.js'
 import { formatBytes, formatRelative, formatAbsolute } from '../format.js'
 import {
   artifacts,
@@ -131,6 +131,9 @@ async function runDelete(artifact) {
               <span class="dimmer nowrap">{{ formatBytes(item.bytes) }}</span>
             </div>
 
+            <div class="dimmer mono cell-note" :title="item.path">
+              {{ fileName(item.path) || item.path }}
+            </div>
             <div class="dimmer mono cell-note" :title="item.path">
               {{ extensionOf(item.path) || item.mime }}{{ extensionOf(item.path) ? ` · ${item.mime}` : '' }}
             </div>

@@ -9,8 +9,8 @@
 //     cd web && node scripts/check-artifacts.mjs
 //
 // (Run from web/, like check-stats.mjs.)
-import { artifactLabel, artifactChipLabel, artifactHintText, extensionOf, kindIcon, kindLabel } from '../src/artifactsChip.js'
-import { filterArtifacts, orphanCount, sessionLabel, totalBytes } from '../src/artifactsView.js'
+import { artifactLabel, artifactChipLabel, artifactHintText, extensionOf, fileName, kindIcon, kindLabel } from '../src/artifactsChip.js'
+import { filterArtifacts, groupByDay, dayKey, orphanCount, sessionLabel, totalBytes } from '../src/artifactsView.js'
 
 let failures = 0
 const check = (name, cond, detail = '') => {
@@ -41,6 +41,47 @@ check('an unknown kind still gets an icon', kindIcon('video') === 'package')
 check('the button counts', artifactChipLabel(3, true) === '3 个产物')
 check('a disabled deployment says so rather than counting', artifactChipLabel(3, false) === '产物未启用')
 check('a live deployment with none says zero', artifactChipLabel(0, true) === '0 个产物')
+
+// --- a name's file name --------------------------------------------------
+
+// The stored file name is the reason a reader can tell two artifacts apart:
+// since artifacts are saved under a title-derived stem, showing the last path
+// segment is showing what the model actually saved.
+check('the file name is the last segment', fileName('s1/2026-02-14/季度报告.html') === '季度报告.html')
+check('a date folder does not become the name', fileName('s1/2026-02-14/report.html') === 'report.html')
+check('a path with no folder is its own name', fileName('index.html') === 'index.html')
+check('a trailing slash does not produce an empty name', fileName('s1/report.html/') === 'report.html')
+check('a missing path has no name', fileName('') === '' && fileName(null) === '' && fileName(undefined) === '')
+
+// --- the day grouping ----------------------------------------------------
+
+// The day is the *local* day, so the expectation is built from local components
+// rather than from a fixed UTC string: a fixture pinned to UTC would pass in one
+// timezone and fail in the next.
+const localDay = (y, m, d) => {
+  const dt = new Date(y, m - 1, d, 12, 0, 0)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`
+}
+check('a timestamp reduces to its local day', dayKey(new Date(2026, 1, 14, 12, 0, 0).toISOString()) === localDay(2026, 2, 14))
+check('an unparseable timestamp has no day', dayKey('not-a-date') === '' && dayKey('') === '' && dayKey(null) === '')
+
+const dated = [
+  { id: 'r1', created_at: new Date(2026, 1, 15, 10, 0, 0).toISOString() },
+  { id: 'r2', created_at: new Date(2026, 1, 15, 9, 0, 0).toISOString() },
+  { id: 'r3', created_at: new Date(2026, 1, 14, 23, 0, 0).toISOString() },
+]
+const grouped = groupByDay(dated)
+check('rows are grouped into one entry per day', grouped.length === 2, JSON.stringify(grouped.map((g) => g.day)))
+check('the newest day comes first', grouped[0].rows.length === 2 && grouped[1].rows.length === 1)
+check('order within a day is the server order, not re-sorted', grouped[0].rows.map((r) => r.id).join() === 'r1,r2')
+check('an empty list groups to nothing', groupByDay([]).length === 0 && groupByDay(null).length === 0)
+check('a null row is skipped rather than crashing', groupByDay([null, dated[0]]).length === 1)
+check(
+  'a row with no usable time is kept in a trailing bucket, not dropped',
+  groupByDay([{ id: 'x', created_at: '' }, dated[0]])[1].day === '' &&
+    groupByDay([{ id: 'x', created_at: '' }, dated[0]])[1].rows.length === 1,
+)
 
 // --- a name's extension --------------------------------------------------
 

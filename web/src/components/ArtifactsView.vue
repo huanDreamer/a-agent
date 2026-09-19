@@ -14,9 +14,9 @@ import { computed, ref } from 'vue'
 import AsyncBlock from './AsyncBlock.vue'
 import Icon from './Icon.vue'
 import { api, artifactUrl } from '../api.js'
-import { artifactLabel, extensionOf, kindIcon, kindLabel } from '../artifactsChip.js'
-import { filterArtifacts, orphanCount, sessionLabel, totalBytes } from '../artifactsView.js'
-import { formatBytes, formatCount, formatRelative, formatAbsolute, truncate } from '../format.js'
+import { artifactLabel, fileName, extensionOf, kindIcon, kindLabel } from '../artifactsChip.js'
+import { filterArtifacts, groupByDay, orphanCount, sessionLabel, totalBytes } from '../artifactsView.js'
+import { formatBytes, formatCount, formatRelative, formatAbsolute, formatDayLong, shortId, truncate } from '../format.js'
 import { useResource } from '../useResource.js'
 
 const KINDS = [
@@ -43,6 +43,12 @@ const enabled = computed(() => !data.value || data.value.enabled !== false)
 const message = computed(() => (data.value && data.value.message) || '')
 const all = computed(() => (data.value && data.value.artifacts) || [])
 const rows = computed(() => filterArtifacts(all.value, { kind: kind.value, session: session.value }))
+
+// The list is read by day: newest day first, and within a day the order the
+// server sent (newest first). A flat list of every artifact on a server is
+// unreadable once it has a few days in it, and the day is also how the bytes are
+// filed on disk, so the console and `ls` agree about how to look at them.
+const groups = computed(() => groupByDay(rows.value))
 
 // Two facts a reader of a deployment-wide list needs and cannot reconstruct from
 // the rows: how much disk this is, and how much of it belongs to no conversation.
@@ -168,8 +174,16 @@ async function runDelete(artifact) {
                   <th>操作</th>
                 </tr>
               </thead>
-              <tbody>
-                <tr v-for="item in rows" :key="item.id">
+              <tbody v-for="group in groups" :key="group.day || 'unknown'">
+                <tr class="artifact-day">
+                  <td colspan="7" class="artifact-day-cell">
+                    <span class="artifact-day-label">
+                      {{ group.day ? formatDayLong(group.day) : '未知时间' }}
+                    </span>
+                    <span class="muted-note">{{ formatCount(group.rows.length) }} 个</span>
+                  </td>
+                </tr>
+                <tr v-for="item in group.rows" :key="item.id">
                   <td class="nowrap" :title="formatAbsolute(item.created_at)">
                     {{ formatRelative(item.created_at) }}
                   </td>
@@ -191,7 +205,7 @@ async function runDelete(artifact) {
                         {{ truncate(artifactLabel(item), 42) }}
                       </a>
                     </div>
-                    <div class="dimmer mono cell-note" :title="item.path">{{ item.path }}</div>
+                    <div class="dimmer mono cell-note" :title="item.path">{{ fileName(item.path) }}</div>
                   </td>
                   <td>
                     <span class="tag">{{ kindLabel(item.kind) }}</span>
@@ -201,7 +215,7 @@ async function runDelete(artifact) {
                   <td class="num dim mono">{{ extensionOf(item.path) || '—' }}</td>
                   <td>
                     <div class="row">
-                      <a class="btn ghost sm" :href="href(item)" download :title="`下载 ${artifactLabel(item)}`">
+                      <a class="btn ghost sm" :href="href(item)" download :title="`下载 ${fileName(item.path) || artifactLabel(item)}`">
                         <Icon name="download" :size="14" />
                       </a>
                       <template v-if="confirmDelete === item.id">

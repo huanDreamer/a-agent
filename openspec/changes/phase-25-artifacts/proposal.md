@@ -34,7 +34,8 @@ The gap is visible in three ways:
 ### ADDED
 
 - `internal/artifact/` — the artifact store: the file layout
-  (`<root>/<session>/<timestamp>-<slug>.<ext>`), the path containment rules
+  (`<root>/<session>/<YYYY-MM-DD>/<name>.<ext>`, date = local day, name from the
+  title), the path containment rules
   (shared with the workspace sandbox's reasoning), the extension whitelist, the
   atomic bounded write, and `URL()` which builds every link.
 - `internal/artifact/saver.go` — `Saver`, the one implementation of
@@ -107,10 +108,28 @@ The gap is visible in three ways:
   conversation's artifacts" a directory operation rather than a query, and keeps
   two sessions from colliding on a name. A session here is an opaque owner token
   — a chat session id, or a one-shot run's — not a foreign key.
-- **A title with no ASCII is named by a random token, not pinyin.** `slugify`
-  returns `""` for a Chinese title on purpose; transliterating would be a
-  dependency and a guess, and a short opaque name is honest about being one. The
-  artifact is still addressable and still carries its title for display.
+- **The file name is the title, in whatever script the title uses.** `slugify`
+  keeps non-ASCII letters, so `季度报告` becomes `季度报告.html` and the store reads
+  like the work that produced it. Transliterating into pinyin was rejected: it
+  needs a dependency and a table, it is wrong often enough to be worse than
+  nothing (多音字), and it throws away the name the author chose. Only punctuation
+  and separators collapse to a dash, and a title with nothing nameable at all
+  falls back to the fixed word `artifact` — a word, not a random token, because
+  uniqueness is handled separately, so a random name would buy nothing and cost
+  the reader the ability to guess what is inside.
+- **The date directory is the local day.** `<session>/<YYYY-MM-DD>/<name>.<ext>`
+  groups a day's output under one `ls`, and the day is the saving process's local
+  day, not UTC — the console groups by the reader's local day, so a UTC stamp
+  would make the store and 产物中心 disagree about which day an artifact belongs
+  to for the first hours of every local day (in UTC+8, anything saved before
+  08:00). Found while smoke-testing: the store said 2026-09-19 and a
+  `TZ=America/New_York` console said 2026-09-18 for the same file.
+- **A repeated name gets a numeric suffix, not an overwrite.** Saving the same
+  title twice in one day is the ordinary case, so the second file becomes
+  `<stem>-2.<ext>` and the third `<stem>-3.<ext>`. The suffix goes before the
+  extension so the type still comes from the extension, and a file already on
+  disk counts as taken even with no row pointing at it — overwriting is the one
+  thing this must not do.
 - **Atomic, bounded writes.** Temp file in the destination directory (so the
   rename stays on one filesystem) + `rename`; one byte past the cap is read so
   "exactly at the limit" and "over it" are distinguishable and the message can
@@ -134,6 +153,22 @@ The gap is visible in three ways:
 - **One endpoint for both list views.** `?session=` narrows it, omitting it asks
   for everything: they are one question — "which artifacts" — asked with a
   narrower answer in one case.
+- **The row template's bindings are checked statically, not by rendering.** An
+  unbound name in a `v-if`/`{{ }}` compiles to `_ctx.<name>`, which builds and
+  type-checks cleanly and throws only when that branch renders — so 产物中心
+  showed its counts and then failed on the first row, leaving an empty list and
+  a number. Rendering in Node cannot catch it either: the panel fetches in
+  `onMounted`, which SSR never runs, so the probe only ever sees the empty state.
+  `check-component-bindings.mjs` therefore compiles each SFC the way the build
+  does (real `bindingMetadata`) and rejects every non-`$` `_ctx.<name>`. The
+  browser probe (`web/.verify/artifacts-view-verify.mjs`) is the end-to-end half,
+  not the guard.
+- **The embedded `dist/` is built by `npm run build`, never by `check:ui`.** The
+  `vite build` inside `check:ui` uses `ssr-probe/vite.config.js` and writes to
+  `ssr-probe/out/` (gitignored). A green test suite therefore says nothing about
+  `internal/server/webui/dist/`, which is what `//go:embed` ships — that
+  directory has to be rebuilt explicitly or the running server keeps serving the
+  old bundle.
 
 ## Impact
 

@@ -577,6 +577,130 @@ func TestArtifactSavedThroughSaverIsServable(t *testing.T) {
 	}
 }
 
+// The date directory is the *local* day — the same day 产物中心 groups by.
+//
+// Pinning this is the point: with a UTC stamp the store and the console disagree
+// about which day an artifact belongs to for the first hours of every local day
+// (in UTC+8, anything saved before 08:00), so `ls` and the console would show two
+// different dates for one file.
+func TestArtifactDateDirectoryIsTheLocalDay(t *testing.T) {
+	srv, st, root := buildArtifactServer(t, nil)
+	startHarness(t, srv)
+
+	files, err := artifact.New(root, artifact.Options{})
+	if err != nil {
+		t.Fatalf("artifact.New: %v", err)
+	}
+	saver, err := artifact.NewSaver(files, st, artifact.SaverOptions{
+		Owner:     "sess-date",
+		URLPrefix: artifactsURLPrefix,
+	})
+	if err != nil {
+		t.Fatalf("NewSaver: %v", err)
+	}
+	res, err := saver.SaveArtifact(context.Background(), tool.ArtifactInput{
+		Title:   "日期",
+		Name:    "report.html",
+		Kind:    store.ArtifactKindHTML,
+		Content: strings.NewReader("x"),
+	})
+	if err != nil {
+		t.Fatalf("SaveArtifact: %v", err)
+	}
+	want := time.Now().Format("2006-01-02")
+	if got := filepath.Base(filepath.Dir(res.Path)); got != want {
+		t.Errorf("date directory = %q, want the local day %q", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(res.Path))); err != nil {
+		t.Errorf("file is not where the local-day path says: %v", err)
+	}
+}
+
+// A Chinese title has to survive the whole way: it names the file on disk, and
+// the URL the model is handed has to fetch that same file back over the real
+// route. This is the case that a percent-encoded path could silently break — the
+// router decodes `*path` before the handler sees it, so a name that is escaped
+// for the link and a name that is opened on disk are two different strings.
+func TestArtifactChineseNameRoundTrips(t *testing.T) {
+	srv, st, root := buildArtifactServer(t, nil)
+	startHarness(t, srv)
+	client := artifactLogin(t, srv)
+	base := "http://" + srv.Addr()
+
+	files, err := artifact.New(root, artifact.Options{})
+	if err != nil {
+		t.Fatalf("artifact.New: %v", err)
+	}
+	const sess = "sess-cn"
+	saver, err := artifact.NewSaver(files, st, artifact.SaverOptions{
+		Owner:     sess,
+		URLPrefix: artifactsURLPrefix,
+	})
+	if err != nil {
+		t.Fatalf("NewSaver: %v", err)
+	}
+
+	const html = "<!doctype html><html><body><h1>季度用量报告</h1></body></html>"
+	res, err := saver.SaveArtifact(context.Background(), tool.ArtifactInput{
+		Title:   "季度用量报告",
+		Name:    "report.html",
+		Kind:    store.ArtifactKindHTML,
+		Source:  "save_artifact",
+		Content: strings.NewReader(html),
+	})
+	if err != nil {
+		t.Fatalf("SaveArtifact: %v", err)
+	}
+
+	// The file on disk is named for the title, in Chinese, filed under a date.
+	dir := filepath.Dir(res.Path)
+	if filepath.Base(dir) != time.Now().Format("2006-01-02") {
+		t.Errorf("date directory = %q, want today (UTC)", filepath.Base(dir))
+	}
+	if got := filepath.Base(res.Path); got != "季度用量报告.html" {
+		t.Errorf("stored name = %q, want 季度用量报告.html", got)
+	}
+	onDisk := filepath.Join(root, filepath.FromSlash(res.Path))
+	if _, err := os.Stat(onDisk); err != nil {
+		t.Fatalf("file is not on disk at %s: %v", res.Path, err)
+	}
+
+	// The link is percent-encoded, and fetching it returns the same bytes.
+	if !strings.Contains(res.URL, "%E5%AD%A3") {
+		t.Errorf("url = %q, want a percent-encoded Chinese name", res.URL)
+	}
+	resp, err := client.Get(base + res.URL)
+	if err != nil {
+		t.Fatalf("get %s: %v", res.URL, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status for %s = %d, want 200", res.URL, resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != html {
+		t.Errorf("served body = %q, want the stored html", string(body))
+	}
+
+	// And the listing hands the console the very same encoded link.
+	var list struct {
+		Artifacts []struct {
+			URL string `json:"url"`
+		} `json:"artifacts"`
+	}
+	listed, err := client.Get(base + "/api/artifacts?session=" + sess)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	decodeStatus(t, listed, http.StatusOK, &list)
+	if len(list.Artifacts) != 1 || list.Artifacts[0].URL != res.URL {
+		t.Errorf("listed urls = %+v, saver said %q", list.Artifacts, res.URL)
+	}
+}
+
 // idOfFirst returns the id of the only artifact listed for a session.
 func idOfFirst(t *testing.T, client *http.Client, base, session string) string {
 	t.Helper()

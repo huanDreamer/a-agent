@@ -512,7 +512,7 @@ made in is gone. `save_artifact` is the tool for them:
 
 ```
 save_artifact  kind="html"  title="巡检报告"  content="<!doctype html>…"  path="report.html"
-               → stored, url=/api/artifacts/files/<session>/1770000000-report.html
+               → stored, url=/api/artifacts/files/<session>/2026-09-19/%E5%B7%A1%E6%A3%80%E6%8A%A5%E5%91%8A.html
 save_artifact  kind="image" path="./charts/q3.png"      → stored from a file, not from content
 ```
 
@@ -526,6 +526,14 @@ What it does:
   `json`, `xml`, `png`, `jpg`, `gif`, `webp`, `pdf`). Anything else is refused
   rather than stored and worried about later; the tool tells the model which types
   were accepted so it can pick a different one.
+- Names the file **after its title**, in whatever script the title uses, and files
+  it under **the date it was saved**: `title="巡检报告"` on 2026-09-19 becomes
+  `<session>/2026-09-19/巡检报告.html`, so the store reads like the work that
+  produced it. A Chinese title stays Chinese — it is not transliterated into
+  pinyin, which would be a dependency and a guess. Two artifacts wanting the same
+  name on one day both survive, the second as `巡检报告-2.html`. The date is the
+  saving process's **local** day, so a file's directory and the day 产物中心 groups
+  it under are always the same day.
 - Accepts either `content` (inline text, for HTML/markdown/CSV the model just
   wrote) or `path` (an existing file inside the workspace, read and copied), and
   refuses both at once — the ambiguity has exactly one right answer and it must

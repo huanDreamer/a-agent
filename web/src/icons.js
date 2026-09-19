@@ -51,15 +51,24 @@ export const ICON_PATHS = {
   // 模型管理: 测试连接 (plug) and a positive test result (circle-check).
   plug: 'M12 22v-5|M9 8V2|M15 8V2|M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z',
   'circle-check': 'M21.801 10A10 10 0 1 1 17 3.335|m9 11 3 3L22 4',
-  // 长任务: a clock for "the turn stopped on its budget" and stacked layers for
-  // "the window was condensed to stay inside it". Both follow Lucide geometry,
+  // 长任务: a clock for "the turn stopped on its budget". Follows Lucide geometry,
   // like every other icon here.
   clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20|M12 6v6l4 2',
   // 后台进程: a terminal window for the drawer a conversation's header opens —
   // everything listed there was started as a shell command.
   terminal: 'm4 17 6-6-6-6|M12 19h8',
-  layers:
-    'm12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z|m6.08 9.5-3.5 1.6a1 1 0 0 0 0 1.81l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9a1 1 0 0 0 0-1.83l-3.5-1.59|m6.08 14.5-3.5 1.6a1 1 0 0 0 0 1.81l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9a1 1 0 0 0 0-1.83l-3.5-1.59',
+  // 产物: Lucide package — 智能体交出来的东西，一个可以直接打开的整体。
+  // It marks the header button, the drawer it opens and 产物中心.
+  package:
+    'm7.5 4.27 9 5.15|M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z|m3.3 7 8.7 5 8.7-5|M12 22V12',
+  // 产物的两种形态：prose (file-text) 和 picture (image)。Rect drawn as a path, so
+  // neither has to join ICON_RECT_FIRST.
+  'file-text':
+    'M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z|M14 2v4a2 2 0 0 0 2 2h4|M10 9H8|M16 13H8|M16 17H8',
+  image:
+    'M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z|M10 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2|m21 15-4.35-4.35a1.1 1.1 0 0 0-1.55 0L7 19',
+  // 打开 / 下载一个产物。
+  download: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4|m7 10 5 5 5-5|M12 15V3',
   // 任务看板: Lucide list-checks — 一份勾选过的清单，正是"这一轮要做的事"的形状。
   'list-checks': 'm3 17 2 2 4-4|m3 7 2 2 4-4|M13 6h8|M13 12h8|M13 18h8',
   // 链路追踪: Lucide git-branch — one thing descending from another, which is

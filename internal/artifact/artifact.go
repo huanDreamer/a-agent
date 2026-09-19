@@ -11,9 +11,12 @@
 //
 //   - where an artifact's bytes live (Root, one directory outside the
 //     workspaces), and the path rules that keep a write — and a read — inside it;
-//   - what a path looks like: <session>/<timestamp>-<slug>.<ext>, so the store is
-//     browsable by a person with `ls` and a deleted database row does not make the
-//     file unrecognisable;
+//   - what a path looks like: <session>/<YYYY-MM-DD>/<name>.<ext>, where the date
+//     is the day it was stored and the name comes from the artifact's title (a
+//     Chinese title stays Chinese). The store is meant to be readable by a person
+//     with `ls`: the date groups one day's output, and the name says what the file
+//     is — so a file whose database row is gone is still identifiable, and so is a
+//     day's work;
 //   - the content type a file is served as, derived from its extension and
 //     never from anything a client said.
 //
@@ -33,8 +36,6 @@
 package artifact
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -44,6 +45,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/huan/huan-agent/internal/store"
@@ -55,9 +57,23 @@ const (
 	// inlined images, a long report or a screenshot, and is the point past which
 	// the console's download URL stops being the right way to hand something over.
 	DefaultMaxBytes int64 = 32 << 20
-	// maxSlug bounds the file-name slug derived from a title, so a title that is
+	// maxStem bounds the file-name stem derived from a title, so a title that is
 	// a whole paragraph does not become a whole-paragraph file name.
-	maxSlug = 48
+	maxStem = 48
+	// unnamedStem names a file whose title had nothing usable in it (a title of
+	// "***", or only punctuation). It is a word rather than a random token on
+	// purpose: uniqueness is handled separately (uniqueRel), so naming a file
+	// randomly here would buy nothing and cost the reader the ability to guess
+	// what is in it.
+	unnamedStem = "artifact"
+	// dateLayout is the directory an artifact is filed under. It sits directly
+	// under the session so that a day's output is one `ls` away, and so the store
+	// stays navigable as it grows.
+	dateLayout = "2006-01-02"
+	// maxNameAttempts bounds the search for a free file name. The first attempt
+	// is expected to succeed; the bound exists so a pathological store cannot
+	// spin here.
+	maxNameAttempts = 1000
 	// maxTitle bounds the title recorded for display, for the same reason.
 	maxTitle = 200
 	// maxSession bounds an owner token before it is used as a path component.
@@ -142,7 +158,7 @@ func (s *Store) MaxBytes() int64 {
 
 // SaveInput is one artifact about to be stored.
 type SaveInput struct {
-	// Title is the human label. It supplies the file name's slug and is recorded
+	// Title is the human label. It supplies the file name's stem and is recorded
 	// for display; it is never a path component on its own.
 	Title string
 	// SessionID owns the artifact and becomes the first path component. It is
@@ -150,8 +166,10 @@ type SaveInput struct {
 	// what a one-shot run produces.
 	SessionID string
 	// Name suggests a file name (e.g. "report.html"). The extension picks the
-	// stored extension and therefore the content type; the stem is used only
-	// when Title gives no slug. Optional.
+	// stored extension and therefore the content type; its stem is the fallback
+	// for the file name when Title gives nothing usable. Only the stem and the
+	// extension are read — a directory part is discarded, so a caller cannot
+	// steer where the file lands. Optional.
 	Name string
 	// Kind is the store's artifact kind (store.ArtifactKind*). Empty is inferred
 	// from the extension.
@@ -198,28 +216,26 @@ func (s *Store) Save(in SaveInput, content io.Reader) (Result, error) {
 	kind := normalizeKind(in.Kind, ext)
 	title := truncateRunes(strings.TrimSpace(in.Title), maxTitle)
 
-	dir := s.root
+	// The date comes from the clock at save time and is part of the path, not of
+	// the row: a listing of the store groups a day's artifacts without asking the
+	// database anything.
+	//
+	// Local time, not UTC, because the directory and the console's day grouping
+	// have to be the same day: the console groups by the reader's local day, and
+	// an artifact saved at 02:00 in Shanghai is filed under that day in the path
+	// only if this clock is local too. With UTC the store would show one date and
+	// 产物中心 another for the first eight hours of every local day, which defeats
+	// the point of the date directory.
+	stamp := time.Now().Format(dateLayout)
+	dir := filepath.Join(s.root, stamp)
 	if session != "" {
-		dir = filepath.Join(s.root, session)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return Result{}, fmt.Errorf("artifact: create session directory: %w", err)
-		}
+		dir = filepath.Join(s.root, session, stamp)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return Result{}, fmt.Errorf("artifact: create artifact directory: %w", err)
 	}
 
-	slug := slugify(title)
-	if slug == "" {
-		// No title, or a title with nothing nameable in it (a Chinese title has
-		// no ASCII letters — slugify says so, and the id below is what names the
-		// file instead). The file is still addressable; only its name is opaque.
-		slug = randomToken(6)
-	}
-	name := fmt.Sprintf("%s-%s%s", time.Now().UTC().Format("20060102-150405"), slug, ext)
-	rel := name
-	if session != "" {
-		rel = session + "/" + name
-	}
-
-	abs, err := s.Resolve(rel)
+	rel, abs, err := s.uniqueRel(session, stamp, artifactStem(title, in.Name), ext)
 	if err != nil {
 		return Result{}, err
 	}
@@ -549,36 +565,115 @@ func ExtForKind(kind string) string {
 	return ".html"
 }
 
+// artifactStem picks the file-name stem: the title's slug, or the name's, or a
+// generic word as a last resort.
+//
+// A title is what the model was asked for and is the reason the reader can tell
+// two artifacts apart, so it wins. Name is a second chance for a caller that gave
+// no title; only its stem is read, so a name of "../../x.html" cannot move the
+// file. Neither producing anything usable is not an error — the file still has to
+// be written, and uniqueRel is what keeps names distinct — so it is named
+// unnamedStem.
+func artifactStem(title, name string) string {
+	if stem := slugify(title); stem != "" {
+		return stem
+	}
+	base := path.Base(strings.ReplaceAll(strings.TrimSpace(name), "\\", "/"))
+	if stem := slugify(strings.TrimSuffix(base, path.Ext(base))); stem != "" {
+		return stem
+	}
+	return unnamedStem
+}
+
 // slugify turns a title into a file-name-safe stem.
 //
-// It keeps ASCII letters, digits, dashes and underscores, folds everything else
-// into a single dash, and returns "" when nothing nameable is left — a Chinese
-// title produces an empty slug on purpose, and the caller names the file by a
-// random token instead. Transliterating Chinese into pinyin here would be a
-// dependency and a guess; a short opaque name is honest about being one.
+// Letters and digits are kept as they are, including non-ASCII ones: a Chinese
+// title produces a Chinese file name, so the store reads like the work that
+// produced it and a URL for it is legible rather than a hex string. Everything
+// that is not a letter, digit, dash or underscore becomes a single dash. It
+// returns "" when nothing nameable is left, and the caller decides what to do
+// about that.
+//
+// Deliberately not transliterating Chinese into pinyin: that needs a dependency
+// and a table, it is wrong often enough to be worse than nothing (多音字), and it
+// would throw away the name the author actually chose.
 func slugify(title string) string {
 	var b strings.Builder
-	lastDash := true // leading dashes are dropped
-	for _, r := range strings.ToLower(title) {
+	lastDash := true // leading separators are dropped
+	for _, r := range strings.ToLower(strings.TrimSpace(title)) {
 		switch {
-		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
 			b.WriteRune(r)
 			lastDash = false
-		case r == '_':
+		case r == '-' || r == '_' || r == ' ' || r == '.':
 			if !lastDash {
-				b.WriteRune(r)
+				b.WriteRune('-')
+				lastDash = true
 			}
 		default:
+			// Punctuation, symbols, control characters: a separator, not a
+			// character in the name. / and \ land here too, which is what
+			// strips a path out of anything that looks like one.
 			if !lastDash {
 				b.WriteRune('-')
 				lastDash = true
 			}
 		}
-		if b.Len() >= maxSlug {
-			break
+	}
+	// The bound is applied to runes, not bytes, so a Chinese title is not cut
+	// short just because each character costs three bytes.
+	out := []rune(b.String())
+	if len(out) > maxStem {
+		out = out[:maxStem]
+	}
+	return strings.Trim(string(out), "-")
+}
+
+// uniqueRel picks a free relative path and its absolute location for a new
+// artifact.
+//
+// The file name carries the title, so two artifacts can want the same name — a
+// report saved twice in one day is the ordinary case, not a collision to fail on.
+// The second one becomes <stem>-2, the third <stem>-3, and so on, which keeps the
+// directory listing sorted by what the files are rather than by when they were
+// written. An existing file on disk is treated as taken even if no database row
+// points at it: it is still a file, and overwriting it would be the one thing
+// this must not do.
+//
+// The caller creates the directory first and holds no lock, so this is a
+// find-and-hope: a concurrent save can race it, and writeAtomic's rename means
+// the loser's bytes are replaced by the winner's under a name both believe they
+// own. Nothing else in this program saves two artifacts for one session at the
+// same instant (save_artifact is declared serial), which is why that is
+// acceptable here rather than worth a lock file.
+func (s *Store) uniqueRel(session, stamp, stem, ext string) (rel, abs string, err error) {
+	for attempt := 1; attempt <= maxNameAttempts; attempt++ {
+		rel := path.Join(session, stamp, candidate(stem, ext, attempt))
+		abs, rerr := s.Resolve(rel)
+		if rerr != nil {
+			return "", "", rerr
+		}
+		switch _, serr := os.Stat(abs); {
+		case serr == nil:
+			continue // taken
+		case os.IsNotExist(serr):
+			return rel, abs, nil
+		default:
+			return "", "", fmt.Errorf("artifact: stat %s: %w", rel, serr)
 		}
 	}
-	return strings.Trim(b.String(), "-_")
+	return "", "", fmt.Errorf("artifact: no free name for %s after %d attempts", stem, maxNameAttempts)
+}
+
+// candidate builds the n-th name for a stem: the stem itself, then "-2", "-3".
+//
+// The suffix goes before the extension so the served type is decided by the
+// extension the caller asked for, and the name still ends in it.
+func candidate(stem, ext string, n int) string {
+	if n <= 1 {
+		return stem + ext
+	}
+	return fmt.Sprintf("%s-%d%s", stem, n, ext)
 }
 
 // truncateRunes cuts s to at most n runes, counting runes rather than bytes so a
@@ -595,19 +690,6 @@ func truncateRunes(s string, n int) string {
 		}
 	}
 	return s
-}
-
-// randomToken returns n bytes of hex randomness, used to name a file whose title
-// gave no slug.
-func randomToken(n int) string {
-	buf := make([]byte, (n+1)/2)
-	if _, err := rand.Read(buf); err != nil {
-		// crypto/rand does not fail in practice on the platforms this runs on;
-		// a fallback based on the clock is still better than an empty name,
-		// because the caller is about to write a file.
-		return fmt.Sprintf("%x", time.Now().UnixNano())[:n]
-	}
-	return hex.EncodeToString(buf)[:n]
 }
 
 // URL returns the path an artifact is served at for a console mounted at the

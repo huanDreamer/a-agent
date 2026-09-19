@@ -75,6 +75,23 @@ export function kindIcon(kind) {
   return KIND_ICONS[kind] || KIND_ICONS.other
 }
 
+/**
+ * The stored file's name: the last segment of the path.
+ *
+ * This is the name the file actually has on disk, which since artifacts are saved
+ * under a title-derived stem is the most readable thing to show about where an
+ * artifact lives: "季度用量报告.html" says what it is, where the full path
+ * ("sess-1/2026-02-14/季度用量报告.html") only adds the folder it is filed in.
+ * The full path belongs in a title attribute, not in a cell.
+ */
+export function fileName(path) {
+  const value = typeof path === 'string' ? path : ''
+  if (value === '') return ''
+  const trimmed = value.replace(/\/+$/, '')
+  const slash = trimmed.lastIndexOf('/')
+  return slash >= 0 ? trimmed.slice(slash + 1) : trimmed
+}
+
 /** The extension shown after a name: ".html", or '' when the path has none. */
 export function extensionOf(path) {
   const value = typeof path === 'string' ? path : ''
