@@ -95,7 +95,7 @@ function windowHint(entry) {
               <tr>
                 <th>Provider</th>
                 <th>模型</th>
-                <th>窗口大小</th>
+                <th>窗口大小 <span class="muted-note">token</span></th>
                 <th>能力</th>
                 <th>状态</th>
               </tr>
@@ -143,7 +143,8 @@ function windowHint(entry) {
 
         <p class="muted-note card-foot">
           {{ formatCount(models.length) }} 个模型来自启用的 provider；这张表就是对话里
-          模型选择器的内容。窗口大小决定 agent 一轮的窗口预算（<code class="md-code">context.window_ratio</code>），
+          模型选择器的内容。窗口大小的单位是 <strong>token</strong>（模型的输入上下文上限，
+          不是输出上限），agent 一轮的窗口预算由它算出（<code class="md-code">context.window_ratio</code>），
           来源标注说明它是 provider 接口报的、模型自报的，还是你手填的 —— 修改与重新询问在下面的
           「模型管理」里。
           <template v-if="defaultModel">

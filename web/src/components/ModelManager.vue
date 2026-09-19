@@ -1151,6 +1151,7 @@ const inferredCount = computed(
                 @change="saveModel(model)"
                 @keyup.enter="$event.target.blur()"
               />
+              <span class="dimmer nowrap">tokens</span>
               <span
                 v-if="windowSourceShort(model.context_window_source)"
                 class="tag"

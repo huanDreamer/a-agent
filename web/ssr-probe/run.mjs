@@ -1078,6 +1078,8 @@ check('an idle chip counts records', subagentChip().label.includes('1 个子 age
   })
 
   check('设置 → 模型 has a window column', html.includes('窗口大小'), '')
+  check('the column names its unit', html.includes('窗口大小') && html.includes('token'), '')
+  check('the footer says the unit is tokens and that it is the input window', /单位是\s*<strong>token<\/strong>/.test(html), '')
   check('the window column is a table heading', /<th[^>]*>\s*窗口大小/.test(html), '')
   check('a published window is shown', html.includes('1,000,000'), '')
   check('its provenance is shown next to it', html.includes('接口'), '')
