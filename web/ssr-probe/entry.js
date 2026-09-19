@@ -69,6 +69,21 @@ export async function renderLogin() {
   return renderWithTeleports(LoginView, {})
 }
 
+/**
+ * Render 设置 → 模型 with a seeded catalog.
+ *
+ * The point of the probe is the column the user asked for: a window size and a
+ * capability set are only useful if they are visible where the models are listed,
+ * and "I added it but it is on another sub-tab" is exactly the failure a
+ * screenshot-free check can catch. 模型管理 below the table fetches on mount (which
+ * SSR does not run), so this asserts on the catalog table — the part this screen
+ * opens with.
+ */
+export async function renderModelPanel({ catalog: seeded }) {
+  Object.assign(chat, { catalog: seeded, catalogStatus: 'ready', catalogError: '' })
+  return renderWithTeleports(ModelPanel, {})
+}
+
 export function setChatState(patch) {
   Object.assign(chat, patch)
 }

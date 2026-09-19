@@ -614,6 +614,12 @@ export const api = {
     request(`/api/llm/providers/${encodeURIComponent(id)}/models/refresh`, { method: 'POST' }),
 
   llmModels: (provider) => request('/api/llm/models', { query: { provider } }),
+
+  /**
+   * Ask a model — or a provider's models — about themselves: window and
+   * capabilities. Synchronous on the server, so the caller shows a spinner.
+   */
+  probeModelFacts: (body) => request('/api/llm/models/probe', { method: 'POST', body }),
   saveLlmModel: (body) => request('/api/llm/models', { method: 'PUT', body }),
   deleteLlmModel: (providerId, modelId) =>
     request('/api/llm/models', {

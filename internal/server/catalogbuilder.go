@@ -395,14 +395,16 @@ func (b *CatalogModelBuilder) storeCatalog(providers []store.Provider, models []
 		}
 		for _, m := range v.offered {
 			out.Models = append(out.Models, ModelChoice{
-				Provider:           p.ID,
-				ProviderName:       v.name,
-				Model:              m.ModelID,
-				DisplayName:        modelDisplayName(m),
-				Capabilities:       capabilityStrings(m.Capabilities),
-				CapabilitiesSource: m.CapabilitiesSource,
-				ChatCapable:        m.Has(store.CapChat),
-				HasAPIKey:          p.HasAPIKey,
+				Provider:            p.ID,
+				ProviderName:        v.name,
+				Model:               m.ModelID,
+				DisplayName:         modelDisplayName(m),
+				Capabilities:        capabilityStrings(m.Capabilities),
+				CapabilitiesSource:  m.CapabilitiesSource,
+				ContextWindow:       m.ContextWindow,
+				ContextWindowSource: m.ContextWindowSource,
+				ChatCapable:         m.Has(store.CapChat),
+				HasAPIKey:           p.HasAPIKey,
 			})
 		}
 	}

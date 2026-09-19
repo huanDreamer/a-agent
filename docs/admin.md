@@ -1024,3 +1024,27 @@ exist for a script, but the console has no control for them.
 - **Traces never appear in Langfuse** — check the status strip counters: a rising
   `failed` means the keys or host are wrong; `dropped` means the buffer overflowed.
   An empty Langfuse is not a sign that tracing is off — the console reads locally.
+
+### 在设置里看、改、重新询问
+
+设置 → 模型 有两块，窗口与能力在两块里都能看到：
+
+- **模型目录**（上半张表，只读）：每个模型一行，列里多了 **窗口大小**，数字后面跟一枚来源标签
+  （`接口` / `自报` / `手填`）；能力的来源同样标着。鼠标悬停会说明这个数字是怎么来的、agent
+  用它做什么（`窗口 × context.window_ratio − reserve_output_tokens`）。
+- **模型管理**（下半块）：窗口大小在这里是**可编辑输入框**（支持 `128000`、`128,000`、`128K`、
+  `1M`；看不懂就清空而不是存一个猜的数字），右边一个刷新图标按钮 = **只问这一个模型**；
+  provider 的标题栏还有 **询问窗口与能力** = 问这个 provider 下开着的模型（一次最多 4 个，
+  返回里会说还剩几个，可以再点）。
+
+谁覆盖谁：**你手填的值谁也改不动**（存储层遇到 `user` 来源就放弃），包括强制重新询问；
+清空则退回"没人说"，内置表接着估。provider 接口报的窗口同样不被模型自报覆盖。
+
+接口：`PUT /api/llm/models` 增加 `context_window`（正数=手填，0=清空）；
+新增 `POST /api/llm/models/probe`，body 是 `{provider_id, model_id?, force?}`，
+同步返回 `{asked, recorded, remaining, models}` —— 一次点击问了几个、真正改了几个、还剩几个。
+
+回归检查（无浏览器）：`cd web && npm run check:models` 覆盖输入解析（`128K`/`1M`/空/乱填）
+与来源文案；`npm run check:ui` 里的 SSR 探针会把 设置 → 模型 真渲染一遍，断言窗口列、来源标签、
+未描述模型显示「未知」都在 HTML 里。这条探针抓到过一个真 bug：模板里用了 `windowSourceShort`
+却没 import，浏览器一打开这个页面就会抛错。

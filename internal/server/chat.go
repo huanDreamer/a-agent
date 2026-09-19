@@ -244,6 +244,12 @@ type ModelChoice struct {
 	// 推断，请自行确认" is right for the heuristics and wrong for a value the
 	// provider published.
 	CapabilitiesSource string `json:"capabilities_source,omitempty"`
+	// ContextWindow is the model's context window in tokens, 0 when nobody has
+	// said, and ContextWindowSource says who did (see store.ModelWindowSource*).
+	// The settings screen shows both: a number the provider published and one the
+	// model guessed are different facts.
+	ContextWindow       int    `json:"context_window"`
+	ContextWindowSource string `json:"context_window_source,omitempty"`
 	// ChatCapable reports whether the model declares the chat capability.
 	//
 	// ChatCapable=false is possible and meaningful: when a provider has no

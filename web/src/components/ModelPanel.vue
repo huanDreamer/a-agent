@@ -1,4 +1,6 @@
 <script setup>
+// 窗口大小与能力都来自模型目录（GET /api/chat/models）：provider 的 /models 接口报的、
+// 模型自己回答的，或运维手填的，标签写着是哪一种。修改与重新询问在下面的「模型管理」。
 // 模型 — the whole model surface in one tab: what is available (read-only) and
 // what is editable (模型管理).
 //
@@ -17,7 +19,7 @@ import {
   loadCatalog,
   maxSteps,
 } from '../chatStore.js'
-import { capabilityLabel, modelOptionHint } from '../llm.js'
+import { capabilityLabel, modelOptionHint, windowSourceLabel, windowSourceShort } from '../llm.js'
 import { formatAbsolute, formatCount, formatRelative } from '../format.js'
 
 /** The catalog's models, groups and provider summaries, as the composer sees them. */
@@ -38,6 +40,20 @@ const catalogByProvider = computed(() =>
     models: group.models,
   })),
 )
+/**
+ * Why a window is what it is, on hover.
+ *
+ * The number alone invites the wrong question ("why is it 200000?"); the source
+ * answers it, and the note says where to change it.
+ */
+function windowHint(entry) {
+  const source = windowSourceLabel(entry.contextWindowSource)
+  if (!entry.contextWindow) {
+    return '还没有记录窗口大小：在下面的「模型管理」里点「重新询问」，或不填让它按内置表估算'
+  }
+  const how = source ? `${source}` : '来源不明'
+  return `${formatCount(entry.contextWindow)} tokens（${how}）。agent 一轮的窗口预算 = 这个数 × context.window_ratio − reserve_output_tokens；要改就在下面的「模型管理」里填`
+}
 </script>
 
 <template>
@@ -79,6 +95,7 @@ const catalogByProvider = computed(() =>
               <tr>
                 <th>Provider</th>
                 <th>模型</th>
+                <th>窗口大小</th>
                 <th>能力</th>
                 <th>状态</th>
               </tr>
@@ -95,6 +112,15 @@ const catalogByProvider = computed(() =>
                       {{ entry.model }}
                     </span>
                     <span v-if="entry.isDefault" class="tag ok">默认</span>
+                  </td>
+                  <td class="mono nowrap" :title="windowHint(entry)">
+                    <template v-if="entry.contextWindow > 0">
+                      {{ formatCount(entry.contextWindow) }}
+                      <span class="tag" :class="entry.contextWindowSource === 'user' ? 'purple' : ''">
+                        {{ windowSourceShort(entry.contextWindowSource) }}
+                      </span>
+                    </template>
+                    <span v-else class="dimmer">未知</span>
                   </td>
                   <td>
                     <span v-if="entry.capabilities.length" class="row caps">
@@ -117,7 +143,9 @@ const catalogByProvider = computed(() =>
 
         <p class="muted-note card-foot">
           {{ formatCount(models.length) }} 个模型来自启用的 provider；这张表就是对话里
-          模型选择器的内容。
+          模型选择器的内容。窗口大小决定 agent 一轮的窗口预算（<code class="md-code">context.window_ratio</code>），
+          来源标注说明它是 provider 接口报的、模型自报的，还是你手填的 —— 修改与重新询问在下面的
+          「模型管理」里。
           <template v-if="defaultModel">
             新建对话默认使用
             <code class="md-code">{{ defaultModel.providerName }} / {{ defaultModel.displayName }}</code>

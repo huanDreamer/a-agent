@@ -8,8 +8,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check:ui": "node scripts/check-component-bindings.mjs && node scripts/check-budget.mjs && node scripts/check-stats.mjs && node scripts/check-artifacts.mjs && vite build --config ssr-probe/vite.config.js && node ssr-probe/run.mjs",
+    "check:ui": "node scripts/check-component-bindings.mjs && node scripts/check-budget.mjs && node scripts/check-stats.mjs && node scripts/check-artifacts.mjs && vite build --config ssr-probe/vite.config.js && node ssr-probe/run.mjs && node scripts/check-models.mjs",
     "check:budget": "node scripts/check-budget.mjs",
+    "check:models": "node scripts/check-models.mjs",
     "check:stats": "node scripts/check-stats.mjs",
     "check:artifacts": "node scripts/check-artifacts.mjs"
   },

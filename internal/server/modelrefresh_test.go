@@ -2,7 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+
 	"errors"
+	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/schema"
 	"net/http"
 	"strconv"
 	"strings"
@@ -730,5 +734,194 @@ func TestFillModelWindows_RespectsTheBudget(t *testing.T) {
 	asked, filled := fillModelFacts(context.Background(), st, zap.NewNop(), asker, models, 3)
 	if asked != 3 || filled != 0 {
 		t.Fatalf("asked=%d filled=%d, want exactly the budget (3) asked", asked, filled)
+	}
+}
+
+/* ------------------------------------------------- interactive probing --- */
+
+// probeBuilder is a ModelBuilder whose models answer the probe with fixed facts.
+// It is the seam that lets these tests exercise the whole path — HTTP handler →
+// asker → store → response — without a provider.
+type probeBuilder struct {
+	window int
+	caps   map[store.Capability]bool
+}
+
+func (b probeBuilder) Build(context.Context, string, string) (any, error) {
+	return probeModel(b), nil
+}
+
+func (b probeBuilder) Catalog(context.Context) ModelCatalog {
+	return ModelCatalog{}
+}
+
+type probeModel struct {
+	window int
+	caps   map[store.Capability]bool
+}
+
+func (m probeModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	answer := map[string]any{"context_window": m.window, "text": true}
+	for cap, v := range m.caps {
+		answer[string(cap)] = v
+	}
+	raw, _ := json.Marshal(answer)
+	return &schema.Message{Role: schema.Assistant, Content: string(raw)}, nil
+}
+
+func (m probeModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	return nil, errors.New("not used")
+}
+
+// TestProbeModelFacts_OneModelAndOneProvider: the on-demand path 设置 → 模型's
+// buttons call. It is synchronous and bounded, and it reports how many questions
+// are still open rather than pretending one click asked everything.
+func TestProbeModelFacts_OneModelAndOneProvider(t *testing.T) {
+	h := newHarness(t, nil)
+	h.login(t)
+	st := h.store
+	if err := st.UpsertProvider(context.Background(), store.Provider{ID: "p", Enabled: true}); err != nil {
+		t.Fatalf("UpsertProvider: %v", err)
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		if err := st.UpsertModel(context.Background(), store.Model{
+			ProviderID: "p", ModelID: id, Enabled: true,
+			Capabilities:       store.Capabilities{store.CapChat},
+			CapabilitiesSource: store.ModelCapabilitySourceInferred,
+		}); err != nil {
+			t.Fatalf("UpsertModel: %v", err)
+		}
+	}
+	h.srv.chat.Builder = probeBuilder{
+		window: 131_072,
+		caps:   map[store.Capability]bool{store.CapChat: true, store.CapVision: true},
+	}
+
+	// One model, by name.
+	body := map[string]any{"provider_id": "p", "model_id": "a"}
+	resp := h.postJSON(t, "/api/llm/models/probe", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var out struct {
+		Asked     int           `json:"asked"`
+		Recorded  int           `json:"recorded"`
+		Remaining int           `json:"remaining"`
+		Models    []store.Model `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	_ = resp.Body.Close()
+	if out.Asked != 1 || out.Recorded != 1 {
+		t.Fatalf("asked=%d recorded=%d, want one model asked and recorded", out.Asked, out.Recorded)
+	}
+	first, err := st.GetModel(context.Background(), "p", "a")
+	if err != nil {
+		t.Fatalf("GetModel: %v", err)
+	}
+	if first.ContextWindow != 131_072 || first.ContextWindowSource != store.ModelWindowSourceAsked {
+		t.Errorf("window = %d (%s), want the probed 131072", first.ContextWindow, first.ContextWindowSource)
+	}
+	if !first.Capabilities.Contains(store.CapVision) {
+		t.Errorf("capabilities = %v, want the vision the probe affirmed", first.Capabilities)
+	}
+	// The other two are still open.
+	if out.Remaining != 2 {
+		t.Errorf("remaining = %d, want 2", out.Remaining)
+	}
+
+	// A provider-wide click asks them (bounded by the server's batch limit).
+	resp = h.postJSON(t, "/api/llm/models/probe", map[string]any{"provider_id": "p"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	out = struct {
+		Asked     int           `json:"asked"`
+		Recorded  int           `json:"recorded"`
+		Remaining int           `json:"remaining"`
+		Models    []store.Model `json:"models"`
+	}{}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	_ = resp.Body.Close()
+	if out.Asked != 2 || out.Remaining != 0 {
+		t.Errorf("asked=%d remaining=%d, want the two open models asked and nothing left", out.Asked, out.Remaining)
+	}
+
+	// A second click with nothing open asks nobody and says so.
+	resp = h.postJSON(t, "/api/llm/models/probe", map[string]any{"provider_id": "p"})
+	var idle struct {
+		Asked int    `json:"asked"`
+		Note  string `json:"note"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&idle); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	_ = resp.Body.Close()
+	if idle.Asked != 0 || idle.Note == "" {
+		t.Errorf("idle click: asked=%d note=%q, want 0 asked with an explanation", idle.Asked, idle.Note)
+	}
+}
+
+// TestUpsertModel_WindowIsTheOperatorsAndStays: a hand-written window is stored
+// with source=user, and the automatic askers leave it alone.
+func TestUpsertModel_WindowIsTheOperatorsAndStays(t *testing.T) {
+	h := newHarness(t, nil)
+	h.login(t)
+	st := h.store
+	if err := st.UpsertProvider(context.Background(), store.Provider{ID: "p", Enabled: true}); err != nil {
+		t.Fatalf("UpsertProvider: %v", err)
+	}
+	if err := st.UpsertModel(context.Background(), store.Model{ProviderID: "p", ModelID: "m", Enabled: true}); err != nil {
+		t.Fatalf("UpsertModel: %v", err)
+	}
+
+	resp := h.putJSON(t, "/api/llm/models", map[string]any{
+		"provider_id": "p", "model_id": "m", "capabilities": []string{"chat"}, "context_window": 64_000,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+	row, err := st.GetModel(context.Background(), "p", "m")
+	if err != nil {
+		t.Fatalf("GetModel: %v", err)
+	}
+	if row.ContextWindow != 64_000 || row.ContextWindowSource != store.ModelWindowSourceUser {
+		t.Fatalf("window = %d (%s), want the operator's 64000", row.ContextWindow, row.ContextWindowSource)
+	}
+	if row.CapabilitiesSource != store.ModelCapabilitySourceUser {
+		t.Errorf("capabilities source = %q, want user: a hand-edited model is the operator's", row.CapabilitiesSource)
+	}
+
+	// The automatic path cannot take it away.
+	if err := st.SetModelContextWindow(context.Background(), "p", "m", 200_000, store.ModelWindowSourceAsked); err != nil {
+		t.Fatalf("SetModelContextWindow: %v", err)
+	}
+	if err := st.SetModelCapabilitiesFromProbe(context.Background(), "p", "m",
+		map[store.Capability]bool{store.CapVision: true}, store.ModelCapabilitySourceAsked); err != nil {
+		t.Fatalf("SetModelCapabilitiesFromProbe: %v", err)
+	}
+	after, _ := st.GetModel(context.Background(), "p", "m")
+	if after.ContextWindow != 64_000 {
+		t.Errorf("window = %d, want the operator's value kept", after.ContextWindow)
+	}
+	if after.Capabilities.Contains(store.CapVision) {
+		t.Errorf("capabilities = %v, want the operator's set kept", after.Capabilities)
+	}
+
+	// Clearing it puts the built-in table back in charge.
+	resp = h.putJSON(t, "/api/llm/models", map[string]any{
+		"provider_id": "p", "model_id": "m", "capabilities": []string{"chat"}, "context_window": 0,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+	cleared, _ := st.GetModel(context.Background(), "p", "m")
+	if cleared.ContextWindow != 0 || cleared.ContextWindowSource != "" {
+		t.Errorf("window = %d (%s), want it cleared", cleared.ContextWindow, cleared.ContextWindowSource)
 	}
 }

@@ -31,7 +31,16 @@ import AsyncBlock from './AsyncBlock.vue'
 import BindingEditor from './BindingEditor.vue'
 import Icon from './Icon.vue'
 import { api } from '../api.js'
-import { CAPABILITIES, capabilitySourceLabel, checkBaseUrl, checkProviderId, normalizeCapabilities } from '../llm.js'
+import {
+  CAPABILITIES,
+  capabilitySourceLabel,
+  checkBaseUrl,
+  checkProviderId,
+  normalizeCapabilities,
+  parseWindowInput,
+  windowSourceLabel as capabilitySourceLabelForWindow,
+  windowSourceShort,
+} from '../llm.js'
 import {
   catalogProviderStats,
   claimAutoRefresh,
@@ -363,6 +372,64 @@ function modelKey(model) {
   return `${model.provider_id}/${model.model_id}`
 }
 
+/**
+ * Which provider is being asked about its models right now, and the last answer.
+ *
+ * The probe is a real model call and it is synchronous, so a click can take ten
+ * seconds or more; the button says 询问中… and the note under the table says what
+ * came back. A silent wait would look like a broken button.
+ */
+const probing = ref('')
+const probeNote = ref('')
+const probeError = ref('')
+
+/** Ask one model about itself, and reload whatever it answered. */
+async function probeModel(model) {
+  const key = modelKey(model)
+  modelError[key] = ''
+  modelBusy[key] = 'probe'
+  probeError.value = ''
+  try {
+    const res = await api.probeModelFacts({ provider_id: model.provider_id, model_id: model.model_id, force: true })
+    probeNote.value = describeProbe(model.model_id, res)
+    await resync()
+  } catch (err) {
+    modelError[key] = err && err.message ? err.message : '询问失败'
+  } finally {
+    delete modelBusy[key]
+  }
+}
+
+/**
+ * Ask a provider's models: the ones with something open, or — with force — the
+ * first few regardless. The server caps how many one click asks, so the note
+ * says how many questions are still open rather than pretending it asked them
+ * all.
+ */
+async function probeProvider(provider, force) {
+  if (!provider || probing.value) return
+  probing.value = provider.id
+  probeError.value = ''
+  try {
+    const res = await api.probeModelFacts({ provider_id: provider.id, force })
+    probeNote.value = describeProbe(provider.name || provider.id, res)
+    await resync()
+  } catch (err) {
+    probeError.value = err && err.message ? err.message : '询问失败'
+  } finally {
+    probing.value = ''
+  }
+}
+
+function describeProbe(target, res) {
+  const asked = Number(res && res.asked) || 0
+  const recorded = Number(res && res.recorded) || 0
+  const remaining = Number(res && res.remaining) || 0
+  if (asked === 0) return res && res.note ? res.note : `${target}：没有需要询问的模型`
+  const tail = remaining > 0 ? `，还有 ${formatCount(remaining)} 个待询问（再点一次继续）` : ''
+  return `${target}：问了 ${formatCount(asked)} 个模型，更新了 ${formatCount(recorded)} 个${tail}`
+}
+
 function hasCapability(model, key) {
   return Array.isArray(model.capabilities) && model.capabilities.includes(key)
 }
@@ -386,10 +453,17 @@ async function saveModel(model, { quiet = false } = {}) {
       display_name: model.display_name || '',
       capabilities: normalizeCapabilities(model.capabilities),
       enabled: model.enabled !== false,
+      // The window as the operator sees it: an empty box means "nobody says",
+      // which puts the built-in table back in charge rather than keeping a
+      // number that was just deleted. A value here is recorded as theirs, and
+      // the automatic askers then leave it alone.
+      context_window: parseWindowInput(model.context_window),
     })
     if (!quiet) setFlash(`${model.model_id} 已保存`)
-    // A capability change decides whether the chat offers this model, so the
-    // catalog is reloaded even on the quiet path.
+    // A capability change decides whether the chat offers this model, and a
+    // window change decides how much history a turn may carry: both are read
+    // from the catalog, so it is reloaded even on the quiet path.
+    await resync()
     await loadCatalog({ quiet: true })
   } catch (err) {
     if (err && err.status === 401) return
@@ -594,11 +668,16 @@ function selectProvider(provider) {
  * (context.window_ratio), and an operator debugging "why does it compress so
  * often" needs to know which number it was.
  */
-function windowSourceLabel(source) {
-  if (source === 'api') return '接口'
-  if (source === 'asked') return '模型自报'
-  if (source === 'user') return '手填'
-  return ''
+function windowTitle(model) {
+  const window = Number(model.context_window) || 0
+  const source = capabilitySourceLabelForWindow(model.context_window_source)
+  const when = model.context_window_checked_at
+    ? `，记录于 ${String(model.context_window_checked_at).slice(0, 19).replace('T', ' ')}`
+    : ''
+  if (window <= 0) {
+    return '还没有记录窗口大小。点右边的刷新图标问模型自己，或直接在这里填（填了就以你的为准）'
+  }
+  return `${formatCount(window)} tokens${source ? `（${source}${when}）` : ''}。agent 一轮的窗口预算就是这个数 × context.window_ratio − reserve_output_tokens。改了就以你填的为准，自动询问不会再覆盖它；清空则退回内置表估算`
 }
 
 function capabilitiesTitle(model) {
@@ -610,15 +689,6 @@ function capabilitiesTitle(model) {
   return `${origin}${when}。点芯片可以手动改，手动设置优先于任何自动来源；模型自报是模型对自己能力的回答，可能答成整个系列的能力，请自行确认`
 }
 
-function windowTitle(model) {
-  const window = Number(model.context_window) || 0
-  if (window <= 0) {
-    return '还没有记录窗口大小：点「刷新模型」后，会先用 provider 的 /models 接口询问，接口不给就直接问模型自己'
-  }
-  const when = model.context_window_checked_at ? `，记录于 ${String(model.context_window_checked_at).slice(0, 19).replace('T', ' ')}` : ''
-  const source = model.context_window_source === 'api' ? '来自 provider 的 /models 接口' : '由模型自己回答'
-  return `${formatCount(window)} tokens（${source}${when}）；agent 一轮的窗口预算按 context.window_ratio 从这个数算出来`
-}
 
 /** Inferred capabilities are a guess; the note under the table says so. */
 const inferredCount = computed(
@@ -1019,6 +1089,16 @@ const inferredCount = computed(
         <button
           type="button"
           class="btn ghost sm"
+          :title="`询问这个 provider 下开着的模型：它们的窗口大小与能力（一次最多问 ${probeBatchLimit} 个）`"
+          :disabled="Boolean(busy[selected.id]) || Boolean(probing)"
+          @click="probeProvider(selected, false)"
+        >
+          <Icon name="refresh" :size="15" />
+          {{ probing === selected.id ? '询问中…' : '询问窗口与能力' }}
+        </button>
+        <button
+          type="button"
+          class="btn ghost sm"
           :disabled="Boolean(busy[selected.id])"
           @click="refreshModels(selected)"
         >
@@ -1056,21 +1136,39 @@ const inferredCount = computed(
             />
 
             <!-- 上下文窗口：agent 一轮的窗口预算就是用它算的（internal/context）。
-                 来源标注不是装饰：provider 自己在 /models 里报的数与模型自报的数
-                 值得不同程度的信任。 -->
-            <span class="model-window" :title="windowTitle(model)">
-              <template v-if="Number(model.context_window) > 0">
-                <span class="mono">{{ formatCount(model.context_window) }}</span>
-                <span
-                  class="tag"
-                  :class="model.context_window_source === 'api' ? 'blue' : 'purple'"
-                >
-                  {{ windowSourceLabel(model.context_window_source) }}
-                </span>
-              </template>
-              <span v-else class="dimmer" title="刷新模型时会让 provider 报告，或直接问模型自己">
-                未知
+                 可编辑，因为只有人知道某些网关的真实限制；来源标注不是装饰 —— provider
+                 在 /models 里报的数、模型自报的数、人填的数，值得不同程度的信任。
+                 清空它会退回内置表估算，而不是留着一个刚被删掉的数字。 -->
+            <span class="model-window">
+              <input
+                v-model="model.context_window"
+                class="input mono model-window-input"
+                type="text"
+                inputmode="numeric"
+                :placeholder="'未知'"
+                :aria-label="`${model.model_id} 的上下文窗口（token）`"
+                :title="windowTitle(model)"
+                @change="saveModel(model)"
+                @keyup.enter="$event.target.blur()"
+              />
+              <span
+                v-if="windowSourceShort(model.context_window_source)"
+                class="tag"
+                :class="model.context_window_source === 'user' ? 'purple' : 'blue'"
+              >
+                {{ windowSourceShort(model.context_window_source) }}
               </span>
+              <button
+                type="button"
+                class="btn sm ghost icon-btn"
+                :title="`重新询问 ${model.model_id}：它会回答自己的窗口大小与能力（文本/图像/工具/TTS/ASR）`"
+                :aria-label="`重新询问 ${model.model_id}`"
+                :disabled="Boolean(modelBusy[modelKey(model)])"
+                @click="probeModel(model)"
+              >
+                <Icon name="refresh" :size="14" />
+              </button>
+              <span v-if="modelBusy[modelKey(model)] === 'probe'" class="dimmer nowrap">询问中…</span>
             </span>
 
             <!-- 能力来源：provider 接口说的、模型自己说的、按名字猜的，还是人点的。
@@ -1128,6 +1226,12 @@ const inferredCount = computed(
           </div>
         </div>
       </AsyncBlock>
+
+      <p v-if="probeNote" class="muted-note card-foot">{{ probeNote }}</p>
+      <div v-if="probeError" class="banner error" role="alert">
+        <Icon name="circle-alert" :size="16" />
+        <span class="banner-text">{{ probeError }}</span>
+      </div>
 
       <div class="model-add">
         <input

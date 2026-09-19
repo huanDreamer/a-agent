@@ -48,6 +48,9 @@ func (s *Server) registerProviderRoutes(authed *route.RouterGroup) {
 	// The whole-catalog refresh: every enabled provider that has a key, in one
 	// request, answering a per-provider report. 设置's 刷新全部 button uses it.
 	authed.POST("/llm/models/refresh-all", s.handleRefreshAllModels)
+	// Ask models about themselves, on demand: the interactive counterpart to the
+	// background pass (see modelfacts.go).
+	authed.POST("/llm/models/probe", s.handleProbeModelFacts)
 
 	authed.GET("/llm/bindings", s.handleListBindings)
 	authed.PUT("/llm/bindings", s.handleSetBinding)
@@ -169,6 +172,7 @@ func (s *Server) handleUpsertProvider(ctx context.Context, c *app.RequestContext
 	if body.Enabled != nil {
 		enabled = *body.Enabled
 	}
+
 	if body.APIKeyEnv != nil {
 		env = strings.TrimSpace(*body.APIKeyEnv)
 	}
@@ -464,6 +468,10 @@ func (s *Server) handleUpsertModel(ctx context.Context, c *app.RequestContext) {
 		DisplayName  *string  `json:"display_name"`
 		Capabilities []string `json:"capabilities"`
 		Enabled      *bool    `json:"enabled"`
+		// ContextWindow is a hand-written window. A pointer so "not sent" and
+		// "cleared" stay distinguishable: sending 0 on purpose means "forget what
+		// anyone said and go back to the built-in table".
+		ContextWindow *int `json:"context_window"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
@@ -522,9 +530,30 @@ func (s *Server) handleUpsertModel(ctx context.Context, c *app.RequestContext) {
 		Capabilities: caps,
 		Enabled:      enabled,
 		Source:       source,
+		// A write from the console is an operator's decision, and that is what
+		// the source says. It is also what protects the value: the automatic
+		// writers (a refresh, a probe) never overwrite a source of "user".
+		CapabilitiesSource: store.ModelCapabilitySourceUser,
 	}); err != nil {
 		s.fail(c, "upsert model", err)
 		return
+	}
+
+	// The window goes through its own writer, which knows the rules about who may
+	// overwrite whom — and which can clear a value, where an upsert could not
+	// tell "not mentioned" from "set to zero".
+	if body.ContextWindow != nil {
+		window := *body.ContextWindow
+		source := store.ModelWindowSourceUser
+		if window <= 0 {
+			// Cleared: nobody says, so the built-in table answers again rather
+			// than a number the operator just deleted.
+			window, source = 0, ""
+		}
+		if werr := s.store.SetModelContextWindow(ctx, providerID, modelID, window, source); werr != nil {
+			s.fail(c, "set model window", werr)
+			return
+		}
 	}
 	saved, err := s.store.GetModel(ctx, providerID, modelID)
 	if err != nil {

@@ -401,6 +401,17 @@ func (s *sqliteStore) UpsertModel(ctx context.Context, m Model) error {
 	if m.Source == "" {
 		m.Source = "user"
 	}
+	// The update path carries the capability columns too.
+	//
+	// It did not, and that was invisible in the obvious test — a hand-edit of a
+	// row that already existed wrote the capabilities but left
+	// capabilities_source alone, so the console kept saying "按模型名推断" after
+	// the operator had just declared the truth by hand, and the automatic
+	// writers (which never touch a source of "user") were free to overwrite the
+	// decision on the next probe. The window is deliberately *not* here: it has
+	// its own writer with its own rules about who may overwrite whom (see
+	// SetModelContextWindow), and duplicating that logic in an upsert is how the
+	// two would drift.
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO llm_models (`+modelCols+`)
 		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
@@ -408,7 +419,9 @@ func (s *sqliteStore) UpsertModel(ctx context.Context, m Model) error {
 			display_name = excluded.display_name,
 			capabilities = excluded.capabilities,
 			enabled      = excluded.enabled,
-			source       = CASE WHEN llm_models.source = 'fetched' AND excluded.source = 'fetched' THEN llm_models.source ELSE excluded.source END`,
+			source       = CASE WHEN llm_models.source = 'fetched' AND excluded.source = 'fetched' THEN llm_models.source ELSE excluded.source END,
+			capabilities_source = CASE WHEN excluded.capabilities_source <> '' THEN excluded.capabilities_source ELSE llm_models.capabilities_source END,
+			capabilities_checked_at = CASE WHEN excluded.capabilities_source <> '' THEN CURRENT_TIMESTAMP ELSE llm_models.capabilities_checked_at END`,
 		m.ProviderID, m.ModelID, m.DisplayName, m.Capabilities.String(), boolToInt(m.Enabled), m.Source,
 		m.ContextWindow, m.ContextWindowSource, checkedAtValue(m.ContextWindow),
 		m.CapabilitiesSource, nil)

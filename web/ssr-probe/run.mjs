@@ -29,6 +29,7 @@ import {
   renderDirPicker,
   renderLogin,
   renderMessageBubble,
+  renderModelPanel,
   renderSidebar,
   renderSubagentsDrawer,
   setSubagents,
@@ -1010,6 +1011,82 @@ check('the chip explains the cap', subagentChip().hint.includes('上限 2'))
 setSubagents([{ id: 'sa-9', name: 'x', prompt: 'y', status: 'ok', steps: 1, duration_ms: 10 }],
   { running: 0, maxConcurrent: 2, runningAll: 0 })
 check('an idle chip counts records', subagentChip().label.includes('1 个子 agent 记录'))
+
+/* -------------------------------------------- 设置 → 模型 (window, capabilities) -- */
+
+// The window size and the capability set have to be visible where the models are
+// listed, with the provenance of each — the failure this probe exists for is a
+// column that was added to the wrong panel.
+{
+  const html = await renderModelPanel({
+    catalog: {
+      models: [
+        {
+          provider: 'commandcode', provider_name: 'commandcode',
+          model: 'MiniMaxAI/MiniMax-M3', display_name: 'MiniMax M3',
+          capabilities: ['chat', 'vision', 'tools'], capabilities_source: 'asked',
+          context_window: 1000000, context_window_source: 'api',
+          chat_capable: true, default: true, has_api_key: true,
+        },
+        {
+          provider: 'deepseek', provider_name: 'DeepSeek',
+          model: 'deepseek-v4-pro', display_name: 'DeepSeek V4 Pro',
+          capabilities: ['chat'], capabilities_source: 'inferred',
+          context_window: 128000, context_window_source: 'asked',
+          chat_capable: true, has_api_key: true,
+        },
+        {
+          provider: 'deepseek', provider_name: 'DeepSeek',
+          model: 'unknown-model', display_name: 'Unknown',
+          capabilities: [], chat_capable: true, has_api_key: false,
+        },
+      ],
+      providers: [
+        { id: 'commandcode', name: 'commandcode', model_count: 1, has_key: true },
+        { id: 'deepseek', name: 'DeepSeek', model_count: 2, has_key: true },
+      ],
+      groups: [
+        {
+          provider: 'commandcode', providerName: 'commandcode', hasKey: true,
+          models: [{
+            provider: 'commandcode', providerName: 'commandcode',
+            model: 'MiniMaxAI/MiniMax-M3', displayName: 'MiniMax M3',
+            capabilities: ['chat', 'vision', 'tools'], capabilitiesSource: 'asked',
+            contextWindow: 1000000, contextWindowSource: 'api',
+            chatCapable: true, isDefault: true, hasKey: true,
+          }],
+        },
+        {
+          provider: 'deepseek', providerName: 'DeepSeek', hasKey: true,
+          models: [
+            {
+              provider: 'deepseek', providerName: 'DeepSeek',
+              model: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro',
+              capabilities: ['chat'], capabilitiesSource: 'inferred',
+              contextWindow: 128000, contextWindowSource: 'asked',
+              chatCapable: true, hasKey: true,
+            },
+            {
+              provider: 'deepseek', providerName: 'DeepSeek',
+              model: 'unknown-model', displayName: 'Unknown',
+              capabilities: [], chatCapable: true, hasKey: false,
+            },
+          ],
+        },
+      ],
+    },
+  })
+
+  check('设置 → 模型 has a window column', html.includes('窗口大小'), '')
+  check('the window column is a table heading', /<th[^>]*>\s*窗口大小/.test(html), '')
+  check('a published window is shown', html.includes('1,000,000'), '')
+  check('its provenance is shown next to it', html.includes('接口'), '')
+  check('a self-reported window says so', html.includes('自报'), '')
+  check('a model nobody described reads as unknown', html.includes('未知'), '')
+  check('capabilities are still listed', html.includes('工具调用'), '')
+  check('the capabilities come with their source', html.includes('模型自报'), '')
+  check('the footer says where to change a window', html.includes('模型管理'), '')
+}
 
 console.log(failures === 0 ? '\nALL PROBES PASSED' : `\n${failures} PROBE(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)

@@ -47,6 +47,48 @@ export function capabilitySourceLabel(source) {
   return CAPABILITY_SOURCES[source] || ''
 }
 
+/** The same, for a context window: short enough for a table cell. */
+export function windowSourceLabel(source) {
+  if (source === 'api') return '来自 provider 接口'
+  if (source === 'asked') return '模型自报'
+  if (source === 'user') return '手动填写'
+  return ''
+}
+
+/**
+ * The context window as a number, from the text an operator typed.
+ *
+ * The field is a text input on purpose — a number input fights every keystroke of
+ * "128000", and "128K" is how people write it. So this is where a comma, a space
+ * or a suffix becomes a number, and where anything unreadable becomes 0, which
+ * clears the value instead of storing a guess. A wrong number here is not
+ * cosmetic: it is the history budget of every turn (context.window_ratio).
+ */
+export function parseWindowInput(raw) {
+  const text = String(raw ?? '').trim()
+  if (text === '') return 0
+  const cleaned = text.replace(/[,\s_]/g, '').toLowerCase()
+  // A number, optionally with one unit — and *nothing else*. An earlier version
+  // stripped the non-digits and kept what was left, which turned "-5" into a
+  // five-token window and "abc12" into twelve: a typo would quietly become a
+  // fact. Anything unrecognised clears the value instead, which puts the built-in
+  // table back in charge.
+  const match = /^(\d+(?:\.\d+)?)(k|m|tokens?|个|字)?$/.exec(cleaned)
+  if (!match) return 0
+  const scale = match[2] === 'k' ? 1_000 : match[2] === 'm' ? 1_000_000 : 1
+  const value = Number(match[1]) * scale
+  if (!Number.isFinite(value) || value <= 0) return 0
+  return Math.round(value)
+}
+
+/** The one-or-two character form used inside the table cells. */
+export function windowSourceShort(source) {
+  if (source === 'api') return '接口'
+  if (source === 'asked') return '自报'
+  if (source === 'user') return '手填'
+  return ''
+}
+
 /**
  * The capabilities that can be bound to a model, and the tools they switch on.
  * `chat` and `embedding` are deliberately absent: they are properties of a
@@ -120,6 +162,8 @@ export function catalogEntry(raw) {
     displayName: String(raw.display_name || model),
     capabilities: normalizeCapabilities(raw.capabilities),
     capabilitiesSource: typeof raw.capabilities_source === 'string' ? raw.capabilities_source : '',
+    contextWindow: Number(raw.context_window) || 0,
+    contextWindowSource: typeof raw.context_window_source === 'string' ? raw.context_window_source : '',
     isDefault: Boolean(raw.default),
     // A server that does not report the flag is assumed to have a key, so an
     // older response cannot make every model look unconfigured.

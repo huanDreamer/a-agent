@@ -3753,17 +3753,6 @@ table.data tbody tr.row-click:focus-visible {
   border-bottom: 1px solid var(--border);
 }
 
-/* 上下文窗口：一个数字加一枚来源标签。宽度固定，免得每行的能力芯片随着窗口
-   位数（128,000 与 1,000,000）左右跳动。 */
-.model-window {
-  flex: 0 0 150px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  justify-content: flex-end;
-  font-size: 12px;
-}
-
 .model-id {
   flex: 0 1 200px;
   min-width: 0;
@@ -4954,4 +4943,19 @@ table.data tbody tr.row-click:focus-visible {
 .tool-nested-line.kind-reasoning .tool-nested-text {
   color: var(--muted-foreground);
   font-style: italic;
+}
+
+/* 窗口大小：一个可编辑的数字框 + 来源标签 + 询问按钮。宽度固定，免得每一行的
+   能力芯片随着窗口位数（128,000 与 1,000,000）左右跳动。 */
+.model-window {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-window-input {
+  width: 104px;
+  text-align: right;
+  font-size: 12px;
 }
