@@ -652,6 +652,16 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	if err := os.MkdirAll(filepath.Dir(cfg.Database.Path), 0o755); err != nil {
 		return fmt.Errorf("mkdir database dir: %w", err)
 	}
+
+	// The bot and the console share one pid file, so starting either stops the
+	// other: the feishu long connection is a second copy of the same service,
+	// and running two of them is how a message gets answered twice.
+	pidHandle, err := claimInstance(logger)
+	if err != nil {
+		return err
+	}
+	defer releaseInstance(pidHandle, logger)
+
 	st, err := store.Open(cmd.Context(), cfg.Database.Path)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)

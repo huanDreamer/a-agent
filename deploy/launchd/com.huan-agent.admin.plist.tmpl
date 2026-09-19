@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  huan-agent admin server as a per-user launchd agent (macOS equivalent of a
+  systemd unit). Rendered by `make agent-install`: __PROJECT_DIR__ and
+  __HOME_DIR__ are substituted with the real absolute paths.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.huan-agent.admin</string>
+
+	<!-- Absolute binary + absolute config: launchd does not run a login shell,
+	     so nothing may depend on PATH lookup or on a relative config path. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PROJECT_DIR__/bin/huan-agent</string>
+		<string>admin</string>
+		<string>serve</string>
+		<string>--config</string>
+		<string>__PROJECT_DIR__/configs/config.yaml</string>
+	</array>
+
+	<!-- config.yaml resolves data/, checkpoints and skill dirs relatively, so the
+	     working directory must be the project root. -->
+	<key>WorkingDirectory</key>
+	<string>__PROJECT_DIR__</string>
+
+	<!-- Start now (and at every login), and restart whenever it exits. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+
+	<!-- Do not hot-loop on a crash: launchd waits 10s between respawns. -->
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<!-- launchd creates the files but not the directory; `make agent-install`
+	     creates __PROJECT_DIR__/logs first. -->
+	<key>StandardOutPath</key>
+	<string>__PROJECT_DIR__/logs/admin.log</string>
+	<key>StandardErrorPath</key>
+	<string>__PROJECT_DIR__/logs/admin.err.log</string>
+
+	<!-- launchd hands a process a minimal environment (/usr/bin:/bin:/usr/sbin:/sbin).
+	     The agent shells out for its tools, so it gets the same PATH as a login
+	     shell on this machine — otherwise go/git/node/brew silently go missing. -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME_DIR__</string>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/sbin:/usr/local/opt/node@22/bin:/Users/huan/.local/bin:/Users/huan/sdk/go1.21/bin:/Users/huan/sdk/gopath/bin:/Users/huan/sdk/flutter/bin:/Users/huan/apps/etcd-v3.5.4:/Users/huan/Documents/apache-maven-3.8.4/bin:/Library/Java/JavaVirtualMachines/jdk1.8.0_331.jdk/Contents/Home/bin:/Library/Apple/usr/bin:/pkg/env/global/bin</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+	</dict>
+</dict>
+</plist>

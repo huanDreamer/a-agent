@@ -110,6 +110,12 @@ The bot opens a WebSocket long-connection and stays up until you send SIGINT/SIG
 Each private user (`open_id`) gets an independent session with the same memory +
 context machinery as `huan-agent chat`.
 
+Only one instance runs at a time. `serve` and `admin serve` share the pid file
+`.huan-agent.pid` in the working directory, so starting either stops the other —
+which is what keeps a bot from answering each message twice. See
+[One instance at a time](admin.md#one-instance-at-a-time) for what happens on
+startup and the two limits of the guard.
+
 ### Behavior options
 
 ```yaml

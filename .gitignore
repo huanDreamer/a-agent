@@ -50,3 +50,6 @@ coverage.html
 # Build cache
 .cache/
 .gocache/
+
+# Runtime state
+.huan-agent.pid
