@@ -19,6 +19,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/huan/huan-agent/internal/chat"
+	"github.com/huan/huan-agent/internal/claudecode"
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/jobs"
 	"github.com/huan/huan-agent/internal/langfuse"
@@ -53,7 +54,7 @@ var _ server.TraceReader = (*tracing.Recorder)(nil)
 // config file, because the default may come from the database.
 func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 	rec *usage.Recorder, logger *zap.Logger, vikingSvc *viking.Service,
-	jobMgr *jobs.Manager) (server.ChatDeps, string, string) {
+	jobMgr *jobs.Manager, claudeSvc *claudecode.Service) (server.ChatDeps, string, string) {
 
 	if !cfg.Chat.Enable {
 		logger.Info("web chat disabled (chat.enable = false)")
@@ -77,6 +78,11 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 		// the config-only fallback path behaves identically.
 		Retry:  cfg.LLM.RetryPolicy(),
 		Logger: logger,
+		// ClaudeCode compatibility mode is a provider source of its own: while it
+		// is on, its provider and models join the catalog and a new conversation
+		// starts on them, so the switch is visible in 对话 rather than only in
+		// 设置. Nil is the feature off.
+		Extra: claudeSvc,
 	})
 
 	// The default model is resolved through the builder, not the registry: with
@@ -366,6 +372,15 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	if err := os.MkdirAll(filepath.Dir(cfg.Database.Path), 0o755); err != nil {
 		return fmt.Errorf("mkdir database dir: %w", err)
 	}
+
+	// One instance at a time, and a start is a restart: whatever the pid file
+	// names is stopped before the store is opened or the port is bound, because
+	// those are the two things a second instance cannot share.
+	pidHandle, err := claimInstance(logger)
+	if err != nil {
+		return err
+	}
+	defer releaseInstance(pidHandle, logger)
 	st, err := store.Open(cmd.Context(), cfg.Database.Path)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
@@ -471,8 +486,15 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	// no one tracking it.
 	defer jobMgr.Close()
 
+	// ClaudeCode compatibility mode: the settings file, the switch and the hook
+	// engine. It is built before the chat wiring because that wiring offers its
+	// provider in the catalog (see ModelBuilderOptions.Extra), and handed the MCP
+	// runtime afterwards because that runtime is built with the tool registry the
+	// chat wiring produces.
+	claudeSvc := newClaudeCodeService(cfg, st, logger)
+
 	// The chat feature needs a model builder and a tool set.
-	chatDeps, chatProvider, chatModel := buildChatDeps(cfg, tracer, st, recorder, logger, vikingSvc, jobMgr)
+	chatDeps, chatProvider, chatModel := buildChatDeps(cfg, tracer, st, recorder, logger, vikingSvc, jobMgr, claudeSvc)
 
 	// /api/meta reports where a conversation actually runs. The config file is
 	// the answer when it names a provider; otherwise it is the model the catalog
@@ -515,9 +537,13 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 		ChatEnable:       cfg.Chat.Enable,
 		Chat:             chatDeps,
 		Jobs:             jobMgr,
-		OpenViking:       vikingConsole(vikingSvc),
-		Tracer:           tracer,
-		Traces:           rec,
+		// ClaudeCode compatibility mode, and the approval mode hooks read as
+		// Claude Code's permission_mode.
+		ClaudeCode:   claudeSvc,
+		ApprovalMode: cfg.Tools.Approval.ModeOr(),
+		OpenViking:   vikingConsole(vikingSvc),
+		Tracer:       tracer,
+		Traces:       rec,
 		// Checkpoints: where they live, and how many turns to keep. The
 		// per-workspace checkpointer is built by the server, because this process
 		// serves several workspaces.
@@ -541,6 +567,10 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+
+	// The mode's mcp_tool handlers run through MCP, whose runtime exists only
+	// once the server has registered its tools.
+	claudeSvc.SetMCPCaller(srv.HookMCPCaller())
 
 	ctx, stop := signalContext()
 	defer stop()

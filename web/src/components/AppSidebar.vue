@@ -1,7 +1,12 @@
 <script setup>
 // The app sidebar — four regions, in this order:
 //
-//   1. 新建对话 (one button, nothing above it);
+//   1. 新建对话 and, directly under it, the **run-mode badge**: which mode the next
+//      message runs on and which model that mode resolves to. It is here rather
+//      than in 设置 because it is a fact about every conversation in the list
+//      below it — turning ClaudeCode 兼容 on overrides the model each of them
+//      picked — and because the place it is switched is one click away from
+//      wherever the reader noticed it;
 //   2. the **workspace folders**: conversations grouped by the directory they
 //      run in. A workspace is managed here because this is where it is visible —
 //      renaming a label and deleting a folder are list actions, not settings.
@@ -36,7 +41,7 @@ import {
   workspaceGroups,
 } from '../chatStore.js'
 import { formatAbsolute, formatCount, formatRelative } from '../format.js'
-import { NAV, openTrace, setTab, signOut, state } from '../state.js'
+import { NAV, claudeCode, openTrace, setSettings, setTab, signOut, state } from '../state.js'
 
 const emit = defineEmits(['select'])
 
@@ -238,6 +243,79 @@ function openPicker() {
 function isFolded(name) {
   return Boolean(chat.collapsedWorkspaces[name])
 }
+
+// --- the run-mode badge ------------------------------------------------
+
+/**
+ * Which mode the next message runs on, and which model that mode resolves to.
+ *
+ * Everything comes from the shared `claudeCode` store (state.js), which bootstrap()
+ * read once at boot and 设置 → ClaudeCode re-reads when it switches the mode: the
+ * badge and the panel are always the same answer, and the badge never asks the
+ * server a second question of its own.
+ *
+ * The four states are deliberately distinct:
+ *   ''        the probe has not answered. Nothing renders — "本机模式" would be a
+ *             claim about every conversation in the list, and it would be wrong
+ *             exactly when the mode was switched from another tab;
+ *   'native'  the mode is off: each conversation runs the model it picked;
+ *   'compat'  the mode is on: every conversation runs model.effective_model;
+ *   'unknown' the read failed. That is a fact worth a line too — with the reason in
+ *             the tooltip — because a badge that disappeared would read as "fine".
+ */
+const modeKind = computed(() => {
+  if (claudeCode.snapshot) return claudeCode.snapshot.compat ? 'compat' : 'native'
+  return claudeCode.status === 'error' ? 'unknown' : ''
+})
+
+const modeLabel = computed(() => {
+  if (modeKind.value === 'unknown') return '模式未知'
+  return modeKind.value === 'compat' ? 'ClaudeCode 兼容' : '本机模式'
+})
+
+/** The model under the label: the name is the whole consequence of the mode. */
+const modeModel = computed(() => {
+  const snapshot = claudeCode.snapshot
+  if (!snapshot) return claudeCode.error ? '无法读取状态，点开查看' : ''
+  if (snapshot.compat) {
+    const model = snapshot.model || {}
+    return model.effective_model || model.model || '模型未解析'
+  }
+  const native = snapshot.native || {}
+  if (!native.model) return native.provider || '默认模型'
+  return native.provider ? `${native.provider} / ${native.model}` : native.model
+})
+
+/** What the badge means, plus the way to change it — it is the only control here. */
+const modeHint = computed(() => {
+  const snapshot = claudeCode.snapshot
+  if (!snapshot) {
+    return `${claudeCode.error || '正在读取运行模式'} · 点击打开 设置 → ClaudeCode`
+  }
+  if (snapshot.compat) {
+    return (
+      `ClaudeCode 兼容模式：所有对话都跑 ${modeModel.value}，` +
+      `覆盖每个对话自己选的模型（关掉即恢复，下一个对话生效）· 点击打开 设置 → ClaudeCode`
+    )
+  }
+  return (
+    `本机模式：每个对话跑自己在 对话 里选的模型（默认 ${modeModel.value}）· ` +
+    `点击打开 设置 → ClaudeCode`
+  )
+})
+
+/**
+ * Jump to 设置 → ClaudeCode.
+ *
+ * The sub-tab is set first and the surface second, so the settings page is already
+ * pointing at the right panel when it mounts — the panel is keyed on `state.settings`
+ * and would otherwise render 外观 for a frame.
+ */
+function openClaudeCode() {
+  emit('select')
+  setSettings('claudecode')
+  setTab('settings')
+}
 </script>
 
 <template>
@@ -253,6 +331,26 @@ function isFolded(name) {
       >
         <Icon name="plus" :size="16" />
         {{ chat.creating ? '创建中…' : '新建对话' }}
+      </button>
+
+      <!-- Which mode the next message runs on. It renders nothing until the probe
+           answers: see `modeKind`. -->
+      <button
+        v-if="modeKind"
+        type="button"
+        class="side-mode"
+        :class="modeKind"
+        :title="modeHint"
+        @click="openClaudeCode"
+      >
+        <span class="side-mode-line">
+          <Icon
+            :name="modeKind === 'compat' ? 'plug' : modeKind === 'unknown' ? 'circle-alert' : 'cpu'"
+            :size="13"
+          />
+          <span class="side-mode-name">{{ modeLabel }}</span>
+        </span>
+        <span v-if="modeModel" class="side-mode-model">{{ modeModel }}</span>
       </button>
     </div>
 

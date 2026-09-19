@@ -25,7 +25,7 @@ import MonitorView from './components/MonitorView.vue'
 import SettingsView from './components/SettingsView.vue'
 import Icon from './components/Icon.vue'
 import { ensureLoaded } from './chatStore.js'
-import { bootstrap, loadMeta, needsLogin, state } from './state.js'
+import { bootstrap, loadClaudeCode, loadMeta, needsLogin, state } from './state.js'
 import { ui } from './ui.js'
 
 const VIEWS = {
@@ -37,11 +37,16 @@ const VIEWS = {
 const activeView = computed(() => VIEWS[state.tab] || ChatView)
 
 /** Session list + model catalog, for the whole shell (the sidebar is always up). */
-function boot() {
-  bootstrap()
+async function boot() {
+  // The probe decides which screen comes first, so it has to answer before
+  // anything is loaded. Firing these without waiting is the bug this awaits:
+  // `state.auth.probed` is still false while the round trip is in flight, so
+  // `needsLogin` reads false, the whole console loads on a deployment that
+  // requires a password, and every request comes back 401.
+  await bootstrap()
   // Nothing to load while the login form is up: those requests would carry a
   // session the operator does not have yet.
-  if (!needsLogin.value) ensureLoaded()
+  if (!needsLogin.value) await ensureLoaded()
 }
 
 onMounted(boot)
@@ -56,6 +61,10 @@ onMounted(boot)
  */
 function onSignedIn() {
   loadMeta()
+  // The sidebar's run-mode badge is part of the shell too, and bootstrap() stopped
+  // before reading it: it is the same "the gate kept it from firing requests it had
+  // no session for" case, and a badge with no answer renders nothing at all.
+  loadClaudeCode()
   ensureLoaded()
 }
 

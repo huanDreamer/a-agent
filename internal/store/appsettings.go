@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"strconv"
 )
 
@@ -15,6 +18,18 @@ const (
 	// KeyChatTurnDeadlineSeconds is the per-turn wall-clock cap; 0 means
 	// unlimited.
 	KeyChatTurnDeadlineSeconds = "chat.turn_deadline_seconds"
+	// KeyClaudeCodeMode is which mode the console switched the agent to:
+	// "claudecode" (run on ~/.claude/settings.json) or "native" (run on this
+	// deployment's own model config). An absent key means "whatever
+	// claudecode.enable in config.yaml says", which is what keeps the file
+	// authoritative until someone actually flips the switch.
+	KeyClaudeCodeMode = "claudecode.mode"
+)
+
+// The two values KeyClaudeCodeMode may hold.
+const (
+	ClaudeCodeModeNative = "native"
+	ClaudeCodeModeCompat = "claudecode"
 )
 
 // TurnBudgetOverride is the set of per-turn budget values the console has
@@ -105,6 +120,58 @@ func (s *sqliteStore) SetTurnBudgetOverride(ctx context.Context, o TurnBudgetOve
 	}
 	if err := tx.Commit(); err != nil {
 		return fmtErr("commit app settings", err)
+	}
+	return nil
+}
+
+// GetClaudeCodeMode returns the mode the console stored.
+//
+// The second result says whether the key exists at all. The distinction is the
+// whole reason this is not a plain string: an operator who never touched the
+// switch must get config.yaml's value, not an override this process invented on
+// first read — otherwise editing the config file would stop having any effect
+// the moment the console was opened once.
+func (s *sqliteStore) GetClaudeCodeMode(ctx context.Context) (string, bool, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM app_settings WHERE key = ?`, KeyClaudeCodeMode).Scan(&value)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	case err != nil:
+		return "", false, fmtErr("read app setting %s", err, KeyClaudeCodeMode)
+	}
+	switch value {
+	case ClaudeCodeModeNative, ClaudeCodeModeCompat:
+		return value, true, nil
+	default:
+		// A row that is not one of the two modes is corruption rather than a
+		// value to act on: reporting it as absent falls back to the config file,
+		// which is the only reading that cannot silently pick a mode.
+		return "", false, nil
+	}
+}
+
+// SetClaudeCodeMode stores the mode. An empty mode deletes the key, which is how
+// the config file becomes authoritative again.
+func (s *sqliteStore) SetClaudeCodeMode(ctx context.Context, mode string) error {
+	if mode == "" {
+		if _, err := s.db.ExecContext(ctx,
+			`DELETE FROM app_settings WHERE key = ?`, KeyClaudeCodeMode); err != nil {
+			return fmtErr("clear app setting %s", err, KeyClaudeCodeMode)
+		}
+		return nil
+	}
+	if mode != ClaudeCodeModeNative && mode != ClaudeCodeModeCompat {
+		return fmt.Errorf("store: %q is not a Claude Code mode (%q or %q)",
+			mode, ClaudeCodeModeNative, ClaudeCodeModeCompat)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO app_settings (key, value, updated_at)
+		VALUES (?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`,
+		KeyClaudeCodeMode, mode); err != nil {
+		return fmtErr("write app setting %s", err, KeyClaudeCodeMode)
 	}
 	return nil
 }

@@ -1,5 +1,5 @@
 <script setup>
-// 设置 — every knob the console can turn, as six sub-tabs inside one page.
+// 设置 — every knob the console can turn, as eight sub-tabs inside one page.
 //
 // 工作区 is deliberately NOT here: a workspace is a directory and a folder in the
 // sidebar, so it is created and managed where conversations live, not in a
@@ -21,6 +21,11 @@
 //   * 对话预算    the per-turn budget, editable: it is the one panel here that
 //                 changes how a turn runs, and it exists so a turn that stopped on
 //                 its step cap is not fixable only from a shell;
+//   * ClaudeCode  the compatibility mode: the agent reads ~/.claude/settings.json
+//                 and runs on exactly the model configuration and hooks Claude Code
+//                 uses. One switch, and a read-only account of what that file
+//                 resolved to — including the hooks this agent has no trigger point
+//                 for. It sits next to 对话预算 because both decide how a turn runs;
 //   * MCP         the MCP servers, their live state, and the AI assistant that
 //                 drafts a definition from a description;
 //   * OpenViking  the context database: connection, memory counters, workspace
@@ -41,6 +46,7 @@
 import { computed } from 'vue'
 import AppearancePanel from './AppearancePanel.vue'
 import BudgetPanel from './BudgetPanel.vue'
+import ClaudeCodePanel from './ClaudeCodePanel.vue'
 import McpPanel from './McpPanel.vue'
 import ModelPanel from './ModelPanel.vue'
 import OpenVikingPanel from './OpenVikingPanel.vue'
@@ -53,6 +59,7 @@ const PANELS = {
   appearance: AppearancePanel,
   models: ModelPanel,
   budget: BudgetPanel,
+  claudecode: ClaudeCodePanel,
   mcp: McpPanel,
   openviking: OpenVikingPanel,
   skills: SkillPanel,
@@ -64,6 +71,8 @@ const NOTES = {
   appearance: '主题与显示偏好 · 立即生效，只保存在本机浏览器',
   models: '模型目录与模型管理 · 对话的模型选择器读的就是这里',
   budget: '每轮预算 · 立即生效（写入数据库），覆盖 config.yaml 的默认值',
+  claudecode:
+    'ClaudeCode 兼容模式 · 开关只在这里；打开后所有对话都跑 settings.json 里的模型，覆盖对话各自的选择',
   mcp: 'MCP 服务器 · 保存后立即连接，模型下一轮对话即可调用',
   openviking: 'OpenViking 上下文库 · 长期记忆与文档，设置来自服务端配置',
   skills: '技能（Skill）· 启用的技能会出现在对话的系统提示里，由模型按需加载',

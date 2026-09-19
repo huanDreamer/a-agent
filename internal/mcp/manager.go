@@ -265,6 +265,50 @@ func (m *Manager) Status() []ServerStatus {
 	return m.statusLocked()
 }
 
+// CallTool invokes one tool on a connected server, addressed by the server's id
+// or by its configured name.
+//
+// It exists for the mcp_tool hook of Claude Code compatibility mode, which
+// names a server and a tool rather than the registry name an MCP tool is
+// bridged under — and which must not be able to *start* anything: a hook runs
+// on every tool call, so triggering an OAuth flow or a connection from one
+// would be a side effect nobody asked for. Only an already-connected server is
+// used, and a server that is not connected is an error the hook's failure list
+// carries.
+func (m *Manager) CallTool(ctx context.Context, server, tool, argsJSON string) (string, error) {
+	if m == nil {
+		return "", fmt.Errorf("mcp: no manager")
+	}
+	server = strings.TrimSpace(server)
+	tool = strings.TrimSpace(tool)
+	if server == "" || tool == "" {
+		return "", fmt.Errorf("mcp: server and tool are required")
+	}
+
+	m.mu.Lock()
+	var found *managedServer
+	for id, cur := range m.servers {
+		if id == server || cur.spec.Name == server {
+			found = cur
+			break
+		}
+	}
+	m.mu.Unlock()
+
+	switch {
+	case found == nil:
+		return "", fmt.Errorf("mcp: server %q is not configured", server)
+	case found.client == nil:
+		// The recorded error is the useful half: "not connected" alone sends the
+		// operator looking for a problem the server already reported.
+		if found.err != "" {
+			return "", fmt.Errorf("mcp: server %q is not connected: %s", server, found.err)
+		}
+		return "", fmt.Errorf("mcp: server %q is not connected", server)
+	}
+	return found.client.CallTool(ctx, tool, argsJSON)
+}
+
 func (m *Manager) statusLocked() []ServerStatus {
 	out := make([]ServerStatus, 0, len(m.servers))
 	for id, cur := range m.servers {

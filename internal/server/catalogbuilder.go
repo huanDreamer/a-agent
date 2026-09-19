@@ -18,10 +18,29 @@ import (
 	"github.com/huan/huan-agent/internal/store"
 )
 
-// providerKindOpenAI is the only provider kind this build can call: every
-// supported backend speaks the OpenAI HTTP protocol, so a provider declaring
-// anything else is refused rather than silently treated as OpenAI-compatible.
-const providerKindOpenAI = "openai"
+// providerKindOpenAI is the default provider kind: the OpenAI chat-completions
+// protocol, which every DeepSeek / Qwen / GLM / OpenAI / Ollama endpoint speaks.
+//
+// providerKindAnthropicMessages is the second one this build can call: the
+// Anthropic Messages API, which is what every Claude-Code-shaped endpoint
+// speaks (Claude Code's own ANTHROPIC_BASE_URL, and the proxies people put in
+// front of it). A provider declaring anything else is refused rather than
+// silently treated as OpenAI-compatible.
+const (
+	providerKindOpenAI            = "openai"
+	providerKindAnthropicMessages = "anthropic-messages"
+)
+
+// supportedProviderKind reports whether this build can call a provider kind. An
+// empty kind means OpenAI, which is what every provider predating the Kind
+// column is.
+func supportedProviderKind(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "", providerKindOpenAI, providerKindAnthropicMessages:
+		return true
+	}
+	return false
+}
 
 // maxModelCache bounds the constructed-model cache. Providers x models is a small
 // number in practice; the bound only stops a caller growing the map with
@@ -41,6 +60,33 @@ type ModelBuilderOptions struct {
 	// transient call failure costs a wait instead of the turn. It flows from
 	// llm.retry; the zero value means no retrying.
 	Retry retry.Policy
+	// Extra is a provider the catalog offers on top of the store and the config
+	// registry. Today that is ClaudeCode compatibility mode: a provider defined
+	// by ~/.claude/settings.json rather than by this deployment, which must be
+	// selectable in 对话 and resolvable by a turn while it is on, and must vanish
+	// from both the moment it is switched off. Nil is the ordinary case.
+	Extra ExtraProvider
+}
+
+// ExtraProvider is a provider source that is not the database and not the config
+// file: it is asked on every catalog build and every model build, so switching
+// it on or off takes effect on the next message rather than the next restart.
+//
+// It returns a store.Provider rather than a shape of its own so that every
+// surface which already reads a provider — the composer's picker, the health
+// warnings, the model-management panel — needs no new vocabulary for it. The row
+// is simply never stored.
+type ExtraProvider interface {
+	// ID is the provider id, which is also what a session stores as its
+	// provider when it runs on one of its models.
+	ID() string
+	// Row returns the provider row, or false when this source is currently
+	// offering nothing (which is how it disappears when it is switched off).
+	Row(ctx context.Context) (store.Provider, bool)
+	// Models returns the models it offers. An empty slice is valid.
+	Models(ctx context.Context) []store.Model
+	// Build constructs a chat model for one of those models.
+	Build(ctx context.Context, modelName string) (model.BaseChatModel, error)
 }
 
 // CatalogModelBuilder is the ModelBuilder the console runs on: the database
@@ -76,6 +122,9 @@ type CatalogModelBuilder struct {
 	// setting: the question it answers is about this process, not about one
 	// provider.
 	retry retry.Policy
+	// extra is the provider source that is neither the store nor the config
+	// file; see ExtraProvider. Nil means there is none.
+	extra ExtraProvider
 
 	mu    sync.Mutex
 	cache map[string]cachedModel
@@ -105,6 +154,7 @@ func NewCatalogModelBuilder(st store.Store, reg *llm.Registry, opts ModelBuilder
 		ttl:    opts.TTL,
 		logger: logger,
 		retry:  opts.Retry,
+		extra:  opts.Extra,
 	}
 }
 
@@ -133,6 +183,18 @@ func (b *CatalogModelBuilder) Build(ctx context.Context, provider, modelName str
 	if provider == "" {
 		return nil, errors.New("server: no LLM provider is configured: add one in 设置 → 模型管理, " +
 			"or declare llm.providers in the config file")
+	}
+
+	// The extra source is checked before the store on purpose. Its id is
+	// reserved (see the ClaudeCode mode) and it is authoritative while it offers
+	// anything: a stored row with the same id would be a second, stale copy of a
+	// configuration whose source of truth is a file.
+	if b.extra != nil && provider == b.extra.ID() {
+		built, err := b.extra.Build(ctx, modelName)
+		if err != nil {
+			return nil, fmt.Errorf("server: build %s/%s: %w", provider, modelName, err)
+		}
+		return built, nil
 	}
 
 	if b.st != nil {
@@ -166,9 +228,10 @@ func (b *CatalogModelBuilder) buildStored(ctx context.Context, p store.Provider,
 	if !p.Enabled {
 		return nil, fmt.Errorf("server: provider %q is disabled in 模型管理: enable it before using its models", p.ID)
 	}
-	if kind := strings.TrimSpace(p.Kind); kind != "" && kind != providerKindOpenAI {
+	if kind := strings.TrimSpace(p.Kind); !supportedProviderKind(kind) {
 		return nil, fmt.Errorf("server: provider %q declares kind %q, which this build cannot call: "+
-			"only %q (an OpenAI-compatible endpoint) is supported", p.ID, kind, providerKindOpenAI)
+			"only %q (an OpenAI-compatible endpoint) and %q (the Anthropic Messages API) are supported",
+			p.ID, kind, providerKindOpenAI, providerKindAnthropicMessages)
 	}
 	if strings.TrimSpace(p.BaseURL) == "" {
 		return nil, fmt.Errorf("server: provider %q has no base_url: set it in 模型管理", p.ID)
@@ -216,6 +279,10 @@ func (b *CatalogModelBuilder) buildStored(ctx context.Context, p store.Provider,
 		// overrides a stale copy in the database.
 		APIKey: p.ResolveAPIKey(os.Getenv),
 		Model:  modelName,
+		// The stored kind decides the protocol. It is passed through rather than
+		// defaulted here because llm.New is where "which protocol" is answered,
+		// and a second place that normalised it would be a second answer.
+		Kind: p.Kind,
 	}
 	// A config-declared provider keeps the protocol quirks the config file
 	// carries: the store has columns for identity and credentials, but none for
@@ -246,7 +313,60 @@ func (b *CatalogModelBuilder) buildStored(ctx context.Context, p store.Provider,
 // Catalog returns every selectable model with the provider summaries behind it.
 func (b *CatalogModelBuilder) Catalog(ctx context.Context) ModelCatalog {
 	cat := b.readCatalog(ctx)
+	cat = b.extraCatalog(ctx, cat)
 	b.markDefault(ctx, &cat)
+	return cat
+}
+
+// extraCatalog appends the extra provider's row and models to a built catalog.
+//
+// Appending rather than weaving it into storeCatalog keeps the two rules apart:
+// a store provider's presence is decided by its enabled flag and its stored
+// models, while the extra provider's is decided by whatever it is a view onto
+// (a settings file, today). Merging them would mean the extra source could
+// inherit a rule — staleness, fetching, the enabled column — that it has no way
+// to answer.
+func (b *CatalogModelBuilder) extraCatalog(ctx context.Context, cat ModelCatalog) ModelCatalog {
+	if b.extra == nil {
+		return cat
+	}
+	row, ok := b.extra.Row(ctx)
+	if !ok {
+		return cat
+	}
+	models := b.extra.Models(ctx)
+	if len(models) == 0 {
+		// Off, or on but unusable: either way it must not appear. A provider in
+		// the picker with no model behind it is a choice that fails on the first
+		// message.
+		return cat
+	}
+
+	name := providerDisplayName(row)
+	cat.Providers = append(cat.Providers, ProviderChoice{
+		ID:                row.ID,
+		Name:              name,
+		Source:            string(row.Source),
+		Enabled:           true,
+		HasAPIKey:         row.HasAPIKey,
+		ModelCount:        len(models),
+		EnabledModelCount: len(models),
+		ChatModelCount:    len(models),
+	})
+	for _, m := range models {
+		cat.Models = append(cat.Models, ModelChoice{
+			Provider:            row.ID,
+			ProviderName:        name,
+			Model:               m.ModelID,
+			DisplayName:         modelDisplayName(m),
+			Capabilities:        capabilityStrings(m.Capabilities),
+			CapabilitiesSource:  m.CapabilitiesSource,
+			ContextWindow:       m.ContextWindow,
+			ContextWindowSource: m.ContextWindowSource,
+			ChatCapable:         m.Has(store.CapChat),
+			HasAPIKey:           row.HasAPIKey,
+		})
+	}
 	return cat
 }
 
@@ -478,6 +598,12 @@ func (b *CatalogModelBuilder) registryCatalog() ModelCatalog {
 //
 // The rule, in order:
 //
+//  0. the extra provider, while it offers anything. This is the only rule that
+//     is not about a stored configuration: ClaudeCode compatibility mode is on,
+//     so a new conversation must start on the model that mode names — including
+//     when llm.default_provider names something else, because otherwise turning
+//     the mode on would leave every new conversation running natively and only
+//     the old ones switched.
 //  1. llm.default_provider, when that provider is still on offer and has a
 //     chat-capable model — preferring the model the config names for it. This
 //     keeps an existing deployment behaving as it did.
@@ -491,6 +617,15 @@ func (b *CatalogModelBuilder) registryCatalog() ModelCatalog {
 func (b *CatalogModelBuilder) markDefault(ctx context.Context, cat *ModelCatalog) {
 	if len(cat.Models) == 0 {
 		return
+	}
+
+	if b.extra != nil {
+		if _, ok := b.extra.Row(ctx); ok {
+			if idx := indexOfChatModel(cat.Models, b.extra.ID(), ""); idx >= 0 {
+				cat.Models[idx].Default = true
+				return
+			}
+		}
 	}
 
 	if want := b.configDefaultProvider(); want != "" {

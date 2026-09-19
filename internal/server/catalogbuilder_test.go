@@ -327,14 +327,14 @@ func TestCatalogModelBuilder_RefusesUnsupportedKind(t *testing.T) {
 	mock := newMockProvider(t, "m")
 	st := catalogStore(t, nil, nil)
 	if err := st.UpsertProvider(context.Background(), store.Provider{
-		ID: "anthropic", Name: "anthropic", BaseURL: mock.srv.URL, Kind: "anthropic-messages",
+		ID: "gemini", Name: "gemini", BaseURL: mock.srv.URL, Kind: "gemini-generate-content",
 		Source: store.SourceUser, Enabled: true,
 	}); err != nil {
 		t.Fatalf("upsert provider: %v", err)
 	}
 	b := NewCatalogModelBuilder(st, nil, ModelBuilderOptions{Logger: zap.NewNop()})
 
-	_, err := b.Build(context.Background(), "anthropic", "m")
+	_, err := b.Build(context.Background(), "gemini", "m")
 	if err == nil {
 		t.Fatal("want an error for an unsupported provider kind")
 	}
@@ -343,6 +343,30 @@ func TestCatalogModelBuilder_RefusesUnsupportedKind(t *testing.T) {
 	}
 	if len(mock.paths()) != 0 {
 		t.Errorf("an unsupported provider must not be called: %v", mock.paths())
+	}
+}
+
+// TestCatalogModelBuilder_AnthropicKindIsCallable pins the other half: the
+// Anthropic Messages protocol is a kind this build *can* call, so a provider
+// declaring it is built rather than refused. It is what ClaudeCode compatibility
+// mode runs on, and a regression here would leave that mode switching to a
+// provider that cannot be constructed.
+func TestCatalogModelBuilder_AnthropicKindIsCallable(t *testing.T) {
+	st := catalogStore(t, nil, nil)
+	if err := st.UpsertProvider(context.Background(), store.Provider{
+		ID: "anthropic", Name: "anthropic", BaseURL: "https://api.example.com/anthropic",
+		Kind: providerKindAnthropicMessages, Source: store.SourceUser, Enabled: true,
+	}); err != nil {
+		t.Fatalf("upsert provider: %v", err)
+	}
+	b := NewCatalogModelBuilder(st, nil, ModelBuilderOptions{Logger: zap.NewNop()})
+
+	built, err := b.Build(context.Background(), "anthropic", "claude-sonnet-4")
+	if err != nil {
+		t.Fatalf("build an anthropic-messages provider: %v", err)
+	}
+	if built == nil {
+		t.Fatal("build returned nothing")
 	}
 }
 

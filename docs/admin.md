@@ -156,6 +156,10 @@ Authenticated (session cookie):
 | `GET /api/jobs/{id}?from=&max_bytes=` | a window of one job's output, with the offset to continue from |
 | `POST /api/jobs/{id}/stop` | `{"signal":"term"|"kill"}` — stop it (409 when it already ended) |
 | `DELETE /api/jobs/{id}` | drop the record and delete its log (409 while it runs) |
+| `GET /api/claudecode` | ClaudeCode 兼容模式: the mode, the settings file it read, the model mapping (credential masked), the env table, the configured hooks, the hook run log |
+| `POST /api/claudecode/mode` | `{"compat": true\|false}` or `{"mode":"claudecode"\|"native"}` — switch it; answers the same status |
+| `POST /api/claudecode/reload` | re-read `~/.claude/settings.json` now |
+| `GET /api/claudecode/events?limit=50` | the hook run log on its own, for the panel's refresh button |
 
 Usage endpoints accept `since` and `until` (RFC3339) plus `user`, `provider` and
 `model` filters. A malformed timestamp returns 400, not 500.
@@ -745,6 +749,60 @@ The settings themselves (`openviking.*`) live in the config file and are
 reported read-only here, like the MCP servers declared under `mcp.servers`.
 Full configuration reference: `docs/openviking.md`.
 
+## ClaudeCode 兼容模式 (设置 → ClaudeCode)
+
+ClaudeCode compatibility mode makes this agent run on the configuration Claude
+Code already has: it reads `~/.claude/settings.json`, switches the model to the
+endpoint and models named there, and dispatches the hooks registered on five of
+Claude Code's events. The switch is the first thing on the panel; the sidebar
+shows the active mode directly under 新建对话, because a per-deployment switch
+that changes what every conversation runs on has to be visible from the
+conversation list rather than only from 设置.
+
+While the mode is on, **every conversation runs on the model the settings file
+names**, overriding the per-conversation choice made in 对话 — a mode that only
+affected conversations created after it was flipped would be a switch that half
+works. Turning it off restores the deployment's own model. The choice is stored
+in `app_settings` (`claudecode.mode`), so it survives a restart; `claudecode.enable`
+in the config file is only the state a fresh database starts in.
+
+The panel renders one payload (`GET /api/claudecode`, assembled by
+`internal/claudecode`):
+
+* **the model mapping**, read from the settings file's `env` block with Claude
+  Code's own precedence (`ANTHROPIC_MODEL`, then the Sonnet/Opus/Haiku tiers,
+  `ANTHROPIC_AUTH_TOKEN` as a bearer token or `ANTHROPIC_API_KEY` as `x-api-key`).
+  The credential is masked server-side — the plaintext never leaves the process,
+  not even in the env table;
+* **the env table**, with a `used` flag, because a variable Claude Code has and
+  this agent does not is a fact the operator will come looking for;
+* **the hook table**: every event the file configures, its matcher groups, and
+  each handler's type, target, timeout and `async` flag. Handlers this build
+  cannot run (`prompt`, `agent`, anything with `if`) are marked *before* they are
+  reached, so the table never shows a hook as working that cannot be;
+* **the run log**: one row per executed handler (event, matcher, the value the
+  matcher was tested against, command, exit code, duration, whether it blocked,
+  and the reason or error).
+
+The provider the mode contributes is called `claudecode` and is **not stored**:
+the settings file is the source of truth, and a database copy would be a second,
+staler answer. It appears in the model catalog — and as the default a new
+conversation starts on — while the mode is on, and disappears when it is off.
+
+Hooks are dispatched at the places this agent actually has: `SessionStart` when a
+conversation is created, resumed or cleared; `UserPromptSubmit` before a message
+is persisted (it can refuse it); `PreToolUse` / `PostToolUse` around every tool
+call (they can refuse one, rewrite its arguments, or rewrite its result); `Stop`
+when a turn is about to answer (it can send the model back to work). The other 28
+events are parsed and listed, and marked as having no trigger point here.
+Full detail — payload shape, exit-code semantics, the tool-name translation that
+makes a `"matcher": "Bash"` select this agent's `bash`, and the limits:
+`docs/claudecode.md`.
+
+Only `admin serve` gets the mode. `chat`, `run` and the Feishu bot are separate
+entry points with their own configuration, and a switch that lives in the console
+should not silently change what those do.
+
 ## Workspaces (the sidebar's folders)
 
 A workspace is a directory the agent may work in, and every conversation belongs
@@ -892,7 +950,7 @@ text reached it. So:
 ### Design notes for maintainers
 
 Full rationale is in `openspec/changes/phase-25-artifacts/` (proposal, spec,
-tasks). The four things worth knowing before changing this feature:
+tasks). The things worth knowing before changing this feature:
 
 - **The files are the truth, the row is an index.** `artifacts.path` is both the
   address and the identity: the serving route resolves exactly that string under
@@ -903,12 +961,34 @@ tasks). The four things worth knowing before changing this feature:
   that 404s. So a failed insert deletes the file it just wrote. Deletion runs the
   other way round, for the same reason: the row first, because a row is not
   reversible.
-- **The model chooses a name, never a path.** The extension whitelist decides
-  what may be stored, and it is refused at write time rather than served as an
-  opaque download later.
+- **The model chooses a name, never a path.** The title supplies the file name's
+  stem (non-ASCII letters kept, so a Chinese title gives a Chinese file name),
+  the suggested `path` is a fallback, and only `path.Base` of it is ever read — so
+  a `path` of `../../x.html` still cannot move the file. The extension whitelist
+  decides what may be stored, and it is refused at write time rather than served
+  as an opaque download later.
+- **The layout is `<session>/<YYYY-MM-DD>/<name>.<ext>`, and the date is the
+  local day.** The day is the *saving process's* local day, not UTC, so it always
+  matches the day 产物中心 groups by; a UTC stamp would make the store and the
+  console disagree about which day an artifact belongs to for the first hours of
+  every local day (in UTC+8, anything saved before 08:00). Two artifacts wanting
+  the same name on one day both survive: the second is `<name>-2.<ext>`. A file
+  already on disk counts as taken even with no row pointing at it — overwriting is
+  the one thing this must not do.
 - **A served document is in an opaque origin.** The sandbox CSP is what makes
   "the agent can show me a page" different from "the agent can hand itself my
   session". If you relax it, say so here and in the change record.
+- **A template name that the script does not bind fails only at render time.**
+  `ArtifactsView.vue` used `shortId` from `format.js` without importing it, so
+  产物中心 drew its counts and then threw on the first row — an empty list next to
+  a number. It builds, type-checks and is invisible to SSR probes (the panel
+  fetches in `onMounted`, and SSR does not run it). `web/scripts/check-component-bindings.mjs`
+  is what catches this class of bug; run it (`npm run check:ui`) before blaming
+  the API for an empty table.
+- **`check:ui` does not build what the server serves.** Its vite step writes to
+  `web/ssr-probe/out/`, not to `internal/server/webui/dist/`. Rebuild the shipped
+  bundle with `cd web && npm run build` and rebuild the Go binary, or the running
+  server keeps serving the previous `index-*.js` no matter how green the suite is.
 
 ## Web UI
 

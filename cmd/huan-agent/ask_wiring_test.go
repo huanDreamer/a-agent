@@ -35,7 +35,7 @@ func webChatDeps(t *testing.T, cfg *config.Config) server.ChatDeps {
 	}
 	cfg.Tools.Workspace = t.TempDir()
 
-	deps, _, _ := buildChatDeps(cfg, nil, st, nil, zap.NewNop(), nil, nil)
+	deps, _, _ := buildChatDeps(cfg, nil, st, nil, zap.NewNop(), nil, nil, nil)
 	return deps
 }
 

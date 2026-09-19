@@ -272,10 +272,14 @@ samp {
 
 /* ------------------------------------------------------------- sidebar --- */
 
-/* Exactly three regions, in this order: 新建对话, the session list (which takes
-   every remaining pixel and scrolls), and the two pinned menu items. Nothing
-   sits above the button — no brand, no provider/model line, no theme control —
-   and nothing follows the menu — no account row, no 退出, no version string. */
+/* Four regions, in this order: 新建对话 with the run-mode badge under it, the
+   session list (which takes every remaining pixel and scrolls), the two pinned
+   menu items, and — only where the deployment enforces a password — the account.
+   Nothing sits above the button — no brand, no theme control — and nothing follows
+   the menu except that account. The one line under the button says which mode the
+   next message runs on: it is not a control over conversations like the rows below
+   it, but a fact about all of them (turning 兼容 on overrides the model each one
+   picked), and it is switched one click away in 设置 → ClaudeCode. */
 .side-panel {
   display: flex;
   flex-direction: column;
@@ -995,6 +999,26 @@ table.data tbody tr:last-child td {
 
 table.data tbody tr:hover {
   background: var(--muted);
+}
+
+/* A day header spanning the table: the row that turns a flat list into a
+   timeline. It is not a row of data, so it does not react to hover. */
+table.data tbody tr.artifact-day:hover {
+  background: transparent;
+}
+
+table.data td.artifact-day-cell {
+  padding: 6px 12px;
+  background: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.artifact-day-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted-strong);
+  letter-spacing: 0.02em;
+  margin-right: 8px;
 }
 
 table.data td.num,
@@ -4958,4 +4982,310 @@ table.data tbody tr.row-click:focus-visible {
   width: 72px;
   text-align: right;
   font-size: 12px;
+}
+
+/* --------------------------------------------------- 运行模式（侧栏） ---- */
+
+/* The badge under 新建对话: which mode the next message runs on, and which model
+   that mode resolves to. It is the second element of the sidebar and the only one
+   besides the list that is not a control over conversations, because turning
+   ClaudeCode 兼容 on overrides the model every conversation in that list picked —
+   a fact about the whole app, shown where the whole app is listed.
+
+   It is a button rather than a label: the mode is switched in 设置 → ClaudeCode,
+   and this is the shortest way there. The two lines are sized so the model name,
+   which is the part that changes, does not move the row above it. */
+.side-mode {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  min-width: 0;
+  margin-top: 6px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-foreground);
+  text-align: left;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.side-mode:hover {
+  background: var(--muted);
+  border-color: var(--border-strong);
+}
+
+.side-mode-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.side-mode-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.side-mode-model {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 兼容模式 is the state that is *not* the default, so it is the one that is
+   coloured. Text uses --accent-purple rather than --accent-purple-soft: the soft
+   variants are for borders and icons only (see the token block at the top). */
+.side-mode.compat {
+  border-color: var(--accent-purple-soft);
+  background: var(--accent-purple-fill);
+}
+
+.side-mode.compat:hover {
+  border-color: var(--accent-purple);
+}
+
+.side-mode.compat .side-mode-line {
+  color: var(--accent-purple);
+}
+
+.side-mode.compat .side-mode-model {
+  color: var(--accent-purple-soft);
+}
+
+/* The probe failed. Dashed rather than coloured: nothing is known about the mode,
+   and a badge that read as a state would be the one thing this must not do. */
+.side-mode.unknown {
+  border-style: dashed;
+  border-color: var(--warning-soft);
+}
+
+.side-mode.unknown .side-mode-line {
+  color: var(--warning-soft);
+}
+
+/* --------------------------------------------- ClaudeCode 兼容模式 ------- */
+
+/* 设置 → ClaudeCode. The panel renders one server payload (see the component's
+   header), so most of what is here is about reading long, machine-written values
+   on a narrow window: a path, a command, a base_url. */
+
+/* The switch: two segments, larger than .seg's default because it is the only
+   control on the screen and the one that decides which model runs. */
+.cc-mode {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.cc-mode .seg button {
+  padding: 9px 16px;
+  font-size: 13.5px;
+}
+
+.cc-mode .seg button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* A disabled segment must not light up on hover: it looks like the switch is
+   about to do something. */
+.cc-mode .seg button:disabled:hover {
+  color: var(--muted-foreground);
+  background: none;
+}
+
+.cc-state {
+  font-size: 13px;
+  min-width: 0;
+  flex: 1 1 260px;
+}
+
+/* The settings.json line: path, whether it was read, and when it was last read. */
+.cc-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+/* A value one can neither read around nor wrap is what pushes a card off a phone's
+   screen: overflow-wrap: anywhere also lets the browser shrink the column, which
+   break-word does not. */
+.cc-break {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* 运行记录's confirmation banner. Not .banner.notice: that one carries the warning
+   tone (it was written for a turn that stopped on its budget), and a successful
+   switch shown in warning colours reads as if something went wrong. */
+.cc-notice {
+  border-color: var(--success-soft);
+  background: var(--success-fill);
+  color: var(--foreground);
+}
+
+.cc-notice > .ico {
+  color: var(--success-soft);
+}
+
+/* Hooks, event by event. One block per event, one row per handler: the nesting is
+   the file's own (event → matcher group → handlers), so what is on screen can be
+   compared against settings.json line by line. */
+.cc-events {
+  margin-top: 4px;
+}
+
+.cc-event {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.cc-event:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.cc-event-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.cc-event-note {
+  font-size: 12.5px;
+  color: var(--muted-foreground);
+  margin-top: 3px;
+}
+
+/* A matcher group is indented with a rule rather than a box, so three levels of
+   nesting stay readable at 380px. */
+.cc-group {
+  margin-top: 9px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+}
+
+.cc-group-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.cc-handlers {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* One handler: type, target, and its args/timeout/async as tags. It wraps, because
+   a command with arguments is longer than any row. */
+.cc-handler {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--muted);
+  font-size: 12.5px;
+}
+
+/* A handler this agent will not run (a prompt / agent type): dashed, so the reason
+   it is listed at all is visible without reading the tag. */
+.cc-handler.dead {
+  border-style: dashed;
+}
+
+.cc-handler-cmd {
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 0;
+  margin-left: 6px;
+  overflow-wrap: anywhere;
+}
+
+/* Inside a handler row the container already spaces its children, so the command
+   does not need the extra nudge it gets in the log table's inline cell. */
+.cc-handlers .cc-handler-cmd {
+  margin-left: 0;
+}
+
+/* Configured in settings.json but not dispatched by this agent. Separated by a rule
+   so the compact list cannot be mistaken for the live one above it. */
+.cc-inert {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.cc-inert-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--muted-strong);
+}
+
+.cc-summaries {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.cc-log-reason {
+  overflow-wrap: anywhere;
+}
+
+/* The closing note: where the mode stops. A plain list, not a card of its own —
+   it is the last paragraph of the panel rather than one more thing to configure. */
+.cc-limits {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  color: var(--muted-strong);
+}
+
+.cc-limits li + li {
+  margin-top: 8px;
+}
+
+/* On a phone the switch's two segments take the full width, like every other
+   control that has to be hit with a thumb. */
+@media (max-width: 560px) {
+  .cc-mode .seg {
+    width: 100%;
+  }
+
+  .cc-mode .seg button {
+    flex: 1 1 50%;
+  }
 }

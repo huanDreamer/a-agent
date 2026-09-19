@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/huan/huan-agent/internal/claudecode"
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/jobs"
 	"github.com/huan/huan-agent/internal/mcp"
@@ -176,6 +177,13 @@ type buildOpts struct {
 	// The zero value covers a deployment with the feature off, which is why the
 	// endpoints are absent in most tests.
 	checkpoints CheckpointSettings
+	// claudeCode, when set, is the ClaudeCode compatibility mode the console
+	// switches. Nil covers a deployment that never configured it, which is the
+	// state most tests want.
+	claudeCode *claudecode.Service
+	// approvalMode is tools.approval.mode, which hooks read as Claude Code's
+	// permission_mode.
+	approvalMode string
 }
 
 // buildServerWith constructs a Server with optional chat wiring.
@@ -215,6 +223,8 @@ func buildServerWith(t *testing.T, opts buildOpts) (*Server, store.Store) {
 		Tracer:              opts.tracer,
 		Traces:              opts.traces,
 		Checkpoints:         opts.checkpoints,
+		ClaudeCode:          opts.claudeCode,
+		ApprovalMode:        opts.approvalMode,
 		Logger:              zap.NewNop(),
 	}, st, pricing.NewTable(map[string]pricing.Rate{
 		"deepseek/deepseek-chat": {PromptPer1K: 0.001, CompletionPer1K: 0.002},

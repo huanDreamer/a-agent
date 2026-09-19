@@ -1,6 +1,9 @@
 // Package llm provides a multi-provider LLM client built on eino's
-// BaseChatModel abstraction. All providers speak the OpenAI HTTP protocol,
-// so a single adapter handles DeepSeek / Qwen / GLM / OpenAI / Ollama.
+// BaseChatModel abstraction. Most providers speak the OpenAI HTTP protocol
+// (DeepSeek / Qwen / GLM / OpenAI / Ollama), so one adapter covers them; a
+// provider whose endpoint speaks the Anthropic Messages API instead — which is
+// what an ANTHROPIC_BASE_URL endpoint such as https://api.deepseek.com/anthropic
+// does — is handled by a second adapter (see anthropic.go).
 package llm
 
 import (
@@ -9,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -26,7 +30,39 @@ type Provider struct {
 	// that rejects unknown request fields would fail every streamed call, so it
 	// can be turned off per provider.
 	DisableUsageRequest bool
+	// Kind names the wire protocol this provider speaks. The empty string and
+	// "openai" mean the OpenAI chat-completions protocol; KindAnthropicMessages
+	// means the Anthropic Messages API.
+	Kind string
+	// AuthStyle says which header carries the credential on an Anthropic-shaped
+	// endpoint: AuthStyleBearer sends "Authorization: Bearer <key>" (what
+	// Claude Code does with ANTHROPIC_AUTH_TOKEN), AuthStyleAPIKey sends
+	// "x-api-key: <key>". Empty means AuthStyleAPIKey.
+	AuthStyle string
+	// MaxOutputTokens caps one reply on an Anthropic-shaped endpoint, where
+	// max_tokens is a required field. 0 means DefaultAnthropicMaxTokens.
+	MaxOutputTokens int
+	// AnthropicVersion overrides the anthropic-version header. Empty means
+	// DefaultAnthropicVersion.
+	AnthropicVersion string
 }
+
+// The wire protocols a Provider can speak, and the two ways an Anthropic-shaped
+// endpoint accepts a credential.
+const (
+	// KindOpenAI is the OpenAI chat-completions protocol, the default.
+	KindOpenAI = "openai"
+	// KindAnthropicMessages is the Anthropic Messages API.
+	KindAnthropicMessages = "anthropic-messages"
+	// AuthStyleBearer / AuthStyleAPIKey select the credential header.
+	AuthStyleBearer = "bearer"
+	AuthStyleAPIKey = "api-key"
+	// DefaultAnthropicVersion is the API version sent when a provider does
+	// not name one.
+	DefaultAnthropicVersion = "2023-06-01"
+	// DefaultAnthropicMaxTokens is max_tokens when a provider does not set one.
+	DefaultAnthropicMaxTokens = 8192
+)
 
 // LLMError wraps an upstream LLM call failure with provider context.
 type LLMError struct {
@@ -62,6 +98,18 @@ func New(p Provider, opts ...Option) (model.BaseChatModel, error) {
 	if p.Model == "" {
 		return nil, fmt.Errorf("llm: provider %q: model is required", p.Name)
 	}
+	// The wire protocol decides the adapter. Only an explicitly
+	// Anthropic-shaped provider takes the second one: a provider that names no
+	// kind — or one this build does not recognise — keeps the OpenAI path it
+	// had before the field existed, so the default behaviour of every deployed
+	// configuration is unchanged.
+	if normalizeKind(p.Kind) == KindAnthropicMessages {
+		// No reasoning alias here, unlike the OpenAI path below: that shim
+		// rewrites the `reasoning` field of an OpenAI-shaped stream, while the
+		// Messages API streams its thinking as `thinking` blocks this adapter
+		// already understands.
+		return withRetry(newAnthropicModel(p, nil), applyOptions(opts)), nil
+	}
 	cfg := openai.DefaultConfig(p.APIKey)
 	cfg.BaseURL = p.BaseURL
 	// Gateways that spell the reasoning field `reasoning` rather than
@@ -73,6 +121,19 @@ func New(p Provider, opts ...Option) (model.BaseChatModel, error) {
 		client:   openai.NewClientWithConfig(cfg),
 	}
 	return withRetry(base, applyOptions(opts)), nil
+}
+
+// normalizeKind reduces a configured kind to one of the two protocols this
+// package implements. It is a reduction rather than a switch that rejects: the
+// value comes from configuration and a database row, and a typo in it must not
+// be the difference between a working provider and a refused one — an unknown
+// kind behaves as the OpenAI protocol, which is what every stored row meant
+// before this field existed.
+func normalizeKind(kind string) string {
+	if strings.EqualFold(strings.TrimSpace(kind), KindAnthropicMessages) {
+		return KindAnthropicMessages
+	}
+	return KindOpenAI
 }
 
 // openAIModel is the eino adapter around go-openai.

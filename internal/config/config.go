@@ -42,6 +42,83 @@ type Config struct {
 	// OpenViking is the context database (long-term memory + documents) the
 	// agent mirrors into. Off unless configured; see ApplyOpenVikingMCP.
 	OpenViking OpenVikingConfig `mapstructure:"openviking" json:"openviking"`
+	// ClaudeCode is the Claude Code compatibility mode: the agent runs on the
+	// model configuration and the hooks of ~/.claude/settings.json instead of
+	// its own. See internal/claudecode.
+	ClaudeCode ClaudeCodeConfig `mapstructure:"claudecode" json:"claudecode"`
+}
+
+// ClaudeCodeConfig configures Claude Code compatibility mode.
+//
+// The mode exists so that a machine already configured for Claude Code — one
+// settings.json naming the endpoint, the token, the models and the hooks — can
+// run this agent without a second, diverging configuration. What the file says
+// is therefore the source of truth for the model and the hooks while the mode is
+// on; nothing here duplicates those values, and none of them is writable from
+// the console beyond the mode's own switch.
+type ClaudeCodeConfig struct {
+	// Enable is the mode's state at startup. The console's 设置 → ClaudeCode
+	// switch overrides it at runtime (the stored value lives in app_settings),
+	// which is why this field is only a default rather than the answer.
+	Enable bool `mapstructure:"enable" json:"enable"`
+	// SettingsPath is the settings file to read. Empty means
+	// DefaultClaudeSettingsPath() (~/.claude/settings.json).
+	SettingsPath string `mapstructure:"settings_path" json:"settings_path"`
+	// Hooks turns hook execution off while leaving the model switch alone.
+	//
+	// It is a separate switch because the two halves have different risks: the
+	// model half changes who is billed, the hook half runs whatever commands the
+	// file names on every tool call. An operator who wants the endpoint without
+	// the hooks should not have to keep the mode off.
+	Hooks *bool `mapstructure:"hooks" json:"hooks"`
+	// HookTimeoutSeconds caps one handler, whatever its own timeout says. 0
+	// means DefaultClaudeHookTimeoutSeconds.
+	//
+	// Claude Code's own default is 600s per handler, which is longer than a
+	// useful turn: this ceiling is what keeps a hung hook from holding a
+	// conversation for ten minutes.
+	HookTimeoutSeconds int `mapstructure:"hook_timeout_seconds" json:"hook_timeout_seconds"`
+	// ReloadSeconds is how often the settings file's mtime is checked. 0 means
+	// DefaultClaudeReloadSeconds. The file is always re-read on demand (the
+	// console's 重新读取 button and a change of the mode), so this only bounds how
+	// quickly an edit made in an editor is noticed by a running turn.
+	ReloadSeconds int `mapstructure:"reload_seconds" json:"reload_seconds"`
+}
+
+// Claude Code compatibility defaults. They are named here rather than inlined
+// because the console reports them and a test asserts the package agrees.
+const (
+	// DefaultClaudeHookTimeoutSeconds matches Claude Code's own per-handler
+	// default for command/http/mcp_tool handlers (600s) — deliberately NOT
+	// lowered, because a hook that legitimately takes a minute (a formatter, a
+	// test run) must not be cut off by a default nobody chose. The console shows
+	// the number so it is visible rather than surprising.
+	DefaultClaudeHookTimeoutSeconds = 600
+	// DefaultClaudeReloadSeconds is how often the settings file is re-checked.
+	DefaultClaudeReloadSeconds = 15
+)
+
+// HooksOr reports whether hook execution is on.
+func (c ClaudeCodeConfig) HooksOr() bool {
+	return c.Hooks == nil || *c.Hooks
+}
+
+// HookTimeout returns the ceiling applied to one handler.
+func (c ClaudeCodeConfig) HookTimeout() time.Duration {
+	secs := c.HookTimeoutSeconds
+	if secs <= 0 {
+		secs = DefaultClaudeHookTimeoutSeconds
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// Reload returns how often the settings file is re-checked.
+func (c ClaudeCodeConfig) Reload() time.Duration {
+	secs := c.ReloadSeconds
+	if secs <= 0 {
+		secs = DefaultClaudeReloadSeconds
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // RunConfig configures the one-shot `huan-agent run` command: the entry point a
@@ -1540,8 +1617,23 @@ func Default() *Config {
 			},
 			MCP: OpenVikingMCPConfig{Register: true, Name: DefaultOpenVikingMCPName},
 		},
+		ClaudeCode: ClaudeCodeConfig{
+			// Off, and pointed at the file Claude Code itself reads: turning the
+			// mode on must not need a path typed in, and a machine without that
+			// file must behave exactly as it did before this section existed.
+			Enable:             false,
+			SettingsPath:       "",
+			Hooks:              boolPtr(true),
+			HookTimeoutSeconds: DefaultClaudeHookTimeoutSeconds,
+			ReloadSeconds:      DefaultClaudeReloadSeconds,
+		},
 	}
 }
+
+// boolPtr is the one-line helper the pointer-typed defaults above need: a
+// *bool default cannot be written as a literal, and "unset" must stay distinct
+// from "explicitly false" so that `hooks: false` in a config file is honoured.
+func boolPtr(v bool) *bool { return &v }
 
 // Load reads configuration from the given path. If path is empty, it tries
 // the well-known locations. Environment variables with prefix HUAN_ override
@@ -1788,6 +1880,15 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("feishu.download_dir", "")
 	v.SetDefault("feishu.max_download_mb", DefaultFeishuMaxDownloadMB)
 	v.SetDefault("feishu.enable_tools", true)
+	// Claude Code compatibility mode. Off, with the hooks on and pointed at the
+	// file Claude Code itself reads: turning the mode on in 设置 must not also
+	// require deciding whether the hooks run, and a mode whose hooks are silently
+	// off would be a switch that does half of what it says.
+	v.SetDefault("claudecode.enable", false)
+	v.SetDefault("claudecode.settings_path", "")
+	v.SetDefault("claudecode.hooks", true)
+	v.SetDefault("claudecode.hook_timeout_seconds", DefaultClaudeHookTimeoutSeconds)
+	v.SetDefault("claudecode.reload_seconds", DefaultClaudeReloadSeconds)
 	// OpenViking (context database). enable stays false: a machine without the
 	// server running must behave exactly as it did before this section existed.
 	v.SetDefault("openviking.enable", false)

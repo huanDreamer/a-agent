@@ -732,3 +732,31 @@ openviking:
   mcp:
     register: true            # register <base_url>/mcp as an MCP server
     name: "openviking"        # an entry with this name declared under mcp.servers wins
+
+# ClaudeCode compatibility mode.
+#
+# Reads Claude Code's own settings file and runs this agent on it: the model
+# mapping (`env`: endpoint, credential, models) and the hooks registered on five
+# of Claude Code's events. The switch itself is in 设置 → ClaudeCode, which
+# stores its choice in the database; `enable` below is only the state a fresh
+# database starts in.
+#
+# While the mode is on, EVERY conversation runs on the model the settings file
+# names — overriding the per-conversation choice in 对话 — and the hooks fire at
+# SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop. Full detail,
+# including the tool-name translation and what is deliberately not wired:
+# docs/claudecode.md
+#
+#   HUAN_CLAUDECODE_ENABLE=true
+#   HUAN_CLAUDECODE_SETTINGS_PATH=~/.claude/settings.json
+claudecode:
+  enable: false              # startup state; the console's switch overrides it at runtime
+  settings_path: ""          # empty = ~/.claude/settings.json
+  hooks: true                # false = switch the model only, run no hook. Separate from the
+                             # mode because the two halves carry different risks: the model
+                             # half changes who is billed, the hook half runs whatever
+                             # commands the file names on every tool call.
+  hook_timeout_seconds: 600  # ceiling on one handler, whatever its own `timeout` says
+                             # (600 = Claude Code's own default)
+  reload_seconds: 15         # how often the file's mtime is checked; always re-read on
+                             # demand (the console's 重新读取 and a change of the mode)

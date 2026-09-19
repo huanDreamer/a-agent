@@ -1,6 +1,6 @@
 // Tiny reactive store — the app has no router and no state library on purpose.
 //
-// It owns five things:
+// It owns six things:
 //   1. navigation: which top-level surface is showing ('chat' | 'settings' |
 //      'monitor') and which sub-tab of 统计监控 or 设置 is open;
 //   2. the time-range selector, from which every usage query derives its
@@ -9,7 +9,11 @@
 //      queries without the view knowing about the toolbar;
 //   4. the cached GET /api/meta payload shown by 设置 → 服务与工具;
 //   5. the session: whether this deployment asks for a password at all
-//      (`auth.required`) and whether we hold one (`auth.signedIn`).
+//      (`auth.required`) and whether we hold one (`auth.signedIn`);
+//   6. the ClaudeCode 兼容模式 status (GET /api/claudecode), because the sidebar
+//      badge shows it *next to every conversation* while 设置 → ClaudeCode switches
+//      it — one answer for the whole console, read once at boot (see `claudeCode`
+//      below).
 //
 // The login-free default (admin.require_login: false) is the common case and
 // none of §5 gates it: the probe answers "no password needed" and the console
@@ -49,13 +53,17 @@ export const MONITOR_TABS = [
 ]
 
 /**
- * The seven sub-tabs of 设置, all inside one page — the same shape as 统计监控.
+ * The eight sub-tabs of 设置, all inside one page — the same shape as 统计监控.
  *
  * They are grouped by what they configure rather than by which API they call:
  * 外观 is this browser, 模型 is the LLM catalog, MCP and 技能 are the agent's
  * capabilities, OpenViking is the context database the agent remembers through,
  * and 服务与工具 is everything the operator can only read (the server's own facts
  * and the tool set they produce).
+ *
+ * ClaudeCode 兼容模式 sits with 对话预算 rather than with 模型: both decide how a
+ * turn *runs*, and the mode overrides the model a conversation picked — which is
+ * why it is a switch next to the catalog instead of a provider inside it.
  *
  * 后台进程 is deliberately not a sub-tab: those processes belong to the
  * conversation that started them, so the count rides on that conversation's
@@ -67,6 +75,7 @@ export const SETTINGS_TABS = [
   { key: 'appearance', label: '外观' },
   { key: 'models', label: '模型' },
   { key: 'budget', label: '对话预算' },
+  { key: 'claudecode', label: 'ClaudeCode' },
   { key: 'mcp', label: 'MCP' },
   { key: 'openviking', label: 'OpenViking' },
   { key: 'skills', label: '技能' },
@@ -248,6 +257,94 @@ export const needsLogin = computed(
 )
 
 /**
+ * ClaudeCode 兼容模式 — one reactive answer for the whole console.
+ *
+ * Two surfaces show the mode and they are never on screen in a state where one
+ * could ask the server and the other could not: the sidebar badge (which mode the
+ * next message runs on, on every screen) and 设置 → ClaudeCode. So the answer lives
+ * here rather than inside either of them.
+ *
+ *   snapshot  the server's own status payload, verbatim — the badge and the panel
+ *             read the same fields, so they cannot render two different modes;
+ *   status    'loading' | 'error' | 'ready', for AsyncBlock in the panel;
+ *   error     why the last read failed (the badge says so instead of guessing);
+ *   busy      a mutation is in flight — the switch and 重新读取 settings.json both
+ *             disable on it, whichever one was used.
+ *
+ * `snapshot === null` means the probe has not answered. The badge renders nothing
+ * in that state on purpose: "本机模式" is a claim about every conversation in the
+ * list, and it would be wrong exactly when the mode was switched from another tab.
+ *
+ * Mutations (`setClaudeCodeMode` / `reloadClaudeCodeSettings`) throw on failure and
+ * adopt the server's answer on success, the way `saveBudget` does: the panel shows
+ * the server's own words, and the badge is updated from the same object rather than
+ * from what the button asked for.
+ */
+export const claudeCode = reactive({
+  snapshot: null,
+  status: 'loading', // loading | error | ready
+  error: '',
+  busy: false,
+})
+
+/** Read the mode's status. `quiet` keeps whatever is on screen while it reloads. */
+export async function loadClaudeCode({ quiet = false } = {}) {
+  if (!quiet && !claudeCode.snapshot) claudeCode.status = 'loading'
+  try {
+    claudeCode.snapshot = await api.claudeCodeStatus()
+    claudeCode.error = ''
+    claudeCode.status = 'ready'
+  } catch (err) {
+    if (err && err.status === 401) return
+    claudeCode.error = err && err.message ? err.message : '无法读取 ClaudeCode 模式状态'
+    // A failed *refresh* leaves the last known mode on screen (it is what the
+    // messages run on until the server says otherwise); only a failed first read
+    // leaves the panel with nothing to render.
+    if (!claudeCode.snapshot) claudeCode.status = 'error'
+  }
+  return claudeCode.snapshot
+}
+
+/**
+ * Turn the mode on or off. `compat` is the target state, not a toggle: the server
+ * takes it that way, so a double click cannot land on the opposite mode.
+ *
+ * The switch takes effect on the next message — nothing here restarts anything,
+ * and every conversation switches together, including the ones the reader is not
+ * looking at.
+ */
+export async function setClaudeCodeMode(compat) {
+  claudeCode.busy = true
+  try {
+    claudeCode.snapshot = await api.setClaudeCodeMode(compat)
+    claudeCode.error = ''
+    claudeCode.status = 'ready'
+    return claudeCode.snapshot
+  } finally {
+    claudeCode.busy = false
+  }
+}
+
+/**
+ * Re-read ~/.claude/settings.json.
+ *
+ * The server also re-reads it by itself whenever the file's mtime moves, so this
+ * is not the only path — it is the one that answers "I just edited it, show me
+ * what it says now" without waiting for the next turn.
+ */
+export async function reloadClaudeCodeSettings() {
+  claudeCode.busy = true
+  try {
+    claudeCode.snapshot = await api.reloadClaudeCode()
+    claudeCode.error = ''
+    claudeCode.status = 'ready'
+    return claudeCode.snapshot
+  } finally {
+    claudeCode.busy = false
+  }
+}
+
+/**
  * Boot the shell. `GET /api/me` is the app's bootstrap probe: it says whether
  * this deployment wants a password (login_required) and whether we hold a
  * session, so the console knows which screen to draw before it draws anything.
@@ -272,7 +369,10 @@ export async function bootstrap() {
   // Nothing to read without a session, and asking anyway would answer 401 and
   // mark a first visit as an expired one.
   if (needsLogin.value) return
-  await loadMeta()
+  // The mode is read here rather than when 设置 → ClaudeCode happens to be opened:
+  // its badge sits in the sidebar next to every conversation, so it belongs to the
+  // shell, not to one panel. Both reads are independent, so they go together.
+  await Promise.all([loadMeta(), loadClaudeCode()])
 }
 
 /**

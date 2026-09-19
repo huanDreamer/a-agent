@@ -132,7 +132,11 @@ type Config struct {
 	// travels to the tools so a subagent can size its own window from the same
 	// model, and is empty for a caller that only has a model instance.
 	ModelName string
-	Logger    *zap.Logger
+	// Hooks, when set, is asked before and after every tool call and when the
+	// turn is about to answer. Nil is the normal state — see Hooks — and costs
+	// nothing.
+	Hooks  Hooks
+	Logger *zap.Logger
 }
 
 // Runner drives a streaming tool-calling conversation.
@@ -150,6 +154,7 @@ type Runner struct {
 	guard       GuardConfig
 	toolResult  int
 	modelName   string
+	hooks       Hooks
 	logger      *zap.Logger
 }
 
@@ -195,6 +200,7 @@ func New(cfg Config) (*Runner, error) {
 		guard:       cfg.Guard,
 		toolResult:  resolvedToolResultCap(cfg.ToolResultMaxChars),
 		modelName:   cfg.ModelName,
+		hooks:       cfg.Hooks,
 		logger:      logger,
 	}, nil
 }
@@ -374,6 +380,10 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 	// accumulate inside it, and a runner is reused across turns and sessions.
 	progress := newTurnProgress(r.guard)
 	ledger := newTurnLedger(goalText(req.Messages))
+	// Whether a Stop hook already refused once in this turn. It is per turn
+	// rather than per runner for the same reason the guard is, and it is what a
+	// hook checks to avoid holding a turn until its step budget runs out.
+	stopBlocked := false
 
 	history := append([]*schema.Message(nil), req.Messages...)
 	// The head is computed once, from the window the caller sent: those are the
@@ -467,6 +477,56 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		}
 
 		if len(msg.ToolCalls) == 0 {
+			// The turn is about to answer, which is the moment a Stop hook is
+			// asked. A hook that refuses means the work is not finished: its
+			// reason goes back to the model as a system message and the loop
+			// continues, exactly as Claude Code continues a conversation a Stop
+			// hook blocked. The step budget is still the outer bound, and
+			// AlreadyBlocked is how a hook can see that it already had its say.
+			if r.hooks != nil {
+				decision := r.hooks.Stop(ctx, HookStop{
+					SessionID:            req.SessionID,
+					LastAssistantMessage: msg.Content,
+					Step:                 step,
+					AlreadyBlocked:       stopBlocked,
+				})
+				if decision.Block && step < budget.maxSteps {
+					stopBlocked = true
+					reason := strings.TrimSpace(decision.Reason)
+					if reason == "" {
+						reason = "Stop hook 认为这一轮还没结束，请继续（hook 未给出原因）"
+					}
+					// The model's own answer stays in the history: it is what it
+					// said, and removing it would leave the hook's reason
+					// answering nothing.
+					history = append(history,
+						&schema.Message{Role: schema.System, Content: reason})
+					for _, extra := range decision.Context {
+						if strings.TrimSpace(extra) != "" {
+							history = append(history,
+								&schema.Message{Role: schema.System, Content: extra})
+						}
+					}
+					res.Plan = append(res.Plan, Step{
+						Index:     step,
+						Reasoning: msg.ReasoningContent,
+						Text:      msg.Content,
+					})
+					emit(Event{
+						Type: EventSteer, Step: step, SteerKind: "hook_stop",
+						Text: reason,
+					})
+					continue
+				}
+				// The turn really is over: whatever the hook wanted the model to
+				// know about the answer is appended for the *next* turn, because
+				// there is no next model call in this one to read it.
+				if len(decision.Context) > 0 {
+					r.logger.Debug("chat: Stop hook returned context with no continuation to read it",
+						zap.Int("messages", len(decision.Context)))
+				}
+			}
+
 			res.Text = msg.Content
 			// The last step is the one that answered: its text is the answer, and
 			// it is the only step whose text is.
@@ -488,7 +548,7 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		// matter what order they finished in. That is not tidiness: the messages
 		// that go back to the model are matched to its tool calls by position, and
 		// a plan step lists its calls in the order that explains it.
-		runs := r.runToolCalls(ctx, reg, msg.ToolCalls, req, step, traceID, emit)
+		runs, hookContext := r.runToolCalls(ctx, reg, msg.ToolCalls, req, step, traceID, emit)
 		var calls []ToolRun
 		for i, run := range runs {
 			res.Tools = append(res.Tools, run)
@@ -499,6 +559,15 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 				ToolCallID: msg.ToolCalls[i].ID,
 				ToolName:   msg.ToolCalls[i].Function.Name,
 			})
+		}
+		// What the tool hooks wanted the model to know about these calls, after
+		// the results they describe: a hook that says "this file is generated,
+		// do not edit it" is read in the light of the file it just read.
+		for _, extra := range hookContext {
+			if strings.TrimSpace(extra) == "" {
+				continue
+			}
+			history = append(history, &schema.Message{Role: schema.System, Content: extra})
 		}
 
 		ledger.observe(runs)
@@ -811,12 +880,20 @@ func (r *Runner) streamOnce(ctx context.Context, mdl model.BaseChatModel, histor
 //
 // The returned slice is always in the model's order, whatever order the calls
 // actually completed in.
+// runToolCalls runs the calls of one step and returns, alongside each result,
+// the extra context the tool hooks asked for.
+//
+// The context is returned rather than appended to a shared field because the
+// calls may run in parallel: a slice on the runner would need a mutex and would
+// interleave two calls' context in whatever order they finished, while the
+// caller below appends them in the model's own call order.
 func (r *Runner) runToolCalls(ctx context.Context, reg *tool.Registry, calls []schema.ToolCall,
-	req Request, step int, traceID string, emit Emitter) []ToolRun {
+	req Request, step int, traceID string, emit Emitter) ([]ToolRun, []string) {
 
 	runs := make([]ToolRun, len(calls))
+	contexts := make([][]string, len(calls))
 	if len(calls) == 0 {
-		return runs
+		return runs, nil
 	}
 
 	modes := make([]tool.Concurrency, len(calls))
@@ -840,7 +917,7 @@ func (r *Runner) runToolCalls(ctx context.Context, reg *tool.Registry, calls []s
 	for _, group := range tool.Segment(modes) {
 		if len(group) == 1 || limit == 1 {
 			for _, i := range group {
-				runs[i] = r.runTool(ctx, reg, calls[i], req, step, traceID, emit)
+				runs[i], contexts[i] = r.runTool(ctx, reg, calls[i], req, step, traceID, emit)
 			}
 			continue
 		}
@@ -878,16 +955,29 @@ func (r *Runner) runToolCalls(ctx context.Context, reg *tool.Registry, calls []s
 						})
 					}
 				}()
-				runs[i] = r.runTool(ctx, reg, calls[i], req, step, traceID, emit)
+				runs[i], contexts[i] = r.runTool(ctx, reg, calls[i], req, step, traceID, emit)
 			}(i)
 		}
 		wg.Wait()
 	}
-	return runs
+
+	var extra []string
+	for _, c := range contexts {
+		extra = append(extra, c...)
+	}
+	return runs, extra
 }
 
+// runTool runs one call, with the tool hooks around it.
+//
+// The hooks are asked in the order Claude Code asks them and with the same
+// consequences: a PreToolUse block skips the call and its reason is what the
+// model reads instead of a result, an updated input replaces the model's
+// arguments before the tool sees them, and a PostToolUse hook can rewrite what
+// the model is told the tool returned. Every hook failure is the dispatcher's
+// problem rather than the turn's — see Hooks — so nothing here can fail a call.
 func (r *Runner) runTool(ctx context.Context, reg *tool.Registry, tc schema.ToolCall, req Request,
-	step int, traceID string, emit Emitter) ToolRun {
+	step int, traceID string, emit Emitter) (ToolRun, []string) {
 
 	run := ToolRun{
 		ID:   tc.ID,
@@ -926,6 +1016,41 @@ func (r *Runner) runTool(ctx context.Context, reg *tool.Registry, tc schema.Tool
 		},
 	})
 
+	// The hook sees the arguments the model wrote, before any rewriting — a
+	// PreToolUse hook that rewrote an input it could not read would be deciding
+	// on the wrong text.
+	var hookContext []string
+	if r.hooks != nil {
+		call := HookCall{
+			SessionID: req.SessionID,
+			ToolUseID: run.ID,
+			ToolName:  run.Name,
+			Args:      run.Args,
+		}
+		decision := r.hooks.PreToolUse(ctx, call)
+		hookContext = append(hookContext, decision.Context...)
+		if decision.Block {
+			// The refusal is the call's result, exactly as a permission refusal
+			// is: the model has to learn why it may not do this, and "the tool
+			// ran and returned nothing" would teach it the opposite.
+			run.Err = hookBlockMessage(decision.BlockReason)
+			run.DurationMs = 0
+			emit(Event{
+				Type: EventToolResult, Step: step,
+				ToolCallID: run.ID, ToolName: run.Name,
+				ToolError: run.Err,
+			})
+			nestedMu.Lock()
+			run.Nested = nestedLog
+			nestedMu.Unlock()
+			return run, hookContext
+		}
+		if decision.UpdatedArgs != "" {
+			run.Args = decision.UpdatedArgs
+			tc.Function.Arguments = decision.UpdatedArgs
+		}
+	}
+
 	spanID := r.tracer.StartSpan(ctx, SpanInfo{
 		TraceID: traceID,
 		Name:    "tool." + run.Name,
@@ -954,6 +1079,25 @@ func (r *Runner) runTool(ctx context.Context, reg *tool.Registry, tc schema.Tool
 	// UI's 耗时 column and the audit log would then faithfully record.
 	run.DurationMs = nowFunc().Sub(started).Milliseconds()
 
+	// PostToolUse sees what the tool actually produced, failure included, which
+	// is why it is asked even when the call failed: a hook that logs every Bash
+	// call must not skip the ones that errored.
+	if r.hooks != nil {
+		decision := r.hooks.PostToolUse(ctx, HookCall{
+			SessionID:  req.SessionID,
+			ToolUseID:  run.ID,
+			ToolName:   run.Name,
+			Args:       run.Args,
+			Result:     run.Result,
+			Error:      run.Err,
+			DurationMs: run.DurationMs,
+		})
+		hookContext = append(hookContext, decision.Context...)
+		if decision.HasUpdatedResult {
+			run.Result = decision.UpdatedResult
+		}
+	}
+
 	r.tracer.EndSpan(ctx, spanID, toolSpanOutput(run), run.Err)
 	emit(Event{
 		Type: EventToolResult, Step: step,
@@ -964,7 +1108,19 @@ func (r *Runner) runTool(ctx context.Context, reg *tool.Registry, tc schema.Tool
 	nestedMu.Lock()
 	run.Nested = nestedLog
 	nestedMu.Unlock()
-	return run
+	return run, hookContext
+}
+
+// hookBlockMessage is what the model reads when a PreToolUse hook refused a
+// call. It says who refused, because "the tool failed" and "a hook stopped you"
+// call for different next moves from the model — the second one is often
+// something to ask the user about rather than to work around.
+func hookBlockMessage(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return "工具调用被 PreToolUse hook 阻止（hook 未给出原因）"
+	}
+	return "工具调用被 PreToolUse hook 阻止：" + reason
 }
 
 // appendNestedCall folds one nested event into the call's own record.

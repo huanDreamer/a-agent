@@ -14,6 +14,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/route"
 
+	"github.com/huan/huan-agent/internal/claudecode"
 	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/store"
 )
@@ -108,6 +109,20 @@ func (s *Server) handleUpsertProvider(ctx context.Context, c *app.RequestContext
 	id := strings.TrimSpace(body.ID)
 	if id == "" {
 		c.JSON(http.StatusBadRequest, map[string]string{"error": "id is required"})
+		return
+	}
+
+	// The id ClaudeCode compatibility mode contributes is reserved. That
+	// provider is a view onto ~/.claude/settings.json rather than a row, so a
+	// save here would create a stored provider with the same id and no key: it
+	// would look like a real, broken endpoint in 模型管理 while the mode is off,
+	// and be shadowed by the mode while it is on. Refusing it is the only answer
+	// that keeps one source of truth.
+	if s.claudeCode != nil && id == claudecode.ProviderID {
+		c.JSON(http.StatusConflict, map[string]string{
+			"error": "id " + claudecode.ProviderID + " 由 ClaudeCode 兼容模式提供，" +
+				"内容来自 ~/.claude/settings.json，不能在模型管理里编辑",
+		})
 		return
 	}
 

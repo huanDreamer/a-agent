@@ -34,7 +34,21 @@ func (s *Server) runnerFor(ctx context.Context, sess store.ChatSession) (*chat.R
 		return r, nil
 	}
 
-	built, err := s.chat.Builder.Build(ctx, sess.Provider, sess.Model)
+	// ClaudeCode 兼容模式 overrides the conversation's own choice: the mode is a
+	// property of the deployment, not of a conversation, and a switch that only
+	// affected conversations created after it was flipped would be a switch that
+	// half works. The runner is still cached per (provider, model), so every
+	// conversation on the mode shares one runner.
+	provider, modelName := sess.Provider, sess.Model
+	if p, m, ok := s.claudeCodeTarget(); ok {
+		provider, modelName = p, m
+		key = provider + "\x00" + modelName
+		if r, ok := s.runnerCache.get(key); ok {
+			return r, nil
+		}
+	}
+
+	built, err := s.chat.Builder.Build(ctx, provider, modelName)
 	if err != nil {
 		return nil, err
 	}
@@ -48,12 +62,12 @@ func (s *Server) runnerFor(ctx context.Context, sess store.ChatSession) (*chat.R
 	// from the 128k (or 1M) window the session actually runs on.
 	condenser := s.chat.Condenser
 	if s.chat.CondenserFor != nil {
-		c, cerr := s.chat.CondenserFor(cm, sess.Provider, sess.Model)
+		c, cerr := s.chat.CondenserFor(cm, provider, modelName)
 		if cerr != nil {
 			// Not fatal: the turn runs with the deployment's condenser, or with
 			// none at all, which is still a working turn.
 			s.logger.Warn("chat: resolving the model's context window failed; using the deployment default",
-				zapString("provider", sess.Provider), zapString("model", sess.Model), zapError(cerr))
+				zapString("provider", provider), zapString("model", modelName), zapError(cerr))
 		} else {
 			condenser = c
 		}
@@ -89,13 +103,31 @@ func (s *Server) runnerFor(ctx context.Context, sess store.ChatSession) (*chat.R
 		// deployment rather than of the model, so they come from the wiring.
 		Guard:              s.chat.Guard,
 		ToolResultMaxChars: s.chat.ToolResultMaxChars,
-		Logger:             s.logger,
+		// The hook dispatcher for this conversation, when ClaudeCode
+		// compatibility mode is on and has hooks. Nil is the ordinary state and
+		// costs the loop nothing.
+		Hooks:  s.chatHooksFor(ctx, sess),
+		Logger: s.logger,
 	})
 	if err != nil {
 		return nil, err
 	}
 	s.runnerCache.put(key, r)
 	return r, nil
+}
+
+// claudeCodeTarget reports the (provider, model) ClaudeCode compatibility mode
+// forces every conversation onto, or false when the mode is off or unusable.
+//
+// An unusable mode is reported as "not on" rather than as an error: a
+// settings.json that cannot run must not make every conversation fail — the
+// conversations keep working natively, and 设置 → ClaudeCode says why the switch
+// has no effect.
+func (s *Server) claudeCodeTarget() (string, string, bool) {
+	if s.claudeCode == nil {
+		return "", "", false
+	}
+	return s.claudeCode.Target()
 }
 
 // runnerCache is a small synchronised map of built runners.
@@ -220,8 +252,14 @@ func (s *Server) buildHistoryWithContext(ctx context.Context, sess store.ChatSes
 //
 // It follows the same fallbacks the usage attribution uses, so the model a turn
 // is billed to and the model whose capabilities decide how an attachment is sent
-// cannot disagree.
+// cannot disagree. ClaudeCode compatibility mode is checked first for the same
+// reason it is checked in runnerFor: the mode is what the turn actually runs on,
+// so it is also what the turn must be billed to — a usage row naming a model
+// that was never called is worse than no row.
 func (s *Server) sessionModelTarget(sess store.ChatSession) (string, string) {
+	if p, m, ok := s.claudeCodeTarget(); ok {
+		return p, m
+	}
 	provider, model := sess.Provider, sess.Model
 	if provider == "" {
 		provider = s.cfg.Provider

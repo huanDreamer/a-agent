@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/huan/huan-agent/internal/artifact"
+	"github.com/huan/huan-agent/internal/claudecode"
 	"github.com/huan/huan-agent/internal/config"
 	"github.com/huan/huan-agent/internal/jobs"
 	"github.com/huan/huan-agent/internal/mcp"
@@ -117,8 +118,18 @@ type Config struct {
 	// Jobs supervises the background processes this process started. Nil is a
 	// supported state: /api/jobs then answers enabled:false rather than failing,
 	// which is what a deployment with background jobs turned off should see.
-	Jobs   *jobs.Manager
-	Logger *zap.Logger
+	Jobs *jobs.Manager
+	// ClaudeCode is the Claude Code compatibility mode: the switch, the settings
+	// file it reads and the hook engine it runs. Nil is a supported state — the
+	// feature is off — and every /api/claudecode route then reports
+	// `available:false` rather than 404ing, so the console can say why the
+	// switch is not there.
+	ClaudeCode *claudecode.Service
+	// ApprovalMode is tools.approval.mode, reported to hooks as Claude Code's
+	// permission_mode. It is a string rather than the enum because this server
+	// only ever translates it (see permissionMode).
+	ApprovalMode string
+	Logger       *zap.Logger
 }
 
 // Server is the admin HTTP service.
@@ -187,6 +198,10 @@ type Server struct {
 	// outliving a shut-down admin engine would be exactly the orphan this
 	// feature exists to prevent.
 	jobs *jobs.Manager
+
+	// claudeCode is the Claude Code compatibility mode. Nil is the feature off,
+	// which is what a deployment that never configured it has.
+	claudeCode *claudecode.Service
 
 	hertz  *server.Hertz
 	ln     net.Listener
@@ -263,6 +278,7 @@ func New(cfg Config, st store.Store, table *pricing.Table, adminCfg config.Admin
 		checkpointSettings: cfg.Checkpoints,
 		turns:              newTurnHub(),
 		startT:             time.Now(),
+		claudeCode:         cfg.ClaudeCode,
 	}
 
 	// The artifact store is built once for the process: it belongs to sessions
@@ -406,6 +422,7 @@ func (s *Server) registerRoutes(h *server.Hertz) {
 	s.registerMCPRoutes(authed)
 	s.registerOpenVikingRoutes(authed)
 	s.registerJobRoutes(authed)
+	s.registerClaudeCodeRoutes(authed)
 	// The artifact routes are registered before the UI: the file route is on the
 	// open group and asks for a session itself, because whether it needs one is
 	// artifacts.public_urls.

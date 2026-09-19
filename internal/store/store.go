@@ -142,6 +142,13 @@ type Store interface {
 	GetTurnBudgetOverride(ctx context.Context) (TurnBudgetOverride, error)
 	SetTurnBudgetOverride(ctx context.Context, o TurnBudgetOverride) error
 
+	// App settings (设置 → ClaudeCode): which mode the console switched the agent
+	// to. The bool says whether the switch was ever touched, so a fresh database
+	// keeps config.yaml authoritative instead of pinning whatever happened to be
+	// in effect the first time the console was opened.
+	GetClaudeCodeMode(ctx context.Context) (string, bool, error)
+	SetClaudeCodeMode(ctx context.Context, mode string) error
+
 	// Trace store (Phase 5c). An agent turn and its observation nodes, so the
 	// console can explain a turn without an external observability service.
 	RecordTrace(ctx context.Context, t TraceRow) error

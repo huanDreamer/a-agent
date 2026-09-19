@@ -634,4 +634,32 @@ export const api = {
 
   llmBindings: () => request('/api/llm/bindings'),
   saveLlmBinding: (body) => request('/api/llm/bindings', { method: 'PUT', body }),
+
+  // --- ClaudeCode 兼容模式 ------------------------------------------------
+  // The mode in which this agent runs on exactly the model configuration Claude
+  // Code uses: ~/.claude/settings.json is read (env vars, the five model names,
+  // the hooks) and every turn runs on the model resolved from it.
+  //
+  // The console only ever sees the *resolved* configuration, and one payload of it
+  // serves both surfaces that show the mode (the sidebar badge and 设置 →
+  // ClaudeCode), so the two cannot disagree. Every key is always present —
+  // `mode` / `compat` / `available` / `model` / `native` / `env` / `hooks` /
+  // `hook_log` — which is why the callers render it without a single optional
+  // check, and why turning the mode off is enough to be back on
+  // `native.provider` / `native.model` (on the next message, no restart).
+  //
+  // `model.token_masked` is all the UI ever receives of the token; the key itself
+  // is write-only, through settings.json, and nothing here expects a real one.
+  claudeCodeStatus: () => request('/api/claudecode'),
+  // The switch. `compat` is the *target* state rather than "toggle", so replaying
+  // the same request cannot flip the mode back by accident.
+  setClaudeCodeMode: (compat) =>
+    request('/api/claudecode/mode', { method: 'POST', body: { compat: Boolean(compat) } }),
+  // Re-read settings.json now. The server watches the file's mtime by itself, so
+  // this is the path for "I just edited it, read it again".
+  reloadClaudeCode: () => request('/api/claudecode/reload', { method: 'POST' }),
+  // What the hooks did in this process, one Record per executed handler. The same
+  // records ride along as `hook_log` on the status payload; this route is the
+  // panel's 刷新, i.e. the read that is not tied to reading the file again.
+  claudeCodeEvents: (limit = 50) => request('/api/claudecode/events', { query: { limit } }),
 }

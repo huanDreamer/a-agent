@@ -10,6 +10,7 @@ import (
 
 	"github.com/cloudwego/eino/schema"
 	"github.com/cloudwego/hertz/pkg/app"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/huan/huan-agent/internal/chat"
@@ -104,6 +105,19 @@ func (s *Server) handleResumeTurn(ctx context.Context, c *app.RequestContext) {
 	if err != nil {
 		s.fail(c, "build chat history", err)
 		return
+	}
+	// SessionStart, source "resume" — the value Claude Code reports when a
+	// session is continued with --resume/--continue, which is what 继续执行 is.
+	// What it injects is added to the context the brief already carries, so a
+	// hook that restates the working rules reaches the model on the turn that
+	// needs them most.
+	if s.claudeCode != nil {
+		s.sessionStartHooks(ctx, sess, "resume")
+		history = insertHookContext(history, s.claudeCode.SessionContext(sess.ID))
+		// A resumed turn is a new prompt as far as the protocol is concerned: it
+		// has no UserPromptSubmit of its own, so the id is minted here and travels
+		// with the tool and Stop events that follow.
+		s.claudeCode.SetPromptID(sess.ID, uuid.NewString())
 	}
 
 	s.logger.Info("chat: resuming an interrupted turn",

@@ -540,6 +540,18 @@ func (s *Server) handleCreateSession(ctx context.Context, c *app.RequestContext)
 	if workspaceName != "" {
 		saved.Workspace = workspaceName
 	}
+	// SessionStart, source "startup": this is the moment Claude Code fires it for
+	// a new session. It runs after the conversation exists, because a hook that
+	// renames it or injects context needs something to attach that to.
+	s.sessionStartHooks(ctx, saved, "startup")
+	// The hook may have renamed it, so what the console is told is the stored
+	// row rather than the one read a moment ago.
+	if after, err := s.store.GetChatSession(ctx, sess.ID); err == nil {
+		if workspaceName != "" {
+			after.Workspace = workspaceName
+		}
+		saved = after
+	}
 	c.JSON(http.StatusOK, map[string]any{"session": saved})
 }
 
@@ -576,6 +588,15 @@ func (s *Server) resolveModelChoice(ctx context.Context, provider, model string)
 	if s.chat.Builder == nil {
 		return provider, model
 	}
+
+	// ClaudeCode 兼容模式 wins over everything below, including an explicit
+	// choice: the mode is on, so a new conversation must start on the model it
+	// names. A stored per-conversation choice is not overwritten (the turn
+	// resolves the mode itself — see runnerFor), it is simply not what runs.
+	if p, m, ok := s.claudeCodeTarget(); ok {
+		return p, m
+	}
+
 	catalog := s.chat.Builder.Catalog(ctx).Models
 
 	// 1. An explicit provider wins. A missing model takes that provider's first.
@@ -780,7 +801,8 @@ func (s *Server) handleDeleteSession(ctx context.Context, c *app.RequestContext)
 // handleClearSession empties a session's history but keeps the session.
 func (s *Server) handleClearSession(ctx context.Context, c *app.RequestContext) {
 	id := c.Param("id")
-	if _, err := s.store.GetChatSession(ctx, id); err != nil {
+	sess, err := s.store.GetChatSession(ctx, id)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
@@ -799,6 +821,15 @@ func (s *Server) handleClearSession(ctx context.Context, c *app.RequestContext) 
 	if err := s.store.DeleteChatPlan(ctx, id); err != nil {
 		s.fail(c, "clear chat plan", err)
 		return
+	}
+	// What a SessionStart hook injected for this conversation goes with it: the
+	// conversation that asked for that context has just been emptied, and
+	// Claude Code fires SessionStart again with source "clear" for exactly this
+	// reason. Leaving the old context in place would hand the model a briefing
+	// about work whose messages were deleted.
+	if s.claudeCode != nil {
+		s.claudeCode.ForgetSession(id)
+		s.sessionStartHooks(ctx, sess, "clear")
 	}
 	c.JSON(http.StatusOK, map[string]any{"ok": true})
 }
@@ -867,15 +898,92 @@ func (s *Server) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 		persisted = defaultAttachmentText
 	}
 
+	// UserPromptSubmit runs before anything is persisted or sent: it is the one
+	// hook that can refuse a message, and a refused message that was stored
+	// anyway would be a prompt the user can see, the model never answers, and
+	// nothing explains. What it adds to the context travels on the turn's
+	// history, after the stored conversation and before this message — the same
+	// place Claude Code injects it.
+	promptContext, blocked, blockReason := s.userPromptSubmitPre(ctx, sess, turnText)
+	if blocked {
+		c.JSON(http.StatusForbidden, map[string]string{"error": blockReason})
+		return
+	}
+
 	history, err := s.buildHistory(ctx, sess, buildUserMessage(turnText, inline))
 	if err != nil {
 		s.fail(c, "build chat history", err)
 		return
 	}
+	if len(promptContext) > 0 {
+		history = insertHookContext(history, promptContext)
+	}
 
 	s.launchTurn(ctx, c, sess, store.ChatMessage{
 		Role: store.RoleUser, Content: persisted, Attachments: attachmentsJSON(assetIDs),
 	}, history, true)
+}
+
+// userPromptSubmitPre runs the UserPromptSubmit hooks around one message and
+// returns whether it is refused.
+//
+// The turn text — what the model would actually receive, attachments note
+// included — is what the hook sees, because a hook that scans for something is
+// scanning the prompt: the user's own text and the note explaining their
+// attachments are the same prompt by the time it is sent.
+//
+// The prompt id is minted here and recorded on the mode, so every later event of
+// this turn (PreToolUse, PostToolUse, Stop) carries the same one: Claude Code
+// stamps a whole turn with one prompt_id, and a handler that joins its own log
+// lines by it would otherwise see nothing.
+func (s *Server) userPromptSubmitPre(ctx context.Context, sess store.ChatSession, turnText string) ([]string, bool, string) {
+	promptID := uuid.NewString()
+	if s.claudeCode != nil {
+		s.claudeCode.SetPromptID(sess.ID, promptID)
+	}
+	reason, blocked, extra := s.userPromptSubmitHooks(ctx, sess, turnText, promptID)
+	if blocked {
+		return nil, true, reason
+	}
+	// Context injected by SessionStart is added here too: it is documented as
+	// arriving before the first prompt, and this is the first prompt it can be
+	// attached to without inventing a message the user did not send.
+	if s.claudeCode != nil {
+		extra = append(extra, s.claudeCode.SessionContext(sess.ID)...)
+	}
+	return extra, false, ""
+}
+
+// insertHookContext places hook-injected text between the conversation and the
+// new user message.
+//
+// It is a system message rather than a user one for the reason the loop guard's
+// steering messages are: it is not the user speaking, and a model that read it
+// as a new instruction from the person would be misled about who asked for what.
+// It is also what keeps the condenser's "most recent user message" pin on the
+// real request rather than on a hook's note.
+func insertHookContext(history []*schema.Message, extra []string) []*schema.Message {
+	lines := make([]string, 0, len(extra))
+	for _, e := range extra {
+		if strings.TrimSpace(e) != "" {
+			lines = append(lines, e)
+		}
+	}
+	if len(lines) == 0 {
+		return history
+	}
+	note := &schema.Message{Role: schema.System, Content: strings.Join(lines, "\n\n")}
+
+	// The last message is the user's, and it stays last: everything a hook
+	// injects goes immediately before it, so the model's instruction is
+	// unambiguous.
+	if n := len(history); n > 0 && history[n-1].Role == schema.User {
+		out := make([]*schema.Message, 0, len(history)+1)
+		out = append(out, history[:n-1]...)
+		out = append(out, note, history[n-1])
+		return out
+	}
+	return append(history, note)
 }
 
 // launchTurn puts one turn in flight for a conversation and answers the request
