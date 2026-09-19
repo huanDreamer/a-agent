@@ -1,0 +1,1175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>大模型能力现状 与 huan-agent 规划</title>
+<style>
+  :root {
+    --bg: #0a0e15;
+    --bg-card: #121a26;
+    --bg-card-2: #172030;
+    --bg-inset: #0d141e;
+    --border: #22303f;
+    --text: #e6edf7;
+    --text-dim: #93a3ba;
+    --text-dimmer: #64748b;
+    --gray: #48566d;
+    --blue: #58a6ff;
+    --green: #3fb950;
+    --amber: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --cyan: #39d0d8;
+    --pink: #f778ba;
+    --radius: 14px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: radial-gradient(1300px 640px at 12% -12%, #16233a 0%, transparent 58%),
+                radial-gradient(900px 500px at 92% 4%, #1d1a33 0%, transparent 55%),
+                var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.65;
+    padding: 0 24px 96px;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1160px; margin: 0 auto; }
+
+  /* ---------- hero ---------- */
+  .hero { padding: 72px 0 40px; }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--cyan); font-weight: 600;
+    border: 1px solid rgba(57,208,216,.28);
+    background: rgba(57,208,216,.07);
+    padding: 5px 12px; border-radius: 999px; margin-bottom: 22px;
+  }
+  .hero h1 {
+    font-size: clamp(30px, 5vw, 46px); line-height: 1.18; font-weight: 720;
+    letter-spacing: -.02em; margin-bottom: 18px;
+  }
+  .hero h1 .g {
+    background: linear-gradient(100deg, var(--blue) 0%, var(--purple) 48%, var(--cyan) 100%);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .hero p.lead { font-size: 16.5px; color: var(--text-dim); max-width: 780px; }
+  .hero-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+  .chip {
+    font-size: 12.5px; padding: 5px 11px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--bg-card); color: var(--text-dim);
+  }
+  .chip b { color: var(--text); font-weight: 600; }
+
+  /* ---------- nav ---------- */
+  nav.toc {
+    display: flex; flex-wrap: wrap; gap: 8px; padding: 16px 0 8px;
+    border-top: 1px solid var(--border); margin-top: 40px;
+  }
+  nav.toc a {
+    font-size: 13px; color: var(--text-dim); text-decoration: none;
+    padding: 6px 13px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--bg-card); transition: .18s;
+  }
+  nav.toc a:hover { color: var(--text); border-color: var(--blue); background: var(--bg-card-2); }
+
+  /* ---------- sections ---------- */
+  section { margin-top: 68px; }
+  .part-label {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .1em;
+    color: var(--text-dimmer); text-transform: uppercase; margin-bottom: 10px;
+  }
+  h2 {
+    font-size: 25px; font-weight: 680; letter-spacing: -.015em; margin-bottom: 10px;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  h2 .badge {
+    font-size: 11.5px; font-weight: 600; letter-spacing: .04em;
+    padding: 3px 9px; border-radius: 6px; background: var(--bg-card-2);
+    border: 1px solid var(--border); color: var(--text-dimmer); font-family: var(--mono);
+  }
+  h3 { font-size: 17px; font-weight: 640; margin: 34px 0 12px; letter-spacing: -.01em; }
+  .sec-note { color: var(--text-dim); font-size: 14.5px; max-width: 860px; margin-bottom: 26px; }
+  .sec-note code, p code, li code, td code {
+    font-family: var(--mono); font-size: .875em; background: var(--bg-inset);
+    border: 1px solid var(--border); border-radius: 5px; padding: 1.5px 5px; color: var(--cyan);
+  }
+
+  /* ---------- stat strip ---------- */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 13px; margin: 26px 0 8px; }
+  .stat {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 18px 18px 16px; position: relative; overflow: hidden;
+  }
+  .stat::before {
+    content: ''; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--blue);
+  }
+  .stat.s-green::before { background: var(--green); }
+  .stat.s-amber::before { background: var(--amber); }
+  .stat.s-purple::before { background: var(--purple); }
+  .stat.s-cyan::before { background: var(--cyan); }
+  .stat .v { font-size: 27px; font-weight: 700; letter-spacing: -.02em; line-height: 1.15; }
+  .stat .v small { font-size: 14px; font-weight: 500; color: var(--text-dim); margin-left: 3px; }
+  .stat .k { font-size: 12.5px; color: var(--text-dim); margin-top: 6px; }
+
+  /* ---------- cards ---------- */
+  .grid { display: grid; gap: 15px; }
+  .g2 { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+  .g3 { grid-template-columns: repeat(auto-fit, minmax(272px, 1fr)); }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px 20px 18px;
+  }
+  .card h4 { font-size: 15.5px; font-weight: 640; margin-bottom: 9px; display: flex; align-items: center; gap: 9px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; }
+  .dot-blue { background: var(--blue); box-shadow: 0 0 10px rgba(88,166,255,.55); }
+  .dot-green { background: var(--green); box-shadow: 0 0 10px rgba(63,185,80,.55); }
+  .dot-amber { background: var(--amber); box-shadow: 0 0 10px rgba(210,153,34,.55); }
+  .dot-purple { background: var(--purple); box-shadow: 0 0 10px rgba(188,140,255,.55); }
+  .dot-cyan { background: var(--cyan); box-shadow: 0 0 10px rgba(57,208,216,.55); }
+  .dot-pink { background: var(--pink); box-shadow: 0 0 10px rgba(247,120,186,.55); }
+  .card p { font-size: 14px; color: var(--text-dim); }
+  .card ul { list-style: none; margin-top: 10px; }
+  .card ul li {
+    font-size: 13.5px; color: var(--text-dim); padding: 5px 0 5px 16px; position: relative;
+    border-top: 1px solid rgba(34,48,63,.6);
+  }
+  .card ul li:first-child { border-top: none; }
+  .card ul li::before {
+    content: ''; position: absolute; left: 2px; top: 13px;
+    width: 5px; height: 5px; border-radius: 50%; background: var(--text-dimmer);
+  }
+  .card ul li b { color: var(--text); font-weight: 600; }
+  .src { font-size: 11.5px; color: var(--text-dimmer); margin-top: 12px; font-family: var(--mono); }
+
+  /* ---------- bars ---------- */
+  .bars { margin-top: 6px; }
+  .bar-row { display: grid; grid-template-columns: 116px 1fr 52px; align-items: center; gap: 12px; margin: 9px 0; }
+  .bar-row .lbl { font-size: 13px; color: var(--text-dim); }
+  .bar-track { height: 9px; background: var(--bg-inset); border-radius: 5px; overflow: hidden; border: 1px solid var(--border); }
+  .bar-fill { height: 100%; border-radius: 5px; }
+  .bar-row .num { font-size: 12.5px; color: var(--text); font-family: var(--mono); text-align: right; }
+
+  /* ---------- table ---------- */
+  .tbl-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-card); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--text-dimmer); font-weight: 600; background: var(--bg-inset);
+    position: sticky; top: 0;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--bg-card-2); }
+  td.mono { font-family: var(--mono); font-size: 12.5px; }
+  .num-cell { text-align: right; font-family: var(--mono); }
+
+  /* ---------- pills ---------- */
+  .pill {
+    display: inline-block; font-size: 11px; font-weight: 600; padding: 2.5px 8px;
+    border-radius: 999px; border: 1px solid; font-family: var(--mono); letter-spacing: .02em;
+  }
+  .p-green { color: var(--green); border-color: rgba(63,185,80,.35); background: rgba(63,185,80,.1); }
+  .p-amber { color: var(--amber); border-color: rgba(210,153,34,.35); background: rgba(210,153,34,.1); }
+  .p-red { color: var(--red); border-color: rgba(248,81,73,.35); background: rgba(248,81,73,.1); }
+  .p-blue { color: var(--blue); border-color: rgba(88,166,255,.35); background: rgba(88,166,255,.1); }
+  .p-purple { color: var(--purple); border-color: rgba(188,140,255,.35); background: rgba(188,140,255,.1); }
+  .p-gray { color: var(--text-dimmer); border-color: var(--border); background: var(--bg-inset); }
+  .p-cyan { color: var(--cyan); border-color: rgba(57,208,216,.35); background: rgba(57,208,216,.1); }
+
+  /* ---------- callout ---------- */
+  .callout {
+    border-radius: var(--radius); padding: 18px 20px; margin: 22px 0;
+    border: 1px solid; font-size: 14px; line-height: 1.7;
+  }
+  .callout-honest {
+    border-color: rgba(210,153,34,.3); background: rgba(210,153,34,.06);
+  }
+  .callout-honest .t { color: var(--amber); font-weight: 650; font-size: 14px; margin-bottom: 7px; }
+  .callout p { color: var(--text-dim); }
+  .callout p + p { margin-top: 8px; }
+
+  /* ---------- todo list ---------- */
+  .todo {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+    margin-bottom: 14px; overflow: hidden; border-left: 3px solid var(--gray);
+  }
+  .todo.p0 { border-left-color: var(--red); }
+  .todo.p1 { border-left-color: var(--amber); }
+  .todo.p2 { border-left-color: var(--blue); }
+  .todo-head {
+    display: flex; align-items: flex-start; gap: 14px; padding: 17px 20px 15px;
+    cursor: default;
+  }
+  .todo-head .rank {
+    font-family: var(--mono); font-size: 12px; font-weight: 700; padding: 3px 9px;
+    border-radius: 6px; flex: 0 0 auto; margin-top: 2px;
+  }
+  .rank-p0 { background: rgba(248,81,73,.14); color: var(--red); border: 1px solid rgba(248,81,73,.32); }
+  .rank-p1 { background: rgba(210,153,34,.14); color: var(--amber); border: 1px solid rgba(210,153,34,.32); }
+  .rank-p2 { background: rgba(88,166,255,.14); color: var(--blue); border: 1px solid rgba(88,166,255,.32); }
+  .todo-head h4 { font-size: 15.5px; font-weight: 640; margin-bottom: 5px; }
+  .todo-head .why { font-size: 13.5px; color: var(--text-dim); }
+  .todo-body { padding: 0 20px 18px 20px; }
+  .todo-body .evi {
+    background: var(--bg-inset); border: 1px solid var(--border); border-radius: 10px;
+    padding: 13px 15px; font-family: var(--mono); font-size: 12.5px; color: var(--text-dim);
+    overflow-x: auto; white-space: pre; line-height: 1.75; margin-top: 4px;
+  }
+  .todo-body .evi .cm { color: var(--text-dimmer); }
+  .todo-body .evi .ok { color: var(--green); }
+  .todo-body .evi .bad { color: var(--red); }
+  .todo-body .lbl2 {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--text-dimmer); font-weight: 600; margin: 14px 0 7px;
+  }
+
+  /* ---------- progress ---------- */
+  .prog-list { display: grid; gap: 9px; margin-top: 18px; }
+  .prog { display: grid; grid-template-columns: 250px 1fr 72px; align-items: center; gap: 14px; }
+  .prog .nm { font-family: var(--mono); font-size: 12.5px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; }
+  .prog .track { height: 8px; background: var(--bg-inset); border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+  .prog .fill { height: 100%; }
+  .prog .frac { font-family: var(--mono); font-size: 12px; color: var(--text-dim); text-align: right; }
+  .prog.low .nm { color: var(--amber); }
+  @media (max-width: 640px) {
+    .prog { grid-template-columns: 130px 1fr 66px; }
+    .bar-row { grid-template-columns: 92px 1fr 46px; }
+  }
+
+  /* ---------- trend ---------- */
+  .trend { display: grid; gap: 13px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .trend-item {
+    background: linear-gradient(180deg, var(--bg-card-2), var(--bg-card));
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 19px 20px;
+  }
+  .trend-item .n {
+    font-family: var(--mono); font-size: 12px; color: var(--purple); font-weight: 700; margin-bottom: 9px;
+  }
+  .trend-item h4 { font-size: 15px; font-weight: 640; margin-bottom: 8px; }
+  .trend-item p { font-size: 13.5px; color: var(--text-dim); }
+
+  /* ---------- filter ---------- */
+  .filter-bar { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin: 20px 0 14px; }
+  .filter-bar input {
+    flex: 1 1 240px; background: var(--bg-inset); border: 1px solid var(--border);
+    border-radius: 9px; padding: 9px 13px; color: var(--text); font-size: 13.5px;
+    font-family: var(--mono); outline: none;
+  }
+  .filter-bar input:focus { border-color: var(--blue); }
+  .filter-bar button {
+    background: var(--bg-card); border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: 9px; padding: 9px 15px; font-size: 13px; cursor: pointer;
+    font-family: inherit; transition: .16s;
+  }
+  .filter-bar button:hover { color: var(--text); border-color: var(--blue); }
+  .filter-bar button.on { background: rgba(88,166,255,.14); color: var(--blue); border-color: rgba(88,166,255,.4); }
+  .count-hint { font-size: 12.5px; color: var(--text-dimmer); font-family: var(--mono); }
+
+  footer {
+    margin-top: 76px; padding-top: 28px; border-top: 1px solid var(--border);
+    font-size: 13px; color: var(--text-dimmer);
+  }
+  footer h4 { font-size: 14px; color: var(--text-dim); margin-bottom: 10px; font-weight: 620; }
+  footer ul { list-style: none; margin-bottom: 18px; }
+  footer li { padding: 3px 0; font-size: 13px; }
+  footer a { color: var(--blue); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  footer code { font-family: var(--mono); color: var(--text-dim); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ==================== HERO ==================== -->
+  <header class="hero">
+    <div class="eyebrow">能力盘点 · 2026-09-19</div>
+    <h1>大模型能力现状<br><span class="g">与 huan-agent 的下一步</span></h1>
+    <p class="lead">
+      上半部分：截至 2026 年 9 月，大模型在长上下文、多模态、推理、工具调用与编码上的真实水位，
+      每条都标了来源。下半部分：huan-agent 已经接住了哪些能力（数据来自本机
+      <code>data/huan-agent.db</code> 的实测记录），以及还没做完的 7 件事。
+    </p>
+    <div class="hero-meta">
+      <span class="chip">行业数据：<b>公开资料，第三方汇总为主</b></span>
+      <span class="chip">项目数据：<b>本机数据库实测</b></span>
+      <span class="chip">已接入模型：<b>72 个</b></span>
+      <span class="chip">未完成任务：<b>103 / 1501</b></span>
+    </div>
+    <nav class="toc">
+      <a href="#industry">① 行业能力现状</a>
+      <a href="#frontier">② 前沿模型对照</a>
+      <a href="#direction">③ 演进方向</a>
+      <a href="#project">④ huan-agent 现状</a>
+      <a href="#matrix">⑤ 模型能力矩阵</a>
+      <a href="#todo">⑥ 未完成的事</a>
+      <a href="#sources">⑦ 来源与核实方法</a>
+    </nav>
+  </header>
+
+  <!-- ==================== PART 1 ==================== -->
+  <section id="industry">
+    <div class="part-label">Part 1 · 行业</div>
+    <h2>大模型能力现状<span class="badge">2026-09</span></h2>
+    <p class="sec-note">
+      2026 年的主旋律已经从「参数内卷」转向「能力可用」：百万级上下文成为旗舰标配，
+      原生多模态（文本 + 图像 + 音频同源处理）取代了拼接式多模态，
+      Agentic 能力（工具调用、长程规划、电脑控制）成为厂商竞争的主战场。
+      下面 5 个数字是这一轮变化的锚点。
+    </p>
+
+    <div class="stats">
+      <div class="stat s-blue">
+        <div class="v">1M<small> tokens</small></div>
+        <div class="k">旗舰模型上下文标配；Gemini 3.1 Pro 报称 10M，Grok 4.20 Beta 报称 2M</div>
+      </div>
+      <div class="stat s-purple">
+        <div class="v">93.6<small>%</small></div>
+        <div class="k">Claude Opus 4.8 在 GPQA 上的成绩，推理榜首附近的水位</div>
+      </div>
+      <div class="stat s-green">
+        <div class="v">88.6<small>%</small></div>
+        <div class="k">Claude Opus 4.8 在 SWE-bench Verified 上的成绩</div>
+      </div>
+      <div class="stat s-cyan">
+        <div class="v">80<small>%+</small></div>
+        <div class="k">Gartner 预测 2026 年部署 AI Agent 的企业比例</div>
+      </div>
+      <div class="stat s-amber">
+        <div class="v">$0.15<small> / M</small></div>
+        <div class="k">Mistral Small 4 输入价格，十亿级参数跑出百亿级成本</div>
+      </div>
+    </div>
+
+    <h3>六项核心能力的水位</h3>
+    <div class="grid g3">
+      <div class="card">
+        <h4><span class="dot dot-blue"></span>长上下文</h4>
+        <p>1M token 从「卖点」变成「默认」，几家的旗舰都在这一档。技术侧的关键变化是稀疏注意力让长上下文的成本塌了：MiniMax 的 MSA 设计把 1M 上下文下的单 token 计算降到上一代的约 1/20，预填充快约 9 倍、解码快约 15 倍。</p>
+        <ul>
+          <li><b>GPT-5.6</b> 三档（Sol / Terra / Luna）均为 1M 窗口</li>
+          <li><b>Gemini 3.1 Pro</b> 报称 10M，是已公布的最大窗口</li>
+          <li><b>Kimi</b> 宣传 200 万字符级上下文，面向整库代码与长视频</li>
+        </ul>
+        <div class="src">来源：iternal.ai / ideas2it.com / bentoml.com / 峰会介绍页</div>
+      </div>
+
+      <div class="card">
+        <h4><span class="dot dot-pink"></span>原生多模态</h4>
+        <p>不再是「文本模型加一个视觉编码器」，而是在同一套表示里处理图文音视频。国产模型这一轮跟得很紧，Omni 类模型把「看懂、听懂、直接行动」合到一个模型里，省掉了跨模型串联的延迟与信息损失。</p>
+        <ul>
+          <li><b>Qwen3.5-Omni / MiMo-V2.5</b>：视觉 + 听觉原生融合</li>
+          <li><b>Step-3.7-Flash</b>：直接吃 UI 界面、图表、文档，输出结构化结果</li>
+          <li><b>Grok 4.3</b>：加入原生视频输入</li>
+        </ul>
+        <div class="src">来源：知乎模型汇总（2026-09-09）/ bentoml.com / aimlapi.com</div>
+      </div>
+
+      <div class="card">
+        <h4><span class="dot dot-green"></span>推理与思维链</h4>
+        <p>「思考档位」成了标准配置：同一个模型提供 none / low / high 多档推理强度，让调用方按任务难度换成本。前沿差距收窄到个位数百分点，开源模型已经挤进第一梯队。</p>
+        <ul>
+          <li><b>Claude Opus 4.8</b>：GPQA 93.6%</li>
+          <li><b>GLM-5.2</b>（开源，MIT）：GPQA 91.2%，ARC-AGI-2 22.8%</li>
+          <li><b>Step-3.7-Flash</b>：低 / 中 / 高三档推理层级可选</li>
+        </ul>
+        <div class="src">来源：iternal.ai / 知乎模型汇总</div>
+      </div>
+
+      <div class="card">
+        <h4><span class="dot dot-cyan"></span>工具调用与 Agentic</h4>
+        <p>从「会调函数」升级为「能长程执行」：拆解目标、跨工具串联、失败后自己改策略、跑到环境里验证结果。MCP 与 Skills 事实上成了工具接入的通用协议，模型厂商开始针对主流 Agent 框架做兼容优化。</p>
+        <ul>
+          <li><b>GPT-5.4</b>：原生电脑控制 + 响应中途可控（mid-response steerability）</li>
+          <li><b>Step-3.7-Flash</b>：针对 Claude Code / MCP / Skills 做兼容优化</li>
+          <li><b>企业侧</b>：97% 企业已探索智能体战略，49% 已将近半数项目转正式应用</li>
+        </ul>
+        <div class="src">来源：zte.com.cn / 腾讯云开发者社区 / 头豹研究院引 OutSystems</div>
+      </div>
+
+      <div class="card">
+        <h4><span class="dot dot-amber"></span>编码与工程</h4>
+        <p>SWE-bench 类仓库级任务成了主战场，水位从「补全函数」推到「关掉一个 issue」。开源模型在这一项上追得最快——闭源的优势主要体现在最难的推理与最复杂的多模态工作流上。</p>
+        <ul>
+          <li><b>Claude Opus 4.8</b>：SWE-bench Verified 88.6%</li>
+          <li><b>MiniMax M2.5</b>（开源）：SWE-bench 80.2%，函数调用 BFCL 76.8%</li>
+          <li><b>GLM-5.2</b>：SWE-bench Pro 62.1%，长程编码</li>
+        </ul>
+        <div class="src">来源：iternal.ai / aimlapi.com</div>
+      </div>
+
+      <div class="card">
+        <h4><span class="dot dot-purple"></span>成本与开源</h4>
+        <p>价格不再是前沿能力的门槛。MoE 与高效架构普及后，同代能力的调用价格差出两个数量级；开源权重模型开始咬住闭源旗舰，且大多用 Apache 2.0 / MIT 这类宽松许可。</p>
+        <ul>
+          <li><b>Mistral Small 4</b>：$0.15 / $0.60（119B MoE，6.5B 激活）</li>
+          <li><b>GLM-5.2</b>：753B MoE，约 1/10 前沿价格，MIT 许可</li>
+          <li><b>Qwen3.5-397B-A17B</b>：Apache 2.0，支持 201 种语言</li>
+        </ul>
+        <div class="src">来源：codingscape.com / iternal.ai / bentoml.com</div>
+      </div>
+    </div>
+
+    <div class="callout callout-honest">
+      <div class="t">关于上面这些数字的可信度</div>
+      <p>
+        这一节的数据来自第三方汇总站点、厂商宣传页与媒体报道，<b>不是官方 benchmark 榜单</b>。
+        同一个模型的上下文窗口在不同来源里能差一个数量级（例如 Gemini 3.1 Pro 有 1M 与 10M 两种说法），
+        因为「原生窗口」「可扩展窗口」「API 实际生效窗口」是三件事，各家口径不一。
+      </p>
+      <p>
+        把它当成「量级参考」而不是「精确指标」：绝对值不可全信，但趋势（上下文变长、多模态原生、成本下探、
+        开源追赶）在多个独立来源里一致，这部分是可靠的。每一项的具体链接见页面末尾。
+      </p>
+    </div>
+  </section>
+
+  <!-- ==================== PART 2 ==================== -->
+  <section id="frontier">
+    <div class="part-label">Part 2 · 行业</div>
+    <h2>前沿模型对照<span class="badge">横向</span></h2>
+    <p class="sec-note">
+      挑了几家旗舰做横向对照，用来判断「能力水位」与「价格水位」是否脱钩。
+      注意：列里的数字来自不同来源、不同评测时点，只做量级比较。
+    </p>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>模型</th><th>厂商</th><th>上下文</th><th>关键能力</th><th>代表成绩</th><th>价格 / M tokens</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">Claude Opus 4.8</td><td>Anthropic</td><td class="num-cell">1M</td>
+            <td>深度推理、复杂编码</td>
+            <td class="mono">GPQA 93.6% · SWE-bench 88.6%</td>
+            <td class="mono">$5 / $25</td>
+          </tr>
+          <tr>
+            <td class="mono">Claude Fable 5</td><td>Anthropic</td><td class="num-cell">1M</td>
+            <td>前沿编码、Agentic</td>
+            <td class="mono">MMLU-Pro 91.5% · HLE 53.3%</td>
+            <td class="mono">$10 / $50</td>
+          </tr>
+          <tr>
+            <td class="mono">GPT-5.6 Sol / Terra / Luna</td><td>OpenAI</td><td class="num-cell">1M</td>
+            <td>编码、cyber、电脑控制</td>
+            <td class="mono">输出上限 128K token</td>
+            <td class="mono">$5/30 · $2.5/15 · $1/6</td>
+          </tr>
+          <tr>
+            <td class="mono">Gemini 3.5 Flash</td><td>Google</td><td class="num-cell">1M</td>
+            <td>速度 + 多模态推理</td>
+            <td class="mono">Terminal-Bench 2.1 76.2% · 289 tok/s</td>
+            <td class="mono">Flash 档</td>
+          </tr>
+          <tr>
+            <td class="mono">Grok 4.6 / 4.5</td><td>xAI</td><td class="num-cell">500K</td>
+            <td>实时数据、编码 Agentic</td>
+            <td class="mono">缓存命中价降 75%</td>
+            <td class="mono">$2 / $6</td>
+          </tr>
+          <tr>
+            <td class="mono">GLM-5.2</td><td>Z.ai（开源 MIT）</td><td class="num-cell">1.04M</td>
+            <td>长程编码，低成本</td>
+            <td class="mono">GPQA 91.2% · SWE-bench Pro 62.1%</td>
+            <td class="mono">约 $1.4 / $4.4</td>
+          </tr>
+          <tr>
+            <td class="mono">Kimi K2.7 Code</td><td>Moonshot（开源）</td><td class="num-cell">262K</td>
+            <td>仓库级编码、补丁规划</td>
+            <td class="mono">强制思考模式</td>
+            <td class="mono">—</td>
+          </tr>
+          <tr>
+            <td class="mono">MiniMax M2.5</td><td>MiniMax（开源）</td><td class="num-cell">230K</td>
+            <td>编码、函数调用、办公</td>
+            <td class="mono">SWE-bench 80.2% · BFCL 76.8%</td>
+            <td class="mono">—</td>
+          </tr>
+          <tr>
+            <td class="mono">Qwen3.5-397B-A17B</td><td>阿里（开源 Apache 2.0）</td><td class="num-cell">256K</td>
+            <td>推理、201 语言、原生视觉</td>
+            <td class="mono">GPQA 88.4% · AIME 91.3%</td>
+            <td class="mono">—</td>
+          </tr>
+          <tr>
+            <td class="mono">Mistral Small 4</td><td>Mistral（开源）</td><td class="num-cell">256K</td>
+            <td>指令 / 推理 / 编码三合一</td>
+            <td class="mono">119B MoE，6.5B 激活</td>
+            <td class="mono">$0.15 / $0.60</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note" style="margin-top:14px">
+      读法：<b>1M 上下文 + 个位数差距的 benchmark + 两个数量级的价格差</b>，
+      是 2026 年选型时最需要权衡的三件事。中间档模型（GLM-5.2、MiniMax M2.5 这类开源权重）
+      在编码与工具调用上已经够用，闭源旗舰的溢价主要买最难的推理与最复杂的多模态链路。
+    </p>
+  </section>
+
+  <!-- ==================== PART 3 ==================== -->
+  <section id="direction">
+    <div class="part-label">Part 3 · 行业</div>
+    <h2>演进方向：还没解决的事<span class="badge">趋势</span></h2>
+    <p class="sec-note">
+      下面四条是行业层面的「未来规划」——不是某个厂商的路线图，而是从当前公开信息里
+      能看出的、整个方向正在撞的天花板。这一节与后面的项目待办是两回事：这里是行业的，
+      后面是 huan-agent 自己的。
+    </p>
+    <div class="trend">
+      <div class="trend-item">
+        <div class="n">方向 01</div>
+        <h4>上下文：从「更长」转向「更有选择」</h4>
+        <p>
+          1M 已经是标配，继续堆到 10M 的边际收益在下降——注意力在超长文本里会稀释，
+          全量塞进去的代价是成本与「中间遗忘」。接下来的竞争点是<b>选择性地看</b>：
+          检索、压缩、分层记忆，以及在推理过程中主动回查而不是一次性读完。
+        </p>
+      </div>
+      <div class="trend-item">
+        <div class="n">方向 02</div>
+        <h4>Agentic 的可靠性，而不是能力上限</h4>
+        <p>
+          单步能力已经够用，卡住的是长链路：<b>几十步之后是否还守着最初的目标</b>、
+          出错后能不能识别并回退、能不能判断「该停下来问人」。
+          Gartner 的 80% 部署预测背后，真正的瓶颈从模型能力变成了流程可观测性与权限治理。
+        </p>
+      </div>
+      <div class="trend-item">
+        <div class="n">方向 03</div>
+        <h4>成本与延迟的持续下探</h4>
+        <p>
+          MoE、稀疏注意力、推理缓存让同代能力的价格每年往下走一个台阶。
+          结果是<b>「用得起」不再是限制，「用得多快」成为限制</b>，
+          于是速度指标（tok/s）第一次和智能指标并列出现在选型表里。
+        </p>
+      </div>
+      <div class="trend-item">
+        <div class="n">方向 04</div>
+        <h4>互操作协议收敛，但治理没跟上</h4>
+        <p>
+          MCP、Skills、function calling 正在收敛成事实标准，
+          模型可以被不同宿主复用。但企业侧的审计追踪、权限边界、数据合规仍处在早期——
+          97% 企业在探索、只有一半走到正式应用，差距就在这一层。
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== PART 4 ==================== -->
+  <section id="project">
+    <div class="part-label">Part 4 · 本项目</div>
+    <h2>huan-agent 已经接住了什么<span class="badge">实测</span></h2>
+    <p class="sec-note">
+      以下全部来自本机 <code>data/huan-agent.db</code> 与仓库源码，不是估计值。
+      项目本体是 Go 写的个人 Agent 平台：Eino 做 Agent 框架、Hertz 做 HTTP、
+      飞书做 IM 入口、Web 控制台做人机界面，
+      通过 <code>llm_models</code> 表维护「这个模型到底能干什么、窗口多大」的目录。
+    </p>
+
+    <div class="stats">
+      <div class="stat s-blue">
+        <div class="v">72</div>
+        <div class="k">目录里已登记的模型（全部来自 <code>commandcode</code> 网关）</div>
+      </div>
+      <div class="stat s-purple">
+        <div class="v">48</div>
+        <div class="k">窗口达到 1M token 以上的模型</div>
+      </div>
+      <div class="stat s-green">
+        <div class="v">34</div>
+        <div class="k">测试通过包数（<code>go test ./...</code> 无 FAIL）</div>
+      </div>
+      <div class="stat s-amber">
+        <div class="v">1398<small> / 1501</small></div>
+        <div class="k">openspec 任务完成度</div>
+      </div>
+    </div>
+
+    <h3>能力是怎么被记录的</h3>
+    <div class="grid g2">
+      <div class="card">
+        <h4><span class="dot dot-cyan"></span>两块信息，两种来源</h4>
+        <p>
+          <code>llm_models</code> 表对每个模型记两件事：<b>能干什么</b>（capabilities）
+          和<b>窗口多大</b>（context_window），并且各自标注来源，
+          因为它们的可信度不一样：
+        </p>
+        <ul>
+          <li><b>context_window</b>：71 / 72 个来自 <code>api</code> ——
+              网关在 <code>/models</code> 响应里直接报的数，是厂商会真正执行的限制，最可信</li>
+          <li><b>asked</b> = 直接问模型自己「你支持图像输入吗，窗口多大」，
+              网关不报时的兜底手段</li>
+          <li><b>api</b>（能力列）= 从网关公布的 endpoint 反推，例如
+              <code>/chat/completions</code> 能证明会聊天</li>
+          <li>但能力列有 <b>65 / 72 个来源为空</b>，而这 65 个<b>并不都是「没问过」</b>——
+              见下方「一处口径缺陷」</li>
+        </ul>
+        <div class="src">依据：llm_models 表 capabilities_source / context_window_source 计数</div>
+      </div>
+
+      <div class="card">
+        <h4><span class="dot dot-amber"></span>这个设计背后的判断</h4>
+        <p>
+          代码里写明的原则是：<b>「缺少证据不等于没有能力」</b>。
+          接口列表里没有 <code>/audio/speech</code>，只能说明网关没列，
+          不能证明模型不会说话——所以缺失一律不当作否证，
+          而是留成空值等下一次真实提问。
+        </p>
+        <ul>
+          <li>窗口自动推导：<code>窗口 × window_ratio − reserve_output_tokens</code></li>
+          <li>不认识的模型用 <code>default_window</code>（默认 131072）保守估</li>
+          <li>上下文压缩在 <code>context.max_tokens: 60000</code> 处触发，把旧消息折叠成摘要</li>
+        </ul>
+        <div class="src">依据：internal/llm/catalog.go 注释、configs/config.yaml:153-169</div>
+      </div>
+    </div>
+
+    <div class="callout callout-honest" style="margin-top:20px">
+      <div class="t">一处口径缺陷：能力列的来源标注是断的，别把它当可信度指标</div>
+      <p>
+        核对时发现，<b>「能力已确认」这个说法对这批数据不成立</b>，原因在代码里：
+      </p>
+      <p>
+        刷新模型列表时，<code>internal/server/modelrefresh.go:167</code> 会用
+        <code>llm.InferCapabilities(info.ID)</code> <b>从模型名字猜</b>能力
+        （名字里有 <code>gemini</code>、<code>vision</code>、<code>-vl</code> 等字样就加上 vision），
+        但这个写入路径<b>没有设置 <code>capabilities_source</code></b>，
+        于是在库里留下了「有 vision 但没有来源」的记录。
+      </p>
+      <p>
+        而 <code>internal/store/catalog.go:340-341</code> 定义了本该标记这种情况的常量
+        <code>ModelCapabilitySourceInferred = "inferred"</code>——全仓搜索确认，
+        <b>这个常量除了定义处，没有任何地方写入或读取它</b>。
+      </p>
+      <p>
+        实测后果：10 个模型带 vision / tools 标记，其中 <b>7 个其实源自名字猜测</b>
+        （6 个 gemini、1 个 <code>deepseek-v4-flash-vision-exp</code>），
+        只有 3 个是真问来的（<code>MiniMax-M3</code>、<code>Qwen3.7-Max</code>、<code>Qwen3.7-Plus</code>）。
+        所以下面表格里的「能力来源」列读法应该是：
+        <b><code>asked</code> / <code>api</code> 可信，空白则是「推断，但没标出来」</b>，
+        而不是「未知」。这是这一页里唯一一处我推翻了自己先前说法的地方。
+      </p>
+    </div>
+
+    <h3>供应商接入状态</h3>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>provider</th><th>来源</th><th>状态</th><th>已登记模型</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">commandcode</td><td>user</td>
+            <td><span class="pill p-green">启用</span></td>
+            <td class="num-cell">72</td>
+            <td>OpenAI 兼容网关，唯一实际在用的入口</td>
+          </tr>
+          <tr>
+            <td class="mono">deepseek</td><td>config</td>
+            <td><span class="pill p-gray">停用</span></td>
+            <td class="num-cell">0</td>
+            <td>缺少 base_url：<code>fetch models: base_url is required</code></td>
+          </tr>
+          <tr>
+            <td class="mono">glm / openai / qwen</td><td>config</td>
+            <td><span class="pill p-gray">停用</span></td>
+            <td class="num-cell">0</td>
+            <td>配置文件里的占位条目，未填 base_url</td>
+          </tr>
+          <tr>
+            <td class="mono">ollama</td><td>config</td>
+            <td><span class="pill p-gray">停用</span></td>
+            <td class="num-cell">0</td>
+            <td>本地推理入口，指向 <code>localhost:11434/v1</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note" style="margin-top:14px">
+      注意这里的落差：登记 72 个模型，但<b>实际只有 1 个供应商在用</b>。
+      多 provider 的架子在，能力目录也在，但除了主网关之外的路径都没接通。
+    </p>
+  </section>
+
+  <!-- ==================== PART 5 ==================== -->
+  <section id="matrix">
+    <div class="part-label">Part 5 · 本项目</div>
+    <h2>已接入模型能力矩阵<span class="badge">72 条</span></h2>
+    <p class="sec-note">
+      直接从 <code>llm_models</code> 表读出来的原始记录，可搜索、可按窗口筛选。
+      「来源」列的含义：<code>api</code> = 网关自己报的，<code>asked</code> = 问模型自己得到的，
+      空白 = 未经核实（vision 标记多数如此，详见下方说明）。
+    </p>
+
+    <div class="grid g2" style="margin-bottom:26px">
+      <div class="card">
+        <h4><span class="dot dot-green"></span>能力覆盖分布</h4>
+        <div class="bars">
+          <div class="bar-row"><span class="lbl">chat</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:linear-gradient(90deg,var(--blue),#4f8fd9)"></div></div><span class="num">62</span></div>
+          <div class="bar-row"><span class="lbl">chat + vision</span><div class="bar-track"><div class="bar-fill" style="width:11.3%;background:linear-gradient(90deg,var(--purple),#8f6ad4)"></div></div><span class="num">7</span></div>
+          <div class="bar-row"><span class="lbl">chat + tools</span><div class="bar-track"><div class="bar-fill" style="width:3.2%;background:linear-gradient(90deg,var(--cyan),#2a9aa0)"></div></div><span class="num">2</span></div>
+          <div class="bar-row"><span class="lbl">chat+v+tools</span><div class="bar-track"><div class="bar-fill" style="width:1.6%;background:linear-gradient(90deg,var(--green),#2c8a3a)"></div></div><span class="num">1</span></div>
+        </div>
+        <p style="margin-top:14px;font-size:13px">
+          只有 <b>1 个模型</b>（MiniMax-M3）被完整确认了聊天 + 视觉 + 工具三项能力。
+          绝大多数只标了 <code>chat</code> ——这<b>不代表它们不支持别的</b>：
+          这一列是「已记录的能力」，不是「模型的上限」，
+          其中 vision 那部分多数还是按名字推断来的（见下方口径缺陷）。
+        </p>
+      </div>
+      <div class="card">
+        <h4><span class="dot dot-blue"></span>上下文窗口分档</h4>
+        <div class="bars">
+          <div class="bar-row"><span class="lbl">1M+</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:linear-gradient(90deg,var(--blue),#4f8fd9)"></div></div><span class="num">48</span></div>
+          <div class="bar-row"><span class="lbl">256K–500K</span><div class="bar-track"><div class="bar-fill" style="width:29.2%;background:linear-gradient(90deg,var(--cyan),#2a9aa0)"></div></div><span class="num">14</span></div>
+          <div class="bar-row"><span class="lbl">&lt; 256K</span><div class="bar-track"><div class="bar-fill" style="width:14.6%;background:linear-gradient(90deg,var(--amber),#9c7019)"></div></div><span class="num">7</span></div>
+          <div class="bar-row"><span class="lbl">500K–1M</span><div class="bar-track"><div class="bar-fill" style="width:4.2%;background:linear-gradient(90deg,var(--purple),#8f6ad4)"></div></div><span class="num">2</span></div>
+          <div class="bar-row"><span class="lbl">未知</span><div class="bar-track"><div class="bar-fill" style="width:2%;background:var(--text-dimmer)"></div></div><span class="num">1</span></div>
+        </div>
+        <p style="margin-top:14px;font-size:13px">
+          三分之二的模型在 1M 档。唯一的「未知」是 <code>meituan/LongCat-2.0:free</code>——
+          免费档没报窗口，宁可为空也不填猜测值。
+        </p>
+      </div>
+    </div>
+
+    <div class="filter-bar">
+      <input id="q" type="search" placeholder="搜索模型名，例如 gemini / glm / deepseek …" autocomplete="off">
+      <button class="flt on" data-f="all">全部</button>
+      <button class="flt" data-f="1m">1M 窗口</button>
+      <button class="flt" data-f="vision">有视觉</button>
+      <button class="flt" data-f="tools">有工具</button>
+      <button class="flt" data-f="known">带 vision/tools 标记</button>
+      <span class="count-hint" id="hint"></span>
+    </div>
+    <div class="tbl-wrap" style="max-height:560px;overflow-y:auto">
+      <table>
+        <thead>
+          <tr><th>模型 ID</th><th>能力</th><th>上下文窗口</th><th>能力来源</th><th>窗口来源</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ==================== PART 6 ==================== -->
+  <section id="todo">
+    <div class="part-label">Part 6 · 本项目</div>
+    <h2>还没做完的事<span class="badge">7 项</span></h2>
+    <p class="sec-note">
+      按优先级排，每条都带可复现的核实命令与实测输出。前两条是「在写下一行代码之前处理」，
+      后面五条排队即可。数据核实时间 2026-09-18 / 09-19。
+    </p>
+
+    <!-- P0-1 -->
+    <div class="todo p0">
+      <div class="todo-head">
+        <span class="rank rank-p0">P0-1</span>
+        <div>
+          <h4>trace 数据无裁剪，数据库已在无界增长</h4>
+          <div class="why">
+            这不是风险，是<b>正在发生</b>的事实：本机 5 天涨到 191MB，其中 <code>observations</code> 表占 148MB。
+            设计早就写在 phase-5c 的 tasks.md 里，只是代码没写。
+          </div>
+        </div>
+      </div>
+      <div class="todo-body">
+        <div class="lbl2">实测</div>
+        <div class="evi">$ ls -lh data/huan-agent.db
+<span class="bad">191M</span>
+
+$ sqlite3 data/huan-agent.db "SELECT COUNT(*), SUM(LENGTH(input))/1048576 FROM observations;"
+2912|148        <span class="cm"># 单 input 一列占 148MB</span>
+
+$ sqlite3 ... "SELECT type, COUNT(*), SUM(LENGTH(input))/1048576 FROM observations GROUP BY type;"
+GENERATION|1216|148      <span class="cm"># 体积全在模型调用上，工具调用几乎不占</span>
+SPAN|1696|0
+
+$ grep -rn "PruneTraces\|ClearTraces\|retention" --include=*.go . | grep -v _test.go
+<span class="bad">（零命中）</span>              <span class="cm"># 只写读，没有删</span></div>
+        <div class="lbl2">成因（已修正过的判断）</div>
+        <p style="font-size:13.5px;color:var(--text-dim);margin-top:4px">
+          增长是 <b>线性 + 平台期，不是 O(n²)</b>。每步存完整 message 列表且无长度上限，
+          但仓库里有活的上下文压缩在兜底：逐步骤体积的斜率递减
+          （<code>+5.8 → +4.1 → +1.7 KB/step</code>），在约 480KB 处饱和，
+          第 121 步触发压缩后断崖回落到 18KB。
+          所以压缩只管住「每步多大」，<b>没人管「总共留多少」</b>——真正的解法是裁剪，不是加长度上限。
+        </p>
+        <div class="lbl2">要做</div>
+        <p style="font-size:13.5px;color:var(--text-dim);margin-top:4px">
+          <b>1.</b> <code>store.PruneTraces(retention_days, max_traces)</code> + 启动时跑一次，
+          配置项走 <code>viper.SetDefault</code>（<code>tracing.retention_days</code> 默认 14、
+          <code>tracing.max_traces</code>、<code>tracing.prune_interval</code>）——
+          <b>这一条是让表有界的唯一一件</b>。<br>
+          <b>2.</b> 写入侧加长度上限（单条 input 超 64KB 只存尾部 + <code>truncated: true</code>）——
+          常数改善约 3.7 倍，但消不掉「无界」。<br>
+          <b>3.</b> <code>ListTraces</code> 的 SELECT 去掉 <code>input, output</code>（列表页不显示，实测快 8.5 倍）。<br>
+          <b>4.</b> 裁剪必须配 <code>VACUUM</code>——实测 <code>freelist_count=0</code>、
+          <code>auto_vacuum=0</code>，DELETE 不会把空间还给文件系统。phase-5c 的设计漏了这一步。
+        </p>
+      </div>
+    </div>
+
+    <!-- P0-2 -->
+    <div class="todo p0">
+      <div class="todo-head">
+        <span class="rank rank-p0">P0-2</span>
+        <div>
+          <h4><code>run</code> 的写权限与保护措施强耦合，要么全信任、要么全残废</h4>
+          <div class="why">
+            <code>huan-agent run</code> 是接进 CI / git hook / cron 的唯一入口，
+            现在只有两个档位，没有中间态。这挡住了所有可托付的自动化场景。
+          </div>
+        </div>
+      </div>
+      <div class="todo-body">
+        <div class="lbl2">两个档位</div>
+        <div class="evi"><span class="cm">// 档位一（默认）：完全信任</span>
+tools.read_only   = <span class="bad">false</span>     <span class="cm">// 有完整写权限</span>
+tools.enable_bash = <span class="bad">true</span>
+tools.approval.mode = <span class="bad">off</span>
+$ grep -n checkpoint cmd/huan-agent/run.go
+<span class="bad">（零命中）</span>              <span class="cm">// 也没有回滚</span>
+
+<span class="cm">// 档位二（配了审批）：完全残废</span>
+cmd/huan-agent/approval.go:36 → SurfaceRun 落进 default
+  → canAsk = false → wrap() 返回 <span class="bad">nil, false</span>
+  → 工具从清单里整个摘掉（不是拒绝，是「从未提供」）</div>
+        <div class="lbl2">为什么这是问题</div>
+        <p style="font-size:13.5px;color:var(--text-dim);margin-top:4px">
+          代码注释自己承认了这个取舍，理由是「refused 比 absent 更糟」——
+          这个理由对交互式场景成立，对 CI 不成立：<b>CI 里没人看，但执行者（CI 脚本）可以事先声明权限</b>。
+          「按策略需要确认但无人在场 → 那就别做」是正确的；
+          「于是连读带写的工具全摘掉，任务整个无法完成」不是。
+          <br>结果：不配审批 → 它能在 CI 里跑 <code>git push</code>；配审批 → 它什么都干不了。两者都不可托付。
+        </p>
+        <div class="lbl2">要做</div>
+        <p style="font-size:13.5px;color:var(--text-dim);margin-top:4px">
+          给 <code>run</code> 一个<b>非交互的权限档位</b>——显式声明，而不是「配了审批」的副作用。
+          原则：<b>边界用档位，便利性才用正则</b>，顺序不能反。
+        </p>
+        <div class="lbl2">顺序依赖</div>
+        <p style="font-size:13.5px;color:var(--text-dim);margin-top:4px">
+          <b>先 P0-1 再 P0-2</b>，不能反。反过来的话，<code>run</code> 每跑一次就往同一张无界表写一份 trace，
+          增长速率会从「跟开发时长挂钩」变成「跟提交频率挂钩」。
+        </p>
+      </div>
+    </div>
+
+    <!-- P1-3 -->
+    <div class="todo p1">
+      <div class="todo-head">
+        <span class="rank rank-p1">P1-3</span>
+        <div>
+          <h4>phase-5c 未完成：58 项，占全部未完成任务的 56%</h4>
+          <div class="why">
+            全项目 103 项未完成任务里，<b>这一项占了 58 项</b>（50 / 108 完成）。
+            内容是本地 trace 能力：抽包 <code>internal/tracing</code>、实时推送、
+            CLI 与飞书接入、裁剪策略。
+          </div>
+        </div>
+      </div>
+      <div class="todo-body">
+        <div class="lbl2">未完成的模块</div>
+        <div class="evi">internal/tracing        抽包，统一 TraceSummary / Observation / TraceDetail
+internal/langfuse      改为只留 ingestion 客户端
+store.PruneTraces       按 age + count 双阈值裁剪
+store.ClearTraces       显式删 observations 再删 traces
+tracing.Hub             有界订阅者集合，非阻塞广播
+GET /api/traces/stream  SSE 实时推送（首个 ready 帧 + : ping 心跳）
+DELETE /api/traces      清空，返回删除条数
+tracing.enable / retention_days / max_traces / prune_interval   配置项</div>
+        <p style="font-size:13.5px;color:var(--text-dim);margin-top:12px">
+          设计已经写得很细（连「慢订阅者要摘掉并计数」「无订阅者时不起 goroutine」这种边界都有），
+          缺的是实现。
+        </p>
+      </div>
+    </div>
+
+    <!-- P1-4 -->
+    <div class="todo p1">
+      <div class="todo-head">
+        <span class="rank rank-p1">P1-4</span>
+        <div>
+          <h4><code>ask_user</code> 与审批卡片只有 Web 有，飞书路径能力残缺</h4>
+          <div class="why">
+            交互式能力被绑死在 Web 一个界面上，
+            意味着飞书 bot 上的写操作要么无审批、要么被静默摘掉。
+          </div>
+        </div>
+      </div>
+      <div class="todo-body">
+        <div class="evi"><span class="cm">// cmd/huan-agent/chat.go:530</span>
+if opts.Surface == "web" { <span class="cm">/* ask_user 注册 */</span> }
+<span class="cm">// cmd/huan-agent/chat.go:551</span>
+if opts.Surface == "web" &amp;&amp; cfg.Chat.Plan.Enable { <span class="cm">/* plan_* 注册 */</span> }
+
+<span class="cm">// cmd/huan-agent/approval.go:36-40</span>
+case prompt.SurfaceWeb: return true
+case prompt.SurfaceCLI: return true
+default:                return <span class="bad">false</span>   <span class="cm">// 飞书 + run</span></div>
+        <p style="font-size:13.5px;color:var(--text-dim);margin-top:12px">
+          飞书审批卡片是 Phase 21 明确的「不做」项，所以这是<b>已知取舍</b>而非疏忽。
+          但它与 P0-2 叠加后意味着：<b>三个非 Web 路径（CLI 的 plan/ask、飞书、run）能力明显更弱</b>。
+          CLI 有补偿（REPL 支持 <code>/rollback</code>，检查点是通的），飞书与 run 没有。
+        </p>
+      </div>
+    </div>
+
+    <!-- P2 -->
+    <div class="grid g3" style="margin-top:22px">
+      <div class="todo p2" style="margin-bottom:0">
+        <div class="todo-head">
+          <span class="rank rank-p2">P2-5</span>
+          <div>
+            <h4>没有 MCP server 模式</h4>
+            <div class="why">
+              <code>go.mod</code> 里有 <code>mcp-go v0.54.1</code>，但只在测试里当假 server 用。
+              生产代码没有把自己暴露成 MCP server 的入口，子命令只有
+              admin / serve / chat / run / usage / viking / version。
+              <b>不能被调用 = 进不了别人的工作流</b>（Cursor、Claude Code 这类生态）。
+              需要自己的 capability，尚未排期。
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="todo p2" style="margin-bottom:0">
+        <div class="todo-head">
+          <span class="rank rank-p2">P2-6</span>
+          <div>
+            <h4>没有 Dockerfile / 部署外壳</h4>
+            <div class="why">
+              仓库根目录无 <code>Dockerfile</code> / <code>docker-compose.yml</code> / <code>.dockerignore</code>。
+              单二进制 32MB + SQLite 单文件 + 前端 embed，容器化成本很低，
+              但 PLAN.md Phase 6 计划过、一直没做。
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="todo p2" style="margin-bottom:0">
+        <div class="todo-head">
+          <span class="rank rank-p2">P2-7</span>
+          <div>
+            <h4>文档滞后于实现</h4>
+            <div class="why">
+              <code>docs/status.html</code> 停在 Phase 9（缺 8 与 11–24）；
+              <code>openspec/specs/project.md</code> 的 Capabilities 表停在 phase 7；
+              28 个 change 里只有 4 个归入 <code>archive/</code>，
+              其余 23 个含 phase-6 到 phase-24 全部还挂在 <code>changes/</code>。
+              这是维护债，不是能力缺口——建议在归档 P0 改动时一并清一轮。
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h3>openspec 各 change 完成度</h3>
+    <p class="sec-note">
+      1501 项任务，已完成 1398，未完成 103。下面只列出还没满的阶段；
+      未列出的（phase-11、12、15、22b、phase-4-feishu、phase-5、phase-6、phase-7 等）均已 100%。
+    </p>
+    <div class="prog-list" id="prog"></div>
+    <p class="sec-note" style="margin-top:18px">
+      两条读法：<b>①</b> 除 phase-5c 外，所有阶段的缺口都是 1–6 项，
+      属于「收尾没做」而不是「没开工」——典型如 phase-25 的 6 项全是文档与 commit 未落；
+      <b>②</b> <code>phase-0-bootstrap</code> 显示 0/20 是历史遗留：
+      它的工作早已用别的方式完成，只是 tasks.md 里的勾从没打上。
+    </p>
+  </section>
+
+  <!-- ==================== PART 7 ==================== -->
+  <section id="sources">
+    <div class="part-label">Part 7 · 出处</div>
+    <h2>来源与核实方法</h2>
+    <p class="sec-note">
+      这一页里「行业的」和「本项目的」两类内容可信度完全不同，所以分开列。
+      行业部分是公开资料，项目部分是我在这台机器上跑出来的。
+    </p>
+
+    <div class="grid g2">
+      <div class="card">
+        <h4><span class="dot dot-amber"></span>行业数据（第三方，量级参考）</h4>
+        <ul>
+          <li>iternal.ai · LLM Comparison 2026：30+ 模型基准与价格对照</li>
+          <li>fireworks.ai · Best Open Source LLMs in 2026：开源模型参数与窗口</li>
+          <li>bentoml.com · Best Open-Source LLMs 2026：Qwen / MiniMax 架构细节（含 MSA 稀疏注意力）</li>
+          <li>ideas2it.com · Enterprise LLM Comparison 2026：Gemini / Claude / Grok 企业与定价</li>
+          <li>aimlapi.com · Best LLM Models 2026：Gemini 3.5 Flash 各项 benchmark</li>
+          <li>codingscape.com · Most powerful LLMs 2026：Mistral 与 GPT-5.6 参数与价格</li>
+          <li>zte.com.cn · AI 应用范式变革：Agentic AI：Gartner 80% 预测</li>
+          <li>腾讯云开发者社区 · 2026 年 3 月全球大模型全景：厂商动态综述</li>
+          <li>知乎 · 国内外知名大模型及应用（2026-09-09）：国产模型型号汇总</li>
+          <li>头豹研究院 引 OutSystems / RedHat：企业级 Agentic 落地调研</li>
+          <li>BenchLM LLM Leaderboard（2026-09-08 刷新）：模型与 benchmark 计数</li>
+        </ul>
+        <div class="src">均为公开网页，未经官方榜单交叉验证；口径差异已在正文标注</div>
+      </div>
+
+      <div class="card">
+        <h4><span class="dot dot-green"></span>项目数据（本机实测，可复现）</h4>
+        <ul>
+          <li><b>模型矩阵</b>：<code>sqlite3 data/huan-agent.db "SELECT * FROM llm_models"</code>（72 行）</li>
+          <li><b>供应商状态</b>：同库 <code>llm_providers</code> / <code>llm_bindings</code> 表</li>
+          <li><b>任务完成度</b>：<code>grep -c '^- \[x\]' openspec/changes/*/tasks.md</code></li>
+          <li><b>库体积与增长</b>：<code>ls -lh data/huan-agent.db</code>、
+              <code>SELECT type, COUNT(*), SUM(LENGTH(input))/1048576 FROM observations GROUP BY type</code></li>
+          <li><b>裁剪代码不存在</b>：<code>grep -rn "PruneTraces\|ClearTraces\|retention" --include=*.go .</code></li>
+          <li><b>run 的权限档位</b>：<code>cmd/huan-agent/approval.go:28-41</code>、<code>internal/config/config.go:1459-1482</code></li>
+          <li><b>测试状态</b>：<code>go build ./... &amp;&amp; go test ./...</code> → 34 包 ok 无 FAIL</li>
+        </ul>
+        <div class="src">项目结论详见仓库 RECOMMENDED-NEXT.md（2026-09-18 复核）</div>
+      </div>
+    </div>
+
+    <div class="callout callout-honest">
+      <div class="t">没验证过的，就不写成结论</div>
+      <p>
+        <b>行业内</b>：这一页所有 benchmark 数字都来自第三方汇总，我没有跑过任何一个评测，
+        也没能访问官方榜单核对。「1M 上下文」这类数字在不同来源里口径不一，
+        正文里已按来源逐条标注。
+      </p>
+      <p>
+        <b>项目内</b>：以下几条是<b>推断而非实测</b>，特此说明——
+        配 <code>tools.workspace</code> 后 OpenViking 全量上传源码的行为（只读了机制，没开真实同步观察）；
+        <code>run</code> 配审批后工具被摘掉导致的 CI 失败率（机制确定，没实跑统计）；
+        phase-5c 的 <code>PruneTraces</code> 按设计实现对 40MB 单 trace 的回收效果（未实现，无法测）；
+        手工 <code>VACUUM</code> 对现网 191MB 的实际回收量（没跑，会锁库；
+        但 <code>freelist_count=0</code> 说明现在跑回收量约为零这点是确定的）。
+      </p>
+    </div>
+  </section>
+
+  <footer>
+    <h4>关于这一页</h4>
+    <ul>
+      <li>生成时间：<code>2026-09-19</code> · 项目数据核实于同日，行业数据检索于同日</li>
+      <li>项目仓库：<code>github.com/huan/huan-agent</code>（Go + Eino + Hertz + SQLite + 飞书 + Web 控制台）</li>
+      <li>项目侧全部结论与核实命令的来源文档：<code>RECOMMENDED-NEXT.md</code></li>
+      <li>行业侧数字为第三方汇总，只作量级参考；趋势判断在多个独立来源中一致</li>
+    </ul>
+  </footer>
+</div>
+
+<script>
+// ---------- 模型矩阵 ----------
+var MODELS = [{"m":"MiniMaxAI/MiniMax-M2.5","c":"chat","w":200000,"cs":"asked","ws":"api"},{"m":"MiniMaxAI/MiniMax-M2.7","c":"chat","w":200000,"cs":"","ws":"api"},{"m":"MiniMaxAI/MiniMax-M3","c":"chat,vision,tools","w":1000000,"cs":"asked","ws":"api"},{"m":"Qwen/Qwen3.6-Max-Preview","c":"chat","w":200000,"cs":"","ws":"api"},{"m":"Qwen/Qwen3.6-Plus","c":"chat","w":200000,"cs":"","ws":"api"},{"m":"Qwen/Qwen3.7-Flash","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"Qwen/Qwen3.7-Max","c":"chat,tools","w":1000000,"cs":"asked","ws":"api"},{"m":"Qwen/Qwen3.7-Plus","c":"chat,tools","w":1000000,"cs":"asked","ws":"api"},{"m":"Qwen/Qwen3.8-27B","c":"chat","w":262144,"cs":"","ws":"api"},{"m":"Qwen/Qwen3.8-Flash","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"Qwen/Qwen3.8-Max","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"Qwen/Qwen3.8-Max-0902","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"Qwen/Qwen3.8-Omni-Flash","c":"chat","w":1000000,"cs":"api","ws":"api"},{"m":"claude-fable-5","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"claude-fable-5-1","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"claude-haiku-4-5-20251001","c":"chat","w":200000,"cs":"","ws":"api"},{"m":"claude-opus-4-7","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"claude-opus-4-8","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"claude-opus-5","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"claude-sonnet-4-6","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"claude-sonnet-5","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"deepseek/deepseek-v4-flash","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"deepseek/deepseek-v4-flash-fast","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"deepseek/deepseek-v4-flash-vision-exp","c":"chat,vision","w":1000000,"cs":"","ws":"api"},{"m":"deepseek/deepseek-v4-pro","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"deepseek/deepseek-v4.1-flash","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"google/gemini-3.1-flash-lite","c":"chat,vision","w":1000000,"cs":"","ws":"api"},{"m":"google/gemini-3.5-flash","c":"chat,vision","w":1000000,"cs":"","ws":"api"},{"m":"google/gemini-3.5-flash-lite","c":"chat,vision","w":1000000,"cs":"","ws":"api"},{"m":"google/gemini-3.6-flash","c":"chat,vision","w":1000000,"cs":"","ws":"api"},{"m":"google/gemini-3.7-flash","c":"chat,vision","w":1048576,"cs":"","ws":"api"},{"m":"google/gemini-3.8-flash","c":"chat,vision","w":1000000,"cs":"","ws":"api"},{"m":"gpt-5.3-codex","c":"chat","w":400000,"cs":"","ws":"api"},{"m":"gpt-5.4","c":"chat","w":400000,"cs":"","ws":"api"},{"m":"gpt-5.4-mini","c":"chat","w":400000,"cs":"","ws":"api"},{"m":"gpt-5.5","c":"chat","w":400000,"cs":"","ws":"api"},{"m":"gpt-5.6-luna","c":"chat","w":1050000,"cs":"","ws":"api"},{"m":"gpt-5.6-sol","c":"chat","w":1050000,"cs":"","ws":"api"},{"m":"gpt-5.6-terra","c":"chat","w":1050000,"cs":"","ws":"api"},{"m":"inclusionai/ling-3.0-flash-sante:free","c":"chat","w":262144,"cs":"","ws":"api"},{"m":"meituan/LongCat-2.0","c":"chat","w":1048576,"cs":"api","ws":"api"},{"m":"meituan/LongCat-2.0:free","c":"chat","w":0,"cs":"","ws":""},{"m":"meta/muse-spark-1.1","c":"chat","w":1048576,"cs":"","ws":"api"},{"m":"meta/muse-spark-1.2","c":"chat","w":1048576,"cs":"","ws":"api"},{"m":"meta/muse-spark-1.2-contributor","c":"chat","w":1048576,"cs":"","ws":"api"},{"m":"meta/muse-spark-1.3","c":"chat","w":1048576,"cs":"","ws":"api"},{"m":"meta/muse-spark-1.3-contributor","c":"chat","w":1048576,"cs":"","ws":"api"},{"m":"moonshotai/Kimi-K2.5","c":"chat","w":256000,"cs":"","ws":"api"},{"m":"moonshotai/Kimi-K2.6","c":"chat","w":256000,"cs":"","ws":"api"},{"m":"moonshotai/Kimi-K2.7-Code","c":"chat","w":256000,"cs":"","ws":"api"},{"m":"moonshotai/Kimi-K2.7-Code-Highspeed","c":"chat","w":262000,"cs":"","ws":"api"},{"m":"moonshotai/Kimi-K3","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"nvidia/nemotron-3-ultra-550b-a55b","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"poolside/laguna-s-2.1-free","c":"chat","w":256000,"cs":"","ws":"api"},{"m":"sakana/fugu-ultra","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"stepfun/Step-3.5-Flash","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"stepfun/Step-3.7-Flash","c":"chat","w":256000,"cs":"","ws":"api"},{"m":"tencent/hy3-paid","c":"chat","w":262144,"cs":"","ws":"api"},{"m":"tencent/hy4-preview","c":"chat","w":1048576,"cs":"","ws":"api"},{"m":"thinkingmachines/inkling","c":"chat","w":256000,"cs":"","ws":"api"},{"m":"thinkingmachines/inkling-small","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"xai/grok-4.5","c":"chat","w":500000,"cs":"","ws":"api"},{"m":"xai/grok-4.6","c":"chat","w":500000,"cs":"","ws":"api"},{"m":"xiaomi/mimo-v2.5","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"xiaomi/mimo-v2.5-pro","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"z-ai/glm-5.3-flash","c":"chat","w":1048576,"cs":"","ws":"api"},{"m":"z-ai/glm-5.3-flashx","c":"chat","w":1000000,"cs":"api","ws":"api"},{"m":"zai-org/GLM-5","c":"chat","w":200000,"cs":"","ws":"api"},{"m":"zai-org/GLM-5.1","c":"chat","w":200000,"cs":"","ws":"api"},{"m":"zai-org/GLM-5.2","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"zai-org/GLM-5.2-Fast","c":"chat","w":1000000,"cs":"","ws":"api"},{"m":"zai-org/GLM-5.3","c":"chat","w":1000000,"cs":"","ws":"api"}];
+
+// ---------- 各 change 完成度（未满的） ----------
+var PROGRESS = [
+  ["phase-5c-local-tracing", 50, 108],
+  ["phase-25-artifacts", 43, 49],
+  ["phase-10-background-jobs", 51, 55],
+  ["phase-22-parallel-tools-and-subagents", 79, 81],
+  ["phase-0-bootstrap", 0, 20],
+  ["phase-16-turn-steps", 25, 27],
+  ["phase-17-plan-and-retry", 96, 97],
+  ["phase-18-mcp-transport-fidelity", 41, 42],
+  ["phase-19-one-shot-run", 51, 52],
+  ["phase-20-code-intelligence", 60, 61],
+  ["phase-21-approval-and-checkpoints", 95, 96],
+  ["phase-24-multi-file-edits", 43, 44],
+  ["phase-8-openviking", 43, 44],
+  ["phase-9-workspaces", 71, 72],
+  ["phase-14-session-stats", 23, 24],
+  ["system-prompt-general-agent", 31, 32]
+];
+
+function fmtW(w) {
+  if (!w) return null;
+  if (w >= 1000000) return (w / 1000000).toFixed(w % 1000000 ? 2 : 0) + "M";
+  return Math.round(w / 1000) + "K";
+}
+
+function buildRows() {
+  var tb = document.getElementById("rows");
+  var html = "";
+  for (var i = 0; i < MODELS.length; i++) {
+    var d = MODELS[i];
+    var caps = d.c ? d.c.split(",") : [];
+    var pills = "";
+    for (var j = 0; j < caps.length; j++) {
+      var k = caps[j];
+      var cls = k === "vision" ? "p-purple" : (k === "tools" ? "p-cyan" : "p-blue");
+      pills += '<span class="pill ' + cls + '" style="margin-right:4px">' + k + "</span>";
+    }
+    var w = fmtW(d.w);
+    var wCell = w
+      ? '<span style="font-family:var(--mono)">' + w + '</span>'
+      : '<span class="pill p-gray">未报</span>';
+    var cs = d.cs ? '<span class="pill ' + (d.cs === "asked" ? "p-amber" : "p-green") + '">' + d.cs + "</span>"
+                  : '<span class="pill p-gray">—</span>';
+    var ws = d.ws ? '<span class="pill p-green">api</span>' : '<span class="pill p-gray">—</span>';
+    html += "<tr data-c=\"" + d.c + "\" data-w=\"" + d.w + "\">" +
+            '<td class="mono">' + d.m + "</td>" +
+            "<td>" + pills + "</td>" +
+            '<td class="num-cell">' + wCell + "</td>" +
+            "<td>" + cs + "</td>" +
+            "<td>" + ws + "</td></tr>";
+  }
+  tb.innerHTML = html;
+}
+
+function applyFilter(mode, q) {
+  var rows = document.querySelectorAll("#rows tr");
+  var n = 0;
+  q = (q || "").trim().toLowerCase();
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var txt = r.cells[0].textContent.toLowerCase();
+    var caps = r.getAttribute("data-c") || "";
+    var w = parseInt(r.getAttribute("data-w"), 10) || 0;
+    var ok = true;
+    if (q && txt.indexOf(q) === -1) ok = false;
+    if (ok && mode === "1m") ok = w >= 1000000;
+    if (ok && mode === "vision") ok = caps.indexOf("vision") !== -1;
+    if (ok && mode === "tools") ok = caps.indexOf("tools") !== -1;
+    if (ok && mode === "known") ok = caps.indexOf("tools") !== -1 || caps.indexOf("vision") !== -1;
+    r.style.display = ok ? "" : "none";
+    if (ok) n++;
+  }
+  document.getElementById("hint").textContent = "显示 " + n + " / " + MODELS.length;
+}
+
+function buildProgress() {
+  var el = document.getElementById("prog");
+  var html = "";
+  for (var i = 0; i < PROGRESS.length; i++) {
+    var p = PROGRESS[i];
+    var pct = p[2] ? (p[1] / p[2] * 100) : 0;
+    var low = (pct < 60) ? " low" : "";
+    var color = pct === 100 ? "var(--green)" : (pct < 60 ? "var(--amber)" : "var(--blue)");
+    html += '<div class="prog' + low + '">' +
+            '<span class="nm">' + p[0] + "</span>" +
+            '<span class="track"><span class="fill" style="width:' + pct.toFixed(1) +
+            "%;background:" + color + '"></span></span>' +
+            '<span class="frac">' + p[1] + "/" + p[2] + "</span></div>";
+  }
+  el.innerHTML = html;
+}
+
+buildRows();
+buildProgress();
+applyFilter("all", "");
+
+document.getElementById("q").addEventListener("input", function (e) {
+  var active = document.querySelector(".flt.on");
+  applyFilter(active ? active.getAttribute("data-f") : "all", e.target.value);
+});
+
+var btns = document.querySelectorAll(".flt");
+for (var i = 0; i < btns.length; i++) {
+  btns[i].addEventListener("click", function () {
+    for (var j = 0; j < btns.length; j++) btns[j].classList.remove("on");
+    this.classList.add("on");
+    applyFilter(this.getAttribute("data-f"), document.getElementById("q").value);
+  });
+}
+</script>
+</body>
+</html>

@@ -402,6 +402,17 @@ async function probeModel(model) {
 }
 
 /**
+ * How many models one click asks, for the button's tooltip.
+ *
+ * It mirrors `probeBatchLimit` in internal/server/modelfacts.go, which is where
+ * the cap is actually enforced: the response reports `remaining`, so the note
+ * below is correct even if this number ever drifts. The tooltip needs it up
+ * front, though, because the button has to say what a click will do *before* it
+ * is clicked — and the number is not in any response.
+ */
+const probeBatchLimit = 4
+
+/**
  * Ask a provider's models: the ones with something open, or — with force — the
  * first few regardless. The server caps how many one click asks, so the note
  * says how many questions are still open rather than pretending it asked them

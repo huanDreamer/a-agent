@@ -8,7 +8,11 @@ import DirPicker from '../src/components/DirPicker.vue'
 import AppSidebar from '../src/components/AppSidebar.vue'
 import LoginView from '../src/components/LoginView.vue'
 import AskUserCard from '../src/components/AskUserCard.vue'
+import ArtifactsDrawer from '../src/components/ArtifactsDrawer.vue'
+import ModelPanel from '../src/components/ModelPanel.vue'
+import ArtifactsView from '../src/components/ArtifactsView.vue'
 import ApprovalCard from '../src/components/ApprovalCard.vue'
+import ClaudeCodePanel from '../src/components/ClaudeCodePanel.vue'
 import TaskBoard from '../src/components/TaskBoard.vue'
 import { api } from '../src/api.js'
 import { askFromEvent, askFromTool, applyAskOutcome, askAnswerLine, isAskTool } from '../src/ask.js'
@@ -21,7 +25,7 @@ import {
   isApprovalOpen,
   pendingApprovals,
 } from '../src/approval.js'
-import { budget, buildItems, chat } from '../src/chatStore.js'
+import { budget, buildItems, chat, createSession, ensureLoaded } from '../src/chatStore.js'
 import {
   normalizePlan,
   planGroups,
@@ -39,13 +43,16 @@ import {
   stepToolMs,
   visibleSteps,
 } from '../src/steps.js'
-import { needsLogin, state } from '../src/state.js'
+import { claudeCode, needsLogin, state } from '../src/state.js'
 import {
   subagentsRunning,
   subagentsStoreState as subagentState,
   subagentsTotal,
 } from '../src/subagentsStore.js'
 import { subagentChipLabel, subagentHintText } from '../src/subagentsChip.js'
+import { artifactChipLabel, artifactHintText, artifactLabel } from '../src/artifactsChip.js'
+import { artifactsStoreState as artifactState } from '../src/artifactsStore.js'
+import { filterArtifacts, sessionLabel, totalBytes } from '../src/artifactsView.js'
 
 // The dialog is teleported to <body>, and SSR puts teleport content in its own
 // buffer rather than in the returned HTML — so both halves are concatenated, or
@@ -275,6 +282,58 @@ export function planState() {
   }
 }
 
+/**
+ * 新建对话之后，输入框上方还有没有任务看板？
+ *
+ * 这是"新建对话不该显示任务看板"的回归探针。看板读的是 chat.plan（模块单例），
+ * 而 createSession 在服务端建完之后把界面切到新会话——它一路上重置了 items /
+ * stats / workspace，唯独漏掉 plan 的话，上一个对话的任务清单就挂在一个空对话的
+ * 输入框上方，看起来像"这个刚建的对话有一堆活没干"。
+ *
+ * 断言必须同时看 store 和渲染结果：store 是原因，HTML 是用户看到的东西。
+ *
+ * `status` 不是 200 时走的是失败分支——那时人还留在原会话上，那份计划是他的
+ * 「继续执行」接续点，不能被一次失败的创建清掉。
+ */
+export async function createSessionWithPlan({ existing = null, status = 200 } = {}) {
+  const original = globalThis.fetch
+  const paths = []
+  globalThis.fetch = async (url) => {
+    const path = String(url)
+    paths.push(path)
+    if (status !== 200 && path.endsWith('/api/chat/sessions')) {
+      return { ok: false, status, text: async () => JSON.stringify({ error: 'boom' }) }
+    }
+    let body = {}
+    if (path.endsWith('/api/chat/sessions')) body = { session: { id: 's-new', title: '', message_count: 0 } }
+    else if (path.includes('/api/chat/sessions')) body = { sessions: [] }
+    else if (path.includes('/api/workspaces')) body = { workspaces: [{ name: 'proj', root: '/tmp/proj' }] }
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) }
+  }
+  chat.plan = existing
+  chat.planCollapsed = false
+  chat.activeId = 's-old'
+  chat.session = { id: 's-old' }
+  chat.items = []
+  chat.creating = false
+  chat.actionError = ''
+  try {
+    const created = await createSession()
+    return {
+      created: Boolean(created),
+      plan: chat.plan,
+      activeId: chat.activeId,
+      // 从探针自己的那份 store 读回来，而不是让调用方去读另一个模块实例：
+      // run.mjs 里的 chatStore 与打包进探针的那份是两份。
+      actionError: chat.actionError,
+      html: await renderWithTeleports(TaskBoard, {}),
+      paths,
+    }
+  } finally {
+    globalThis.fetch = original
+  }
+}
+
 /** See plan.js: the wire normalisation, the grouping and the one-line summary. */
 export const planHelpers = {
   normalizePlan,
@@ -376,4 +435,236 @@ export function subagentChip() {
 /** Render the subagents drawer, so the probe sees what a reader sees. */
 export async function renderSubagentsDrawer() {
   return renderWithTeleports(SubagentsDrawer, {})
+}
+
+
+/* --------------------------------------------------------------- 产物 -- */
+
+/**
+ * Load the artifact store with a list, the way a session load would.
+ *
+ * The store is a module singleton that normally fills itself from the API, so a
+ * probe sets it directly — the same thing setSubagents does.
+ */
+export function setArtifacts(items, { enabled = true, message = '', sessionId = 'sess-1' } = {}) {
+  artifactState.sessionId = sessionId
+  artifactState.items = items
+  artifactState.enabled = enabled
+  artifactState.message = message
+  artifactState.error = ''
+  artifactState.loading = false
+  artifactState.loaded = true
+}
+
+/** The facts the header button renders from. */
+export function artifactChip() {
+  return {
+    count: artifactState.items.length,
+    label: artifactChipLabel(),
+    hint: artifactHintText(),
+  }
+}
+
+/** Render the 产物 drawer, so the probe sees what a reader sees. */
+export async function renderArtifactsDrawer() {
+  return renderWithTeleports(ArtifactsDrawer, {})
+}
+
+/** Render 产物中心. It loads from the API, so the probe asserts on the empty state. */
+export async function renderArtifactsView() {
+  return renderWithTeleports(ArtifactsView, {})
+}
+
+/** The listing rules, for the probe's assertions. */
+export function artifactHelpers() {
+  return { filterArtifacts, sessionLabel, totalBytes, artifactLabel }
+}
+
+
+/* ------------------------------------------ ClaudeCode 兼容模式 --------- */
+
+/**
+ * Render 设置 → ClaudeCode against a status payload.
+ *
+ * The panel reads the module singleton rather than props — that is what makes the
+ * sidebar badge and the panel one answer instead of two reads that can disagree —
+ * so the probe seeds it exactly as `loadClaudeCode` does, then renders.
+ *
+ * 运行记录 has two sources by design: the status payload's own `hook_log` (on screen
+ * the moment the panel opens) and GET /api/claudecode/events, which SSR cannot run.
+ * So what this renders is the hook_log half, which is the half a reader sees first.
+ */
+export async function renderClaudeCodePanel(snapshot, { status = 'ready', error = '' } = {}) {
+  // `undefined` is the store's own initial state — no snapshot, i.e. loading — so a
+  // caller that wants the panel's error screen asks for it by name.
+  Object.assign(claudeCode, {
+    snapshot: snapshot === undefined ? null : snapshot,
+    status: snapshot === undefined && status === 'ready' ? 'loading' : status,
+    error,
+    busy: false,
+  })
+  return renderWithTeleports(ClaudeCodePanel, {})
+}
+
+/**
+ * Seed the mode store for the sidebar badge, which is the other half of the same
+ * store — and the one that must render *nothing* until it has an answer.
+ */
+export function setClaudeCode(snapshot, { status = 'ready', error = '' } = {}) {
+  Object.assign(claudeCode, { snapshot, status, error, busy: false })
+}
+
+
+/* ------------------------------------------------------- boot retry ---- */
+
+/**
+ * Drive the store through a scripted boot sequence, and report what happened.
+ *
+ * This is the regression probe for the bug where the console stayed empty after
+ * login until a full page reload. The sequence is the real one, in one store
+ * with nothing reset in between:
+ *
+ *   1. the shell mounts and calls ensureLoaded with no session yet — a
+ *      login-required deployment answers 401 on every request;
+ *   2. the operator signs in and App.vue calls ensureLoaded again.
+ *
+ * Step 2 is the one that used to do nothing, because `booted` was set before the
+ * request in step 1 rather than after it. `statusFor(step)` decides the HTTP
+ * status of each step, so `[401, 200]` is exactly that story.
+ */
+export async function bootSequence({ statuses = [200] } = {}) {
+  const original = globalThis.fetch
+  let step = 0
+  const perStep = []
+  globalThis.fetch = async (url) => {
+    const path = String(url)
+    perStep[step] = perStep[step] || []
+    perStep[step].push(path)
+    const status = statuses[Math.min(step, statuses.length - 1)]
+    if (status !== 200) {
+      return { ok: false, status, text: async () => JSON.stringify({ error: 'unauthorized' }) }
+    }
+    let body = {}
+    if (path.includes('/api/chat/models')) body = { models: [], providers: [], tools: [] }
+    else if (path.includes('/api/chat/sessions/')) {
+      body = { session: { id: 's-1', title: 'one' }, messages: [], stats: {}, plan: null }
+    } else if (path.includes('/api/chat/sessions')) {
+      body = { sessions: [{ id: 's-1', title: 'one', updated_at: '2026-01-01T00:00:00Z' }] }
+    } else if (path.includes('/api/workspaces')) {
+      body = { workspaces: [{ name: 'proj', root: '/tmp/proj' }] }
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) }
+  }
+  // Exactly the state a page load starts from.
+  chat.booted = false
+  chat.catalog = null
+  chat.catalogStatus = 'loading'
+  chat.sessions = []
+  chat.sessionsStatus = 'loading'
+  chat.sessionsError = ''
+  chat.workspaces = []
+  chat.activeId = ''
+  chat.session = null
+
+  const steps = []
+  try {
+    for (step = 0; step < statuses.length; step++) {
+      await ensureLoaded()
+      steps.push({
+        booted: chat.booted,
+        sessions: chat.sessions.length,
+        workspaces: chat.workspaces.length,
+        requested: (perStep[step] || []).length,
+      })
+    }
+  } finally {
+    globalThis.fetch = original
+  }
+  return steps
+}
+
+/**
+ * Call ensureLoaded three times concurrently, as the shell, the chat view and
+ * the tab watcher do on mount, and report how many requests actually went out.
+ */
+export async function bootConcurrently() {
+  const original = globalThis.fetch
+  let hits = 0
+  globalThis.fetch = async (url) => {
+    hits++
+    const path = String(url)
+    let body = {}
+    if (path.includes('/api/chat/models')) body = { models: [], providers: [], tools: [] }
+    else if (path.includes('/api/chat/sessions/')) body = { session: { id: 's-1' }, messages: [], stats: {}, plan: null }
+    else if (path.includes('/api/chat/sessions')) body = { sessions: [{ id: 's-1', updated_at: '2026-01-01T00:00:00Z' }] }
+    else if (path.includes('/api/workspaces')) body = { workspaces: [{ name: 'proj', root: '/tmp/proj' }] }
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) }
+  }
+  chat.booted = false
+  chat.catalog = null
+  chat.sessions = []
+  chat.workspaces = []
+  chat.activeId = ''
+  chat.session = null
+  try {
+    await Promise.all([ensureLoaded(), ensureLoaded(), ensureLoaded()])
+  } finally {
+    globalThis.fetch = original
+  }
+  return { hits, booted: chat.booted, sessions: chat.sessions.length }
+}
+
+/**
+ * Boot with the model catalog refused but the session list readable, then retry
+ * as the 模型目录 banner's 重试 button does.
+ *
+ * The two requests can disagree: booted says "the session list was read", and the
+ * catalog is a separate load. A guard that returned on `booted` alone would make
+ * that banner's 重试 a no-op and leave the pane without a model list forever —
+ * which is why this probe asserts on the second call's request count, not just
+ * on `booted`.
+ */
+export async function bootCatalogRetry() {
+  const original = globalThis.fetch
+  let step = 0
+  const perStep = []
+  globalThis.fetch = async (url) => {
+    const path = String(url)
+    perStep[step] = perStep[step] || []
+    perStep[step].push(path)
+    // Only the first attempt's catalog request fails; the retry gets it.
+    if (path.includes('/api/chat/models') && step === 0) {
+      return { ok: false, status: 500, text: async () => JSON.stringify({ error: 'boom' }) }
+    }
+    let body = {}
+    if (path.includes('/api/chat/models')) body = { models: [{ id: 'm-1' }], providers: [], tools: [] }
+    else if (path.includes('/api/chat/sessions/')) body = { session: { id: 's-1' }, messages: [], stats: {}, plan: null }
+    else if (path.includes('/api/chat/sessions')) body = { sessions: [{ id: 's-1', updated_at: '2026-01-01T00:00:00Z' }] }
+    else if (path.includes('/api/workspaces')) body = { workspaces: [{ name: 'proj', root: '/tmp/proj' }] }
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) }
+  }
+  chat.booted = false
+  chat.catalog = null
+  chat.catalogStatus = 'loading'
+  chat.catalogError = ''
+  chat.sessions = []
+  chat.sessionsStatus = 'loading'
+  chat.workspaces = []
+  chat.activeId = ''
+  chat.session = null
+  const steps = []
+  try {
+    for (step = 0; step < 2; step++) {
+      await ensureLoaded()
+      steps.push({
+        booted: chat.booted,
+        catalog: chat.catalog ? (chat.catalog.models || []).length : 0,
+        catalogStatus: chat.catalogStatus,
+        requested: (perStep[step] || []).length,
+      })
+    }
+  } finally {
+    globalThis.fetch = original
+  }
+  return steps
 }

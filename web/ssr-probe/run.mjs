@@ -12,26 +12,37 @@ import {
   approvalHelpers,
   approvalPending,
   applyAskEvent,
+  artifactChip,
+  artifactHelpers,
   askCardAnswer,
   captureApprovalRequest,
   captureAnswerRequest,
   askCardFromEvent,
   askCardFromTool,
+  bootCatalogRetry,
+  bootConcurrently,
+  bootSequence,
+  createSessionWithPlan,
   gateNeedsLogin,
   messageSteps,
   nestedOf,
   planHelpers,
   planState,
   renderApprovalCard,
+  renderArtifactsDrawer,
+  renderArtifactsView,
   renderAskUserCard,
   renderBudgetPanel,
   renderChatHeader,
+  renderClaudeCodePanel,
   renderDirPicker,
   renderLogin,
   renderMessageBubble,
   renderModelPanel,
   renderSidebar,
   renderSubagentsDrawer,
+  setArtifacts,
+  setClaudeCode,
   setSubagents,
   subagentChip,
   renderTaskBoard,
@@ -786,6 +797,34 @@ check(
   JSON.stringify(afterOpen),
 )
 
+// 新对话＝新任务清单：新建出来的对话还没有任何一轮，所以它不可能有计划。上一个
+// 对话的计划留在 store 里，看板就会挂在一个空对话的输入框上方，写着上一个对话还
+// 没干完的活。断言落在两处——store（原因）与渲染出的 HTML（用户真正看到的东西）。
+const createdWithPlan = await createSessionWithPlan({ existing: planFixture })
+check('creating a conversation succeeds', createdWithPlan.created === true)
+check(
+  'a new conversation starts with no board',
+  createdWithPlan.plan === null,
+  JSON.stringify(createdWithPlan.plan),
+)
+check(
+  'the new conversation renders no board at all',
+  !createdWithPlan.html.includes('plan-') && !createdWithPlan.html.includes('把 chat 的失败续跑做出来'),
+  createdWithPlan.html.slice(0, 120),
+)
+check('the new conversation is the active one', createdWithPlan.activeId === 's-new')
+
+// 反过来：创建失败时人还留在原会话上，那份计划是他的「继续执行」接续点，清掉等于
+// 把还能接着做的那件事也一起抹了。
+const createFailed = await createSessionWithPlan({ existing: planFixture, status: 500 })
+check('a failed create does not switch conversations', createFailed.activeId === 's-old')
+check(
+  'a failed create keeps the plan it never left',
+  createFailed.plan !== null && createFailed.plan.tasks.length === 5,
+  JSON.stringify(createFailed.plan),
+)
+check('a failed create says so', createFailed.actionError !== '', createFailed.actionError)
+
 // 服务端广播的空计划（新请求开始时清掉上一件事的计划）也必须让看板消失。
 const cleared = normalizePlan({ revision: 3, tasks: [] })
 check('an empty plan event means no board', cleared === null)
@@ -1012,6 +1051,130 @@ setSubagents([{ id: 'sa-9', name: 'x', prompt: 'y', status: 'ok', steps: 1, dura
   { running: 0, maxConcurrent: 2, runningAll: 0 })
 check('an idle chip counts records', subagentChip().label.includes('1 个子 agent 记录'))
 
+
+/* --------------------------------------------------------------- 产物 -- */
+
+// The drawer that answers "what did this conversation produce". Three things it
+// must get right, and all three are about honesty rather than layout: an empty
+// list explains what 产物 are instead of showing nothing, the link on a row is the
+// only way to the bytes (they are not in the workspace), and a deployment with the
+// feature off explains itself rather than looking broken.
+
+setArtifacts([], { sessionId: 'sess-1' })
+html = await renderArtifactsDrawer()
+check('an empty drawer explains what artifacts are for', html.includes('这个对话还没有产物'))
+check('the empty state names the tool that saves one', html.includes('save_artifact'))
+
+const stamp = new Date().toISOString()
+setArtifacts([
+  {
+    id: 'ar-2', session_id: 'sess-1', title: '巡检报告', kind: 'html',
+    path: 'sess-1/1770000000-巡检报告.html', mime: 'text/html', bytes: 24576,
+    source: 'save_artifact', created_at: stamp,
+    url: '/api/artifacts/files/sess-1/1770000000-巡检报告.html',
+  },
+  {
+    id: 'ar-1', session_id: 'sess-1', title: '', kind: 'image',
+    path: 'sess-1/1770000001-chart.png', mime: 'image/png', bytes: 4096,
+    created_at: stamp,
+    url: '/api/artifacts/files/sess-1/1770000001-chart.png',
+  },
+], { sessionId: 'sess-1' })
+html = await renderArtifactsDrawer()
+check('a row shows its title', html.includes('巡检报告'))
+check('a row with no title falls back to its file name', html.includes('1770000001-chart.png'))
+check('a row is labelled by kind', html.includes('网页') && html.includes('图片'))
+check('a row states its size', html.includes('24 KB'))
+// The link is the point of the drawer: without it there is no way to the bytes.
+check('a row links to the served file', html.includes('/api/artifacts/files/sess-1/1770000000-巡检报告.html'))
+check('a row can be downloaded', html.includes('download'))
+// Deleting is the one destructive thing here, so it must ask first.
+check('deleting is not a one-click action', !html.includes('确认删除') && html.includes('从列表和硬盘上删除'))
+
+setArtifacts([], { enabled: false, message: '产物功能未启用：请设置 tools.artifacts.enable=true', sessionId: 'sess-1' })
+html = await renderArtifactsDrawer()
+check('a disabled deployment explains itself', html.includes('当前部署未启用产物'))
+check('the reason the server gave is shown', html.includes('tools.artifacts.enable=true'))
+
+// The button's facts come from the same store as the drawer.
+setArtifacts([{ id: 'ar-1', kind: 'html', path: 'a.html', bytes: 1 }], { sessionId: 'sess-1' })
+check('the button counts the artifacts of this conversation', artifactChip().count === 1)
+check('the button says what it counts', artifactChip().label === '1 个产物')
+check('the button points at 产物中心 for everything else', artifactChip().hint.includes('产物中心'))
+
+// The listing rules 产物中心 renders from: a session cell that is never blank, and
+// a size total that does not pretend a missing number is a number.
+const artifactRules = artifactHelpers()
+const listing = [
+  { id: 'a', kind: 'html', session_id: 's1', session_title: '巡检', bytes: 10 },
+  { id: 'b', kind: 'image', session_id: '', bytes: 5 },
+]
+check('a session with a title shows it', artifactRules.sessionLabel(listing[0]) === '巡检')
+check('an artifact from a one-shot run says so', artifactRules.sessionLabel(listing[1]) === '—')
+check('the kind filter keeps only that kind', artifactRules.filterArtifacts(listing, { kind: 'image' }).length === 1)
+check('the size total adds up', artifactRules.totalBytes(listing) === 15)
+
+// 产物中心 renders at all, and its controls are there. This is deliberately a
+// weak assertion: the panel loads its list in onMounted, which SSR never runs, so
+// this can only see the empty state. It would NOT have caught the bug that left
+// the panel showing a count and no rows — nothing rendered in Node touches the
+// row template. That bug is caught statically instead, by
+// check-component-bindings.mjs, and end to end by
+// web/.verify/artifacts-view-verify.mjs against a real browser.
+html = await renderArtifactsView()
+check('产物中心 renders its filter bar', html.includes('会话过滤'))
+check('产物中心 renders the kind filter', html.includes('按类型过滤'))
+check('产物中心 explains an empty server', html.includes('还没有任何会话保存过产物'))
+
+
+// 11. The boot load, and the one invariant that made the console look empty
+//     until a full page reload: a load that failed must leave the store able to
+//     try again. The sequence is the real one, in one store — the 401 the shell
+//     collects before the operator signs in (the probe has not even answered, so
+//     the console fires them anyway), then the same call App.vue makes once the
+//     login succeeded.
+let [beforeLogin, afterLogin] = await bootSequence({ statuses: [401, 200] })
+check('a refused boot reads nothing', beforeLogin.sessions === 0 && beforeLogin.workspaces === 0, JSON.stringify(beforeLogin))
+check('a refused boot does not count as booted', beforeLogin.booted === false, JSON.stringify(beforeLogin))
+check('the retry after login reads the session list', afterLogin.sessions === 1, JSON.stringify(afterLogin))
+check('the retry after login reads the workspaces too', afterLogin.workspaces === 1, JSON.stringify(afterLogin))
+check('the retry after login settles the boot', afterLogin.booted === true, JSON.stringify(afterLogin))
+
+// The regression itself: with `booted` set before the request instead of after
+// it, the login-time call is a no-op and the console stays empty. This is the
+// assertion that fails on that version.
+check(
+  'a failed boot does not spend the one shot',
+  afterLogin.sessions === 1 && afterLogin.requested > 0,
+  `afterLogin=${JSON.stringify(afterLogin)}`,
+)
+
+// A failure that is not an auth failure (server down, 500) has to stay
+// retryable for the same reason: the 重试 buttons call this again.
+const [down, recovered] = await bootSequence({ statuses: [500, 200] })
+check('a 500 boot stays retryable', down.booted === false && recovered.sessions === 1, JSON.stringify([down, recovered]))
+
+// The shell, the chat view and the tab watcher all ask on mount: one round of
+// requests, not three.
+const concurrent = await bootConcurrently()
+check('concurrent boots share one load', concurrent.hits === 4, `hits=${concurrent.hits}`)
+check('a shared boot still lands', concurrent.booted === true && concurrent.sessions === 1)
+
+// A boot can half-succeed: the session list is read (so `booted` is true) while
+// the catalog request fails, which is the state the 模型目录 banner reports. Its
+// 重试 button calls ensureLoaded, so that call still has to fetch the catalog —
+// a guard that returned on `booted` alone would make it a no-op and the pane
+// would stay without a model list.
+const [halfBoot, catalogRetried] = await bootCatalogRetry()
+check('a boot with no catalog counts as booted', halfBoot.booted === true, JSON.stringify(halfBoot))
+check('a boot with no catalog says so', halfBoot.catalogStatus === 'error', JSON.stringify(halfBoot))
+check('the catalog 重试 is not a no-op', catalogRetried.requested > 0, JSON.stringify(catalogRetried))
+check(
+  'the catalog 重试 actually loads the catalog',
+  catalogRetried.catalog === 1 && catalogRetried.catalogStatus === 'ready',
+  JSON.stringify(catalogRetried),
+)
+
 /* -------------------------------------------- 设置 → 模型 (window, capabilities) -- */
 
 // The window size and the capability set have to be visible where the models are
@@ -1091,6 +1254,299 @@ check('an idle chip counts records', subagentChip().label.includes('1 个子 age
   check('the footer says where to change a window', html.includes('模型管理'), '')
 }
 
+/* ------------------------------------ ClaudeCode 兼容模式（面板 + 徽标） -- */
+
+// 15. The mode that makes this agent run on Claude Code's own model configuration.
+//     The probe exists for the four facts this panel could quietly get wrong, all of
+//     them consequences rather than layout:
+//
+//       * the switch overrides the model of *every* conversation — the panel has to
+//         say so, twice, because it reaches conversations the reader is not looking at;
+//       * the token is masked, and an env row marked `secret` must not print the key
+//         it was given even when the server does send one;
+//       * an event or handler this agent cannot dispatch is never shown as working;
+//       * and the sidebar badge, which reads the same store, must render nothing at
+//         all until that store has an answer — a wrong 本机模式 next to a running
+//         conversation is the one thing it must never flash.
+{
+  const ccStatus = {
+    mode: 'claudecode',
+    compat: true,
+    available: true,
+    settings_path: '/Users/huan/.claude/settings.json',
+    settings_found: true,
+    settings_error: '',
+    settings_mtime: '2026-09-19T07:08:00Z',
+    loaded_at: '2026-09-19T07:09:12Z',
+    provider_id: 'claudecode',
+    model: {
+      kind: 'anthropic-messages',
+      base_url: 'https://api.deepseek.com/anthropic',
+      auth_style: 'bearer',
+      auth_header: 'Authorization: Bearer',
+      token_masked: 'sk-4f94…2f10',
+      has_token: true,
+      model: 'deepseek-flash[1m]',
+      opus_model: 'deepseek-flash[1m]',
+      sonnet_model: 'deepseek-flash[1m]',
+      haiku_model: 'deepseek-flash',
+      subagent_model: 'deepseek-flash',
+      effort: 'max',
+      auto_compact_window: '786432',
+      effective_model: 'deepseek-flash[1m]',
+      ready: true,
+      problem: '',
+    },
+    native: { provider: 'deepseek', model: 'deepseek-chat' },
+    env: [
+      {
+        key: 'ANTHROPIC_BASE_URL', value: 'https://api.deepseek.com/anthropic',
+        secret: false, used: true, note: '模型端点',
+      },
+      {
+        // The full key on purpose: a secret row must never render what it was given.
+        key: 'ANTHROPIC_AUTH_TOKEN', value: 'sk-live-abcdefghijklmnop',
+        secret: true, used: true, note: '鉴权 token',
+      },
+      { key: 'SOME_UNUSED', value: 'x', secret: false, used: false, note: '本 agent 不读' },
+    ],
+    hooks: {
+      enabled: true,
+      settings_disable_all: false,
+      supported_events: ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop'],
+      configured_events: 5,
+      total_handlers: 12,
+      unsupported_configured: ['Notification'],
+      events: [
+        {
+          event: 'PreToolUse',
+          supported: true,
+          groups: [
+            {
+              matcher: 'Bash',
+              handlers: [
+                {
+                  type: 'command', command: '/Users/huan/.claude/hooks/log-hook.sh',
+                  args: ['matcher=Bash'], timeout: 10, async: false, if: '',
+                  url: '', mcp_server: '', mcp_tool: '',
+                  summary: 'command /Users/huan/.claude/hooks/log-hook.sh（10s）', unsupported: '',
+                },
+                {
+                  type: 'prompt', command: '', args: [], timeout: 0, async: false, if: '',
+                  url: '', mcp_server: '', mcp_tool: '', summary: 'prompt 校验这段命令',
+                  unsupported: '本 agent 暂未接入 prompt 类型',
+                },
+              ],
+            },
+          ],
+        },
+        {
+          // Configured in settings.json, no trigger point here: never shown as working.
+          event: 'Notification',
+          supported: false,
+          groups: [
+            {
+              matcher: '',
+              handlers: [
+                {
+                  type: 'command', command: '/usr/local/bin/notify', args: [], timeout: 5,
+                  async: false, if: '', url: '', mcp_server: '', mcp_tool: '',
+                  summary: 'command /usr/local/bin/notify（5s）', unsupported: '',
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    hook_log: [
+      {
+        at: '2026-09-19T07:10:00Z', event: 'PreToolUse', matcher: 'Bash', value: 'Bash',
+        handler: 'command', command: '/Users/huan/.claude/hooks/log-hook.sh',
+        session_id: 'sess-abcdefghijklmnop', tool_name: 'Bash', duration_ms: 34,
+        exit_code: 0, blocked: false, reason: '', error: '',
+      },
+      {
+        at: '2026-09-19T07:10:05Z', event: 'PreToolUse', matcher: 'Bash', value: 'Bash',
+        handler: 'command', command: '/Users/huan/.claude/hooks/guard.sh',
+        session_id: 'sess-abcdefghijklmnop', tool_name: 'Bash', duration_ms: 12,
+        exit_code: 2, blocked: true, reason: 'rm -rf 被拦截', error: '',
+      },
+      {
+        at: '2026-09-19T07:10:09Z', event: 'PostToolUse', matcher: '', value: '',
+        handler: 'command', command: '/Users/huan/.claude/hooks/async.sh',
+        session_id: 'sess-abcdefghijklmnop', tool_name: '', duration_ms: 0,
+        exit_code: -1, blocked: false, reason: '', error: '',
+      },
+      {
+        at: '2026-09-19T07:10:12Z', event: 'Stop', matcher: '', value: '',
+        handler: 'http', command: '', session_id: 'sess-abcdefghijklmnop', tool_name: '',
+        duration_ms: 128, exit_code: 7, blocked: false, reason: '', error: '连接超时',
+      },
+    ],
+  }
+
+  // --- the switch -------------------------------------------------------
+
+  html = await renderClaudeCodePanel(ccStatus)
+  const seg = /<div class="seg"[^>]*>([\s\S]*?)<\/div>/.exec(html)
+  check('the panel names the mode it is in', html.includes('ClaudeCode 兼容'), html.slice(0, 120))
+  check('a runnable mode leaves the switch enabled', seg && !seg[1].includes('disabled'), seg ? seg[1] : 'no seg')
+  check(
+    'the panel says the mode overrides every conversation',
+    html.includes('所有对话') && html.includes('deepseek-flash[1m]'),
+    '',
+  )
+  check('the panel says what turning it off restores', html.includes('deepseek-chat'), '')
+
+  // The token, in both places it appears: the resolved config and an env row. The
+  // masked form is all the server sends for the model, but an env row carries the
+  // file's own value — and a page that printed it would leak the key into every
+  // browser that ever opens this tab.
+  check('the resolved token is shown masked', html.includes('sk-4f94…2f10'), '')
+  check(
+    'a secret env row never renders the key it was given',
+    !html.includes('sk-live-abcdefghijklmnop'),
+    html.includes('sk-live-abcdefghijklmnop') ? 'the full token reached the page' : '',
+  )
+  check('a secret env row is masked like the token', html.includes('sk-liv…mnop'), '')
+  check('an env row nobody reads says so', html.includes('未使用'), '')
+
+  // --- hooks ------------------------------------------------------------
+
+  check(
+    'the five trigger points each explain themselves',
+    html.includes('新建 / 恢复对话时') &&
+      html.includes('用户消息提交前') &&
+      html.includes('每次工具调用前（可以阻止）') &&
+      html.includes('工具调用之后') &&
+      html.includes('一轮回答结束时'),
+    '',
+  )
+  check('a handler that will run shows its command', html.includes('log-hook.sh'), '')
+  check('a handler that will run shows its timeout', html.includes('10s 超时'), '')
+  check(
+    'a handler this agent cannot run says so',
+    html.includes('不会运行') && html.includes('本 agent 暂未接入 prompt 类型'),
+    '',
+  )
+  check(
+    'an event with no trigger point is never shown as working',
+    html.includes('Notification') && html.includes('未接入（本 agent 无触发点）'),
+    '',
+  )
+  check('a supportable event with nothing configured says that too', html.includes('未配置处理程序'), '')
+
+  // --- 运行记录 ---------------------------------------------------------
+
+  check('a hook that ran is recorded with its duration', html.includes('exit 0') && html.includes('34ms'), '')
+  check(
+    'a blocked call is marked as a decision, not a failure',
+    html.includes('已阻止') && html.includes('rm -rf 被拦截'),
+    '',
+  )
+  check('a background handler is marked as such', html.includes('后台'), '')
+  check(
+    'a failed handler shows its exit code and its error',
+    html.includes('失败 exit 7') && html.includes('连接超时'),
+    '',
+  )
+  check('a background handler is not counted as a failure', !html.includes('失败 exit -1'), '')
+
+  // --- states -----------------------------------------------------------
+
+  html = await renderClaudeCodePanel(undefined)
+  check('a mode not read yet shows a loading state', html.includes('加载中…'), html.slice(0, 100))
+
+  html = await renderClaudeCodePanel(undefined, { status: 'error', error: '无法连接到服务器' })
+  check(
+    'a failed read renders through AsyncBlock with a retry',
+    html.includes('无法连接到服务器') && html.includes('重试'),
+    html.slice(0, 160),
+  )
+
+  // The mode off: hooks are not dispatched, and the panel has to say why rather than
+  // showing a list that reads as live.
+  html = await renderClaudeCodePanel({
+    ...ccStatus,
+    mode: 'native',
+    compat: false,
+    hooks: { ...ccStatus.hooks, enabled: false },
+    hook_log: [],
+  })
+  check('the mode off reads as 本机模式', html.includes('本机模式'), '')
+  check(
+    'hooked events are explained as not running while the mode is off',
+    html.includes('兼容模式没打开，所以 hooks 不派发'),
+    '',
+  )
+  check('the resolved model is still shown while the mode is off', html.includes('deepseek-flash[1m]'), '')
+  check('a process with no hook runs explains the empty list', html.includes('本进程还没有 hook 运行记录'), '')
+
+  // Nothing to turn on: the switch is disabled, and the reason is the server's.
+  html = await renderClaudeCodePanel({
+    ...ccStatus,
+    compat: false,
+    available: false,
+    settings_found: false,
+    settings_error: 'settings.json 不是合法的 JSON：unexpected end of input',
+    hook_log: [],
+  })
+  const deadSeg = /<div class="seg"[^>]*>([\s\S]*?)<\/div>/.exec(html)
+  check(
+    'nothing to turn on disables the switch',
+    deadSeg && (deadSeg[1].match(/disabled/g) || []).length === 2,
+    deadSeg ? deadSeg[1] : 'no seg',
+  )
+  check(
+    'the reason it cannot be turned on is the server\'s',
+    html.includes('不是合法的 JSON'),
+    '',
+  )
+
+  // Claude Code's own kill switch, and a file edited after the last read: both are
+  // "my hook is configured and does nothing" seen from the other side.
+  html = await renderClaudeCodePanel({
+    ...ccStatus,
+    settings_mtime: '2026-09-19T07:40:00Z',
+    hooks: { ...ccStatus.hooks, settings_disable_all: true },
+  })
+  check('disableAllHooks is stated where it is read', html.includes('disableAllHooks'), '')
+  check(
+    'a file changed after the last read says to re-read it',
+    html.includes('文件在最后一次读取之后又改过'),
+    '',
+  )
+
+  // --- the sidebar badge ------------------------------------------------
+
+  // Before the probe answers, nothing renders: 本机模式 there would be a claim about
+  // every conversation in the list below it.
+  setClaudeCode(null, { status: 'loading' })
+  html = await renderSidebar()
+  check('an unanswered probe renders no mode badge', !html.includes('side-mode'), '')
+  check('an unanswered probe never claims 本机模式', !html.includes('本机模式'), '')
+
+  setClaudeCode({ ...ccStatus, compat: false, mode: 'native' })
+  html = await renderSidebar()
+  check('the badge names 本机模式 when the mode is off', html.includes('本机模式'), '')
+  check('the badge names the model the last message ran on', html.includes('deepseek-chat'), '')
+
+  setClaudeCode(ccStatus)
+  html = await renderSidebar()
+  check('the badge names ClaudeCode 兼容 when it is on', html.includes('ClaudeCode 兼容'), '')
+  check(
+    'the badge leads with the model the mode actually runs',
+    html.includes('deepseek-flash[1m]') && !html.includes('deepseek-chat'),
+    '',
+  )
+
+  // A read that failed is stated rather than hidden: a badge that disappeared would
+  // read as "nothing to see here".
+  setClaudeCode(null, { status: 'error', error: '无法连接到服务器，请确认服务正在运行' })
+  html = await renderSidebar()
+  check('a failed mode read shows as unknown', html.includes('模式未知'), '')
+}
+
 console.log(failures === 0 ? '\nALL PROBES PASSED' : `\n${failures} PROBE(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)
-

@@ -1,24 +1,39 @@
-// Guard against a silent Vue bug: in <script setup>, a setup binding that shares a
-// name with a prop wins in the template. So `v-if="open"` where `open` is also a
-// function declared in the script compiles to the *function* — always truthy —
-// and the component renders when it should not and ignores the prop forever.
+// Guard against two silent Vue bugs in <script setup> that no type check, build
+// or linter can see, because both are invisible until the component renders.
 //
-// It is invisible to the type system, to the build and to any test that does not
-// render the component, so it is checked here instead:
+//   node scripts/check-component-bindings.mjs
 //
-//     node scripts/check-component-bindings.mjs
+// 1. A setup binding that shares a name with a prop wins in the template. So
+//    `v-if="open"` where `open` is also a function declared in the script
+//    compiles to the *function* — always truthy — and the component renders when
+//    it should not and ignores the prop forever. (Not hypothetical: the
+//    directory picker shipped with exactly this bug, which is what this half of
+//    the check was written for.)
 //
-// (This is not hypothetical: the directory picker shipped with exactly this bug,
-// which is what the check was written for.)
-// Finds setup bindings whose name collides with a prop name: in <script setup>
-// the binding wins in the template, so `v-if="open"` silently becomes a function
-// reference (always truthy) instead of reading the prop.
+// 2. A template that references a name the script never bound. It compiles to
+//    `_ctx.<name>`, builds cleanly, and throws only when the branch that uses it
+//    renders — `TypeError: _ctx.shortId is not a function`. The dynamic
+//    `_ctx[...]` fallback is Vue's intended escape hatch for global properties,
+//    but nothing in this app registers one, so every such reference is a typo or
+//    a forgotten import. (Not hypothetical either: 产物中心 referenced `shortId`
+//    without importing it, so the panel rendered its counts and then threw
+//    before the first row — the list came out empty with only a number showing.)
+//
+// Both halves compile the real SFC with the same binding metadata the build
+// uses, so the check sees what the bundler sees rather than guessing at the
+// source text.
 import fs from 'node:fs'
 import path from 'node:path'
-import { parse, compileScript } from 'vue/compiler-sfc'
+import { parse, compileScript, compileTemplate } from 'vue/compiler-sfc'
 
 const dir = 'src/components'
 let found = 0
+
+// Vue's own instance properties ($slots, $attrs, $emit, …) resolve through the
+// render context and are legitimately absent from the setup bindings. Anything
+// else reaching `_ctx.` is unbound.
+const isBuiltin = (name) => name.startsWith('$')
+
 for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.vue'))) {
   const file = path.join(dir, f)
   const src = fs.readFileSync(file, 'utf8')
@@ -35,7 +50,6 @@ for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.vue'))) {
   }
   const arr = script.match(/defineProps\(\[([^\]]*)\]\)/)
   if (arr) for (const m of arr[1].matchAll(/['"]([^'"]+)['"]/g)) props.add(m[1])
-  if (!props.size) continue
 
   const bindings = new Set()
   for (const m of script.matchAll(/^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)/gm)) bindings.add(m[1])
@@ -61,5 +75,37 @@ for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.vue'))) {
       console.log(`PROP-CALL ${file}: the template calls prop "${name}" as a function`)
     }
   }
+
+  // The unbound-identifier rule. Compile the template exactly as the build does
+  // — with the script's binding metadata — and look at what the compiler could
+  // not resolve to a binding, which it emits as `_ctx.<name>`.
+  if (!descriptor.template) continue
+  let compiled
+  try {
+    const compiledScript = compileScript(descriptor, { id: 'bindings-check', inlineTemplate: false })
+    compiled = compileTemplate({
+      source: descriptor.template.content,
+      filename: file,
+      id: 'bindings-check',
+      compilerOptions: { bindingMetadata: compiledScript.bindings, prefixIdentifiers: true },
+    })
+  } catch (err) {
+    found++
+    console.log(`COMPILE ${file}: ${err.message}`)
+    continue
+  }
+
+  const unresolved = new Set(
+    [...compiled.code.matchAll(/_ctx\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]).filter((n) => !isBuiltin(n)),
+  )
+  for (const name of [...unresolved].sort()) {
+    found++
+    console.log(
+      `UNBOUND ${file}: the template uses "${name}", which the script never binds ` +
+        `(compiles to _ctx.${name} and throws when that branch renders)`,
+    )
+  }
 }
-console.log(found === 0 ? 'no prop/setup-binding collisions' : `${found} collision(s)`)
+
+console.log(found === 0 ? 'no prop/setup-binding collisions, no unbound template identifiers' : `${found} problem(s)`)
+process.exit(found === 0 ? 0 : 1)
