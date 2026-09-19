@@ -35,6 +35,12 @@ type Store interface {
 	ListModels(ctx context.Context, providerID string) ([]Model, error)
 	GetModel(ctx context.Context, providerID, modelID string) (Model, error)
 	DeleteModel(ctx context.Context, providerID, modelID string) error
+	// SetModelContextWindow records a model's context window and where the
+	// number came from (see ModelWindowSource*). A zero value clears it.
+	SetModelContextWindow(ctx context.Context, providerID, modelID string, tokens int, source string) error
+	// ModelContextWindows returns every recorded window, keyed by model id. It
+	// is what an agent turn sizes its in-loop window from.
+	ModelContextWindows(ctx context.Context) (map[string]int, error)
 
 	// LatestSessionModel reports the most recently used conversation's model.
 	LatestSessionModel(ctx context.Context) (provider, model string, ok bool)

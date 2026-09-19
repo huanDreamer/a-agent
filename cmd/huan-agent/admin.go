@@ -170,7 +170,11 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 		logger.Warn("web chat disabled: the default model is not a chat model")
 		return server.ChatDeps{}, "", ""
 	}
-	condenser, err := turnCondenser(cfg, chatModel, logger, defModel)
+	// The resolver carries the catalog's recorded windows, so a model whose
+	// provider published one (or answered when asked) is sized from that rather
+	// than from the built-in table.
+	windowSpec := windowSpecFor(cfg, st, logger)
+	condenser, err := turnCondenser(cfg, chatModel, logger, defModel, windowSpec)
 	if err != nil {
 		// Not fatal: a turn with an unbounded window still works, it just costs
 		// more the longer it runs.
@@ -216,7 +220,7 @@ func buildChatDeps(cfg *config.Config, tracer chat.Tracer, st store.Store,
 		Condenser:  condenser,
 		// Per-model: the condenser follows the conversation's model, so a session
 		// on a big-window model is not compressed as if it were on a small one.
-		CondenserFor: turnCondenserFactory(cfg, logger),
+		CondenserFor: turnCondenserFactory(cfg, logger, windowSpec),
 		// The in-turn loop guard and the bound on one tool result as the model
 		// sees it. Both are what keep a long turn from spending its whole budget
 		// exploring: see internal/chat/progress.go.
@@ -482,7 +486,7 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	// because the resolution needs the model table and the config, and the server
 	// should not have to know either: it reports the number and where it came
 	// from.
-	contextCap, contextAuto, contextModel := contextBudgetForPanel(cfg, metaModel)
+	contextCap, contextAuto, contextModel := contextBudgetForPanel(cfg, metaModel, windowSpecFor(cfg, st, logger))
 
 	srv, err := server.New(server.Config{
 		Host:                    cfg.Server.Host,
@@ -552,7 +556,7 @@ func runAdminServe(cmd *cobra.Command, _ []string) error {
 	if cfg.LLM.AutoRefreshModels {
 		ttl := cfg.LLM.ModelsCacheTTL()
 		go func() {
-			results := server.RefreshStaleModels(ctx, st, logger, ttl)
+			results := srv.RefreshStaleModels(ctx, ttl)
 			if len(results) == 0 {
 				return
 			}

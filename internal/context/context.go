@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -85,13 +86,122 @@ type Summarizer interface {
 // Estimator estimates the token count of a message list.
 type Estimator func(msgs []*schema.Message) int
 
-// DefaultEstimator approximates tokens as characters/4 (typical for English
-// and reasonable for code). CJK text is denser, so this over-counts slightly,
-// which errs toward earlier compression — an acceptable trade-off.
+// DefaultEstimator approximates the token count of a message list.
+//
+// It replaced `len(Content)/4` — bytes over four — after measuring that estimate
+// against a real long turn: across 383 steps of a session that mixed Chinese
+// prose, Go source and tool output, the provider's own count was 1.95× the
+// estimate (median). Two things were missing. A Chinese character is three bytes
+// but roughly one token, so dividing bytes by four under-counts CJK by a factor
+// of three; and tool-call arguments were not counted at all.
+//
+// Being wrong in that direction is the expensive one: the condenser fires late,
+// the window runs at the provider's real limit, and the turn ends in a
+// context-limit error instead of a summary. So the estimate is deliberately
+// slightly pessimistic, and the schemas (which are resent every step and appear
+// in no message) are added by the caller — see EstimateSchemas.
 func DefaultEstimator(msgs []*schema.Message) int {
 	var total int
 	for _, m := range msgs {
-		total += len(m.Content)/4 + 4 // +4 header/role overhead
+		if m == nil {
+			continue
+		}
+		total += EstimateText(m.Content)
+		for _, tc := range m.ToolCalls {
+			// The arguments are JSON the provider tokenizes like any other text.
+			total += EstimateText(tc.Function.Arguments) + 8
+		}
+		if m.ToolCallID != "" {
+			total += 4
+		}
+		// Role, name and the per-message scaffolding every chat template adds.
+		total += 6
+	}
+	return total
+}
+
+// EstimateText approximates the tokens in one string.
+//
+// ASCII is about four characters to a token. A CJK character is one token (and
+// three bytes, which is why the old byte count was wrong), and everything else
+// non-ASCII — Cyrillic, accented Latin, emoji — is counted as half a token per
+// rune, which is close for the scripts a model is likely to see.
+func EstimateText(s string) int {
+	if s == "" {
+		return 0
+	}
+	var cjk, ascii, wide int
+	for _, r := range s {
+		switch {
+		case r < utf8.RuneSelf:
+			ascii++
+		case isCJK(r):
+			cjk++
+		default:
+			wide++
+		}
+	}
+	return cjk + wide*2/4 + ascii/4 + 1
+}
+
+// isCJK reports whether a rune belongs to a script a Chinese/Japanese/Korean
+// tokenizer emits one token per character for.
+func isCJK(r rune) bool {
+	switch {
+	case r >= 0x1100 && r <= 0x115F: // Hangul Jamo
+		return true
+	case r >= 0x2E80 && r <= 0x303E: // CJK radicals, Kangxi, punctuation
+		return true
+	case r >= 0x3041 && r <= 0x33FF: // kana, CJK compatibility
+		return true
+	case r >= 0x3400 && r <= 0x4DBF: // CJK ext A
+		return true
+	case r >= 0x4E00 && r <= 0x9FFF: // CJK unified
+		return true
+	case r >= 0xA000 && r <= 0xA4CF: // Yi
+		return true
+	case r >= 0xAC00 && r <= 0xD7A3: // Hangul syllables
+		return true
+	case r >= 0xF900 && r <= 0xFAFF: // CJK compatibility ideographs
+		return true
+	case r >= 0xFE30 && r <= 0xFE4F: // CJK compatibility forms
+		return true
+	case r >= 0xFF00 && r <= 0xFF60: // fullwidth forms
+		return true
+	case r >= 0xFFE0 && r <= 0xFFE6:
+		return true
+	case r >= 0x20000 && r <= 0x3FFFD: // CJK ext B+
+		return true
+	}
+	return false
+}
+
+// ToolSchema is one tool definition as the model receives it.
+type ToolSchema struct {
+	Name        string
+	Description string
+	// ParametersJSON is the tool's parameter schema, as the JSON text that is
+	// sent. It is measured as text rather than by parsing it: eino's
+	// ParamsOneOf keeps its schema in unexported fields and its jsonschema
+	// marshaller drops most of a large schema, so a measurement taken through
+	// them silently reports a fraction of the real cost.
+	ParametersJSON string
+}
+
+// EstimateToolSchemas approximates what a turn's tool definitions cost.
+//
+// It is a separate function because the cost has a separate shape: the schemas
+// are not messages, so the estimator above never sees them, yet they are resent
+// on every single step — a thirty-tool turn carries several thousand tokens of
+// invisible context, which is enough to matter when a window is being filled to
+// a fraction of the model's limit.
+func EstimateToolSchemas(tools []ToolSchema) int {
+	if len(tools) == 0 {
+		return 0
+	}
+	total := 0
+	for _, t := range tools {
+		total += EstimateText(t.Name) + EstimateText(t.Description) + EstimateText(t.ParametersJSON) + 12
 	}
 	return total
 }
@@ -148,10 +258,20 @@ func (m *Manager) SetLog(fn func(string)) { m.logOnce = fn }
 // compression" arrives here as a call on a nil receiver, and the alternative to
 // returning false is taking the whole turn down.
 func (m *Manager) ShouldCompress(msgs []*schema.Message) bool {
+	return m.ShouldCompressWith(msgs, 0)
+}
+
+// ShouldCompressWith is ShouldCompress including the tokens the window carries
+// but the messages do not show: the tool schemas, which the provider counts on
+// every step.
+func (m *Manager) ShouldCompressWith(msgs []*schema.Message, overheadTokens int) bool {
 	if m == nil {
 		return false
 	}
-	return m.budget.MaxTokens > 0 && m.estimate(msgs) > m.budget.MaxTokens
+	if m.budget.MaxTokens <= 0 {
+		return false
+	}
+	return m.estimate(msgs)+overheadTokens > m.budget.MaxTokens
 }
 
 // Pin says which messages survive a compression pass verbatim, beyond the
@@ -186,8 +306,8 @@ func (m *Manager) Compress(ctx context.Context, msgs []*schema.Message) ([]*sche
 // It is the method chat.Condenser declares, which is what lets the runner depend
 // on the capability rather than on this package: a deployment with compression
 // switched off passes a nil Condenser instead of a manager that does nothing.
-func (m *Manager) CompressKeeping(ctx context.Context, msgs []*schema.Message, head int, pinLastUser bool) ([]*schema.Message, string, error) {
-	return m.CompressWith(ctx, msgs, Pin{Head: head, LastUser: pinLastUser})
+func (m *Manager) CompressKeeping(ctx context.Context, msgs []*schema.Message, head int, pinLastUser bool, overheadTokens int) ([]*schema.Message, string, error) {
+	return m.compress(ctx, msgs, Pin{Head: head, LastUser: pinLastUser}, overheadTokens)
 }
 
 // CompressWith reduces msgs exactly like Compress, except that the messages a
@@ -209,6 +329,11 @@ func (m *Manager) CompressKeeping(ctx context.Context, msgs []*schema.Message, h
 // fold one exchange less than asked, and in the tightest case returns msgs
 // unchanged — the caller's over-budget window is the better failure.
 func (m *Manager) CompressWith(ctx context.Context, msgs []*schema.Message, pin Pin) ([]*schema.Message, string, error) {
+	return m.compress(ctx, msgs, pin, 0)
+}
+
+// compress is CompressWith plus the invisible part of the window.
+func (m *Manager) compress(ctx context.Context, msgs []*schema.Message, pin Pin, overheadTokens int) ([]*schema.Message, string, error) {
 	// A nil receiver means "no compression configured", which is a supported
 	// state rather than a bug: see ShouldCompress.
 	if m == nil {
@@ -218,7 +343,7 @@ func (m *Manager) CompressWith(ctx context.Context, msgs []*schema.Message, pin 
 		// Compression disabled.
 		return msgs, "", nil
 	}
-	if !m.ShouldCompress(msgs) {
+	if !m.ShouldCompressWith(msgs, overheadTokens) {
 		return msgs, "", nil
 	}
 	// A local copy rather than a fix-up of the receiver: the manager is shared

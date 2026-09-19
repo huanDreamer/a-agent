@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/hertz/pkg/app"
 	"go.uber.org/zap"
 
@@ -25,6 +26,18 @@ const (
 	// over many slow providers always terminates. Individual fetches are bounded
 	// separately by providerFetchTimeout.
 	refreshPassTimeout = 90 * time.Second
+	// windowAskTimeout bounds one "what is your context window" probe.
+	windowAskTimeout = llm.DefaultWindowAskTimeout
+	// windowAskConcurrency is how many models are asked at once. Two: the probe
+	// is a real chat completion on a real (paid) endpoint, and a burst of them
+	// is a burst on the provider's rate limit for the sake of a number that
+	// nobody is waiting on.
+	windowAskConcurrency = 2
+	// windowAskBudget caps how many models one pass asks. A catalog can hold
+	// hundreds; the window of every one of them is not worth hundreds of model
+	// calls, and a pass that never finishes is worse than a column that fills in
+	// over a couple of refreshes.
+	windowAskBudget = 12
 )
 
 // modelSourceFetched mirrors the source value store.ReplaceFetchedModels writes.
@@ -102,7 +115,7 @@ func providerModelsStale(models []store.Model, ttl time.Duration) bool {
 // empty is a worse answer than stale, because a stale list still lets the
 // operator bind a capability while a network blip must not wipe their
 // configuration.
-func refreshProviderModels(ctx context.Context, st store.Store, logger *zap.Logger, p store.Provider) ([]store.Model, error) {
+func refreshProviderModels(ctx context.Context, st store.Store, logger *zap.Logger, p store.Provider, asker WindowAsker) ([]store.Model, error) {
 	if st == nil {
 		return nil, fmt.Errorf("server: refresh %q: no store configured", p.ID)
 	}
@@ -144,6 +157,13 @@ func refreshProviderModels(ctx context.Context, st store.Store, logger *zap.Logg
 			row.DisplayName = old.DisplayName
 			row.Enabled = old.Enabled
 		}
+		// A window the provider publishes is the number it will enforce, so it
+		// is recorded here and never overwritten by a guess: the store keeps
+		// whatever a listing does not mention.
+		if info.ContextWindow > 0 {
+			row.ContextWindow = info.ContextWindow
+			row.ContextWindowSource = store.ModelWindowSourceAPI
+		}
 		rows = append(rows, row)
 	}
 	if err := st.ReplaceFetchedModels(ctx, p.ID, rows); err != nil {
@@ -156,7 +176,101 @@ func refreshProviderModels(ctx context.Context, st store.Store, logger *zap.Logg
 	}
 	logger.Info("provider models refreshed",
 		zapString("provider", p.ID), zap.Int("models", len(saved)))
+
+	// The listing answered as far as it could; the rest is asked directly. A
+	// provider that publishes context_length (any of the big gateways) needs no
+	// probe at all, which is the common case and the reason this is a fallback.
+	if asker != nil {
+		fillModelWindows(ctx, st, logger, asker, saved, windowAskBudget)
+	}
+
+	// Read back again when something was learned, so the caller (and the
+	// console) sees the windows without a second round trip.
+	if asker != nil {
+		if after, aerr := st.ListModels(ctx, p.ID); aerr == nil {
+			return after, nil
+		}
+	}
 	return saved, nil
+}
+
+// WindowAsker answers what a model's context window is by asking it. It is an
+// interface rather than a *llm call so this package does not need a provider
+// client: the server implements it on top of the model builder, and a caller
+// with no builder passes nil and simply gets no probing.
+type WindowAsker interface {
+	AskContextWindow(ctx context.Context, provider, name string) (int, error)
+}
+
+// fillModelWindows asks the enabled models that have no recorded window.
+//
+// It is bounded three ways — how many models one pass asks, how many are in
+// flight, and how long one answer may take — because it spends real money on a
+// real endpoint for a number that is a hint. A model that does not answer (or
+// answers something implausible) is simply left without one: the built-in table
+// covers it, and the next refresh will ask again.
+func fillModelWindows(ctx context.Context, st store.Store, logger *zap.Logger, asker WindowAsker, models []store.Model, budget int) (asked, filled int) {
+	if asker == nil || st == nil {
+		return 0, 0
+	}
+	if budget <= 0 {
+		budget = windowAskBudget
+	}
+	pending := make([]store.Model, 0, budget)
+	for _, m := range models {
+		if !m.Enabled || m.ContextWindow > 0 {
+			continue
+		}
+		pending = append(pending, m)
+		if len(pending) == budget {
+			break
+		}
+	}
+	if len(pending) == 0 {
+		return 0, 0
+	}
+
+	sem := make(chan struct{}, windowAskConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, m := range pending {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(m store.Model) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			tokens, err := asker.AskContextWindow(ctx, m.ProviderID, m.ModelID)
+			mu.Lock()
+			asked++
+			mu.Unlock()
+			if err != nil {
+				logger.Debug("asking a model for its context window failed",
+					zapString("provider", m.ProviderID), zapString("model", m.ModelID), zapError(err))
+				return
+			}
+			if tokens <= 0 {
+				// The model said it does not know. Recorded as nothing rather
+				// than as a wrong number.
+				logger.Debug("a model did not know its context window",
+					zapString("provider", m.ProviderID), zapString("model", m.ModelID))
+				return
+			}
+			if serr := st.SetModelContextWindow(ctx, m.ProviderID, m.ModelID, tokens, store.ModelWindowSourceAsked); serr != nil {
+				logger.Warn("recording a model's context window failed",
+					zapString("provider", m.ProviderID), zapString("model", m.ModelID), zapError(serr))
+				return
+			}
+			mu.Lock()
+			filled++
+			mu.Unlock()
+			logger.Info("model context window recorded",
+				zapString("provider", m.ProviderID), zapString("model", m.ModelID),
+				zap.Int("context_window", tokens), zap.String("source", store.ModelWindowSourceAsked))
+		}(m)
+	}
+	wg.Wait()
+	return asked, filled
 }
 
 // setProviderError records the outcome of the last connection attempt. Failing
@@ -179,7 +293,7 @@ func setProviderError(ctx context.Context, st store.Store, logger *zap.Logger, i
 //
 // Every provider is isolated: one failure records its reason and continues, so a
 // broken key never stops the rest of a pass.
-func refreshProviderSet(ctx context.Context, st store.Store, logger *zap.Logger, targets []store.Provider) []ModelRefreshResult {
+func refreshProviderSet(ctx context.Context, st store.Store, logger *zap.Logger, targets []store.Provider, asker WindowAsker) []ModelRefreshResult {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -199,7 +313,7 @@ func refreshProviderSet(ctx context.Context, st store.Store, logger *zap.Logger,
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			models, err := refreshProviderModels(ctx, st, logger, p)
+			models, err := refreshProviderModels(ctx, st, logger, p, asker)
 			res := ModelRefreshResult{ProviderID: p.ID, OK: err == nil, ModelsCount: len(models)}
 			if err != nil {
 				res.Error = err.Error()
@@ -280,23 +394,43 @@ func sortProviders(providers []store.Provider) {
 // ----------------------------------------------------------------- the passes --
 
 // RefreshStaleModels refreshes every enabled provider with a key whose cached
-// model list is stale, and returns one result per provider it tried.
+// model list is stale, and then fills whatever context windows are still
+// missing.
 //
 // It is meant to be called from a goroutine at start-up (the caller must not
 // wait on it): a slow or unreachable provider can delay nothing but its own
 // result. The whole pass is bounded by refreshPassTimeout, and any failure is
 // recorded on the provider and logged at warn without stopping the pass.
-func RefreshStaleModels(ctx context.Context, st store.Store, logger *zap.Logger, ttl time.Duration) []ModelRefreshResult {
-	if st == nil || ttl <= 0 {
-		return nil
-	}
+func (s *Server) RefreshStaleModels(ctx context.Context, ttl time.Duration) []ModelRefreshResult {
+	logger := s.logger
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	passCtx, cancel := context.WithTimeout(ctx, refreshPassTimeout)
 	defer cancel()
 
-	targets, err := staleRefreshTargets(passCtx, st, ttl)
+	results := refreshStaleModels(passCtx, s.store, logger, ttl, s.windowAsker())
+
+	// The window is a separate question from the model list: a provider whose
+	// list is fresh can still have no windows recorded — a deployment that just
+	// upgraded to this version, or a provider that publishes none. This is the
+	// "初始化时问一遍" half, and it is skipped entirely when compression is off,
+	// because then nothing reads the number.
+	s.fillMissingWindows(passCtx, logger)
+	return results
+}
+
+// refreshStaleModels is the pass itself, without a Server: the parts that need
+// one are the asker (which needs a model builder) and the compression check, and
+// both are optional.
+func refreshStaleModels(ctx context.Context, st store.Store, logger *zap.Logger, ttl time.Duration, asker WindowAsker) []ModelRefreshResult {
+	if st == nil || ttl <= 0 {
+		return nil
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	targets, err := staleRefreshTargets(ctx, st, ttl)
 	if err != nil {
 		logger.Warn("model auto-refresh: cannot list stale providers", zapError(err))
 		return nil
@@ -306,7 +440,78 @@ func RefreshStaleModels(ctx context.Context, st store.Store, logger *zap.Logger,
 		return nil
 	}
 	logger.Info("model auto-refresh: refreshing stale providers", zap.Int("providers", len(targets)))
-	return refreshProviderSet(passCtx, st, logger, targets)
+	return refreshProviderSet(ctx, st, logger, targets, asker)
+}
+
+// fillMissingWindows asks the models that have no recorded context window, one
+// provider at a time, under a single pass-wide budget.
+//
+// The budget is shared rather than per provider so that adding providers does
+// not multiply the number of paid calls a startup makes.
+func (s *Server) fillMissingWindows(ctx context.Context, logger *zap.Logger) {
+	if s.store == nil {
+		return
+	}
+	asker := s.windowAsker()
+	if asker == nil {
+		return
+	}
+	// Compression off means nothing reads a window: no reason to spend a call.
+	if s.cfg.ContextMaxTokens <= 0 {
+		return
+	}
+	providers, err := refreshTargets(ctx, s.store)
+	if err != nil {
+		logger.Warn("model window fill: cannot list providers", zapError(err))
+		return
+	}
+	remaining := windowAskBudget
+	totalAsked, totalFilled := 0, 0
+	for _, p := range providers {
+		if remaining <= 0 || ctx.Err() != nil {
+			break
+		}
+		models, lerr := s.store.ListModels(ctx, p.ID)
+		if lerr != nil {
+			logger.Warn("model window fill: cannot list models", zapString("provider", p.ID), zapError(lerr))
+			continue
+		}
+		asked, filled := fillModelWindows(ctx, s.store, logger, asker, models, remaining)
+		remaining -= asked
+		totalAsked += asked
+		totalFilled += filled
+	}
+	if totalAsked > 0 {
+		logger.Info("model windows filled",
+			zap.Int("asked", totalAsked), zap.Int("recorded", totalFilled))
+	}
+}
+
+// windowAsker adapts the console's model builder into a WindowAsker.
+//
+// Nil when chat is disabled or no builder is wired: probing needs to construct a
+// real client for a real provider, and a deployment without one simply keeps the
+// built-in table.
+func (s *Server) windowAsker() WindowAsker {
+	if s.chat.Builder == nil {
+		return nil
+	}
+	return builderWindowAsker{builder: s.chat.Builder}
+}
+
+// builderWindowAsker asks a model, built on demand, what its window is.
+type builderWindowAsker struct{ builder ModelBuilder }
+
+func (a builderWindowAsker) AskContextWindow(ctx context.Context, provider, name string) (int, error) {
+	built, err := a.builder.Build(ctx, provider, name)
+	if err != nil {
+		return 0, err
+	}
+	cm, ok := built.(model.BaseChatModel)
+	if !ok {
+		return 0, fmt.Errorf("server: %q is not a chat model", name)
+	}
+	return llm.AskContextWindow(ctx, cm, windowAskTimeout)
 }
 
 // handleRefreshAllModels refreshes every enabled provider that has a key.
@@ -323,7 +528,7 @@ func (s *Server) handleRefreshAllModels(ctx context.Context, c *app.RequestConte
 		s.fail(c, "list providers to refresh", err)
 		return
 	}
-	results := refreshProviderSet(passCtx, s.store, s.logger, targets)
+	results := refreshProviderSet(passCtx, s.store, s.logger, targets, s.windowAsker())
 	if results == nil {
 		results = []ModelRefreshResult{}
 	}

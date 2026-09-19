@@ -3753,6 +3753,17 @@ table.data tbody tr.row-click:focus-visible {
   border-bottom: 1px solid var(--border);
 }
 
+/* 上下文窗口：一个数字加一枚来源标签。宽度固定，免得每行的能力芯片随着窗口
+   位数（128,000 与 1,000,000）左右跳动。 */
+.model-window {
+  flex: 0 0 150px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+  font-size: 12px;
+}
+
 .model-id {
   flex: 0 1 200px;
   min-width: 0;

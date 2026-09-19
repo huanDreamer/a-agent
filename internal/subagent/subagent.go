@@ -59,6 +59,10 @@ type NestedRequest struct {
 	Model model.BaseChatModel
 	// MaxSteps bounds the nested loop.
 	MaxSteps int
+	// ModelName names the model the nested run is on, when the surface knows it.
+	// The nested loop sizes its context window from it, so a subagent on a
+	// 1M-token model is not compressed as if it were on a 128k one.
+	ModelName string
 	// SessionID and Scope keep the nested run attributable in the traces and the
 	// usage table. They are the parent's, deliberately: a subagent's cost belongs
 	// to the turn that asked for it.
@@ -125,16 +129,22 @@ const StepsUnknown = -1
 
 // Defaults for Limits.
 const (
+	// DefaultMaxSteps is the last-resort step budget, used only when neither the
+	// deployment nor the parent turn supplied one. It is small on purpose: a
+	// nested run that nobody bounded must not be able to spend a whole turn's
+	// budget by itself.
 	DefaultMaxSteps       = 8
 	DefaultMaxConcurrent  = 2
 	DefaultMaxReportChars = 8000
 )
 
 // Or returns the limits with defaults applied.
+//
+// MaxSteps is deliberately left at 0: 0 means "no limit of this package's own",
+// and Run falls back to what the spawn asked for — which the spawn tool fills
+// from the parent turn's own budget, so a subagent gets as much room as the
+// conversation it belongs to.
 func (l Limits) Or() Limits {
-	if l.MaxSteps <= 0 {
-		l.MaxSteps = DefaultMaxSteps
-	}
 	if l.MaxConcurrent <= 0 {
 		l.MaxConcurrent = DefaultMaxConcurrent
 	}
@@ -241,8 +251,12 @@ type Options struct {
 	// Model overrides the model for this subagent (a cheap model for exploration
 	// is the main use). Nil uses the parent's.
 	Model model.BaseChatModel
-	// MaxSteps overrides the configured step cap for this spawn.
+	// MaxSteps lowers the step cap for this spawn. It can only lower it: the
+	// budget otherwise comes from the deployment, or from the parent turn.
 	MaxSteps int
+	// ModelName names the model this spawn runs on, when it is not the parent's.
+	// The nested loop sizes its context window from it.
+	ModelName string
 	// Timeout overrides the configured timeout for this spawn. It is still capped
 	// by the parent turn's deadline.
 	Timeout time.Duration
@@ -290,9 +304,24 @@ func (a *Agent) Spawn(ctx context.Context, opts Options) (Report, error) {
 		return Report{}, fmt.Errorf("subagent: %w", ctx.Err())
 	}
 
+	// The step budget, in order of authority: an explicit per-spawn cap, the
+	// deployment's own limit, and finally the parent turn's budget.
+	//
+	// The last one is what makes a subagent as roomy as the conversation it
+	// belongs to. It used to be a fixed 8, which a real turn proved too small for
+	// the work subagents are given: two reconnaissance spawns in one session both
+	// hit the cap mid-sentence and handed the parent a truncated report, so the
+	// parent read the same files itself — the work happened twice and the turn
+	// got longer, not shorter.
 	maxSteps := a.limits.MaxSteps
-	if opts.MaxSteps > 0 && opts.MaxSteps < maxSteps {
+	if opts.MaxSteps > 0 && (maxSteps <= 0 || opts.MaxSteps < maxSteps) {
 		maxSteps = opts.MaxSteps
+	}
+	if maxSteps <= 0 {
+		maxSteps = opts.Parent.MaxSteps
+	}
+	if maxSteps <= 0 {
+		maxSteps = DefaultMaxSteps
 	}
 
 	// The timeout is capped by what is left of the parent turn: a subagent that
@@ -314,6 +343,11 @@ func (a *Agent) Spawn(ctx context.Context, opts Options) (Report, error) {
 		name = shortName(prompt)
 	}
 
+	modelName := strings.TrimSpace(opts.ModelName)
+	if modelName == "" {
+		modelName = strings.TrimSpace(opts.Parent.ModelName)
+	}
+
 	// Record the run before it starts, so a surface can show it while it works —
 	// which is the whole point of the list: a delegation that becomes visible only
 	// after it finishes answers the wrong question.
@@ -328,6 +362,7 @@ func (a *Agent) Spawn(ctx context.Context, opts Options) (Report, error) {
 		Tools:     narrowed,
 		Model:     mdl,
 		MaxSteps:  maxSteps,
+		ModelName: modelName,
 		SessionID: opts.Parent.SessionID,
 		Scope:     opts.Parent.Scope,
 	})

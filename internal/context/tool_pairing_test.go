@@ -164,7 +164,7 @@ func TestCompressKeepsToolExchangePaired(t *testing.T) {
 			}
 
 			// head=1 is the leading system prompt, as the runner computes it.
-			out, _, err := m.CompressKeeping(context.Background(), tc.history, 1, true)
+			out, _, err := m.CompressKeeping(context.Background(), tc.history, 1, true, 0)
 			if err != nil {
 				t.Fatalf("CompressKeeping: %v", err)
 			}
@@ -193,7 +193,7 @@ func TestCompressFoldsWholeExchangeWhenBoundaryIsTight(t *testing.T) {
 		toolObservation("call_1"),
 	}
 
-	out, _, err := m.CompressKeeping(context.Background(), history, 1, true)
+	out, _, err := m.CompressKeeping(context.Background(), history, 1, true, 0)
 	if err != nil {
 		t.Fatalf("CompressKeeping: %v", err)
 	}

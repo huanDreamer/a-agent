@@ -448,6 +448,30 @@ var migrations = []migration{
 		CREATE INDEX IF NOT EXISTS idx_artifacts_created ON artifacts(created_at);`,
 	},
 
+	{
+		version: 16,
+		name:    "model_context_window",
+		// 模型的上下文窗口，记在目录里而不是每次现算。
+		//
+		// Two sources fill it, in this order of authority: the provider's own
+		// /models response when it carries one (context_length and friends — an
+		// exact number, free), and a direct question to the model when it does
+		// not ("你的上下文窗口是多少 token"). A provider that reports nothing is
+		// the norm outside the big gateways: deepseek, for one, answers /models
+		// with ids only.
+		//
+		// It lives here rather than being recomputed per turn because the
+		// question is expensive and the answer does not change: an agent turn
+		// needs the number in microseconds, and asking a model what it is costs
+		// a round trip.
+		//
+		// context_window_source records which of them answered, so the console
+		// can say where a number came from — a value the model guessed and one
+		// its provider published deserve different amounts of trust.
+		up: `ALTER TABLE llm_models ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE llm_models ADD COLUMN context_window_source TEXT NOT NULL DEFAULT '';
+		ALTER TABLE llm_models ADD COLUMN context_window_checked_at TIMESTAMP;`,
+	},
 }
 
 // Migrate applies any pending migrations idempotently.

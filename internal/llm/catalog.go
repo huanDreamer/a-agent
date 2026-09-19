@@ -37,6 +37,59 @@ const maxErrorBody = 512
 type ModelInfo struct {
 	ID      string `json:"id"`
 	OwnedBy string `json:"owned_by,omitempty"`
+	// ContextWindow is the context window the provider publishes for this model,
+	// in tokens, or 0 when it publishes none.
+	//
+	// A gateway that reports it is the cheapest and best source there is: it is
+	// the number the provider will actually enforce, it arrives with the list we
+	// already fetch, and it costs nothing. Providers that do not report it are
+	// the norm outside the big gateways — deepseek answers /models with ids only
+	// — which is why there is a fallback that asks the model instead
+	// (llm.AskContextWindow).
+	ContextWindow int `json:"-"`
+}
+
+// modelListEntry is one entry as it arrives on the wire, before the aliases are
+// resolved. The OpenAI shape is not standardised past `id`, so every spelling
+// seen in the wild is decoded and the first non-zero one wins.
+type modelListEntry struct {
+	ID      string `json:"id"`
+	OwnedBy string `json:"owned_by,omitempty"`
+
+	ContextLength      int `json:"context_length"`
+	ContextWindow      int `json:"context_window"`
+	MaxContextLength   int `json:"max_context_length"`
+	MaxContextTokens   int `json:"max_context_tokens"`
+	MaxInputTokens     int `json:"max_input_tokens"`
+	MaxPositionEmbeds  int `json:"max_position_embeddings"`
+	// Some gateways nest it, as OpenRouter does.
+	TopProvider struct {
+		ContextLength int `json:"context_length"`
+	} `json:"top_provider"`
+}
+
+// window returns the entry's context window, from whichever field carries it.
+//
+// max_tokens is deliberately absent from the list: in the OpenAI shape it means
+// the *output* cap, and treating it as a window would size a turn's history from
+// a model's answer limit.
+func (e modelListEntry) window() int {
+	for _, candidate := range []int{
+		e.ContextLength,
+		e.TopProvider.ContextLength,
+		e.ContextWindow,
+		e.MaxContextLength,
+		e.MaxContextTokens,
+		e.MaxInputTokens,
+		// A position-embedding count is the training window, which is what a
+		// self-hosted server (vLLM, llama.cpp) knows about a local model.
+		e.MaxPositionEmbeds,
+	} {
+		if candidate > 0 {
+			return candidate
+		}
+	}
+	return 0
 }
 
 // FetchModels calls GET {base_url}/models with the provider's key and returns
@@ -114,17 +167,17 @@ func parseModels(body []byte) ([]ModelInfo, error) {
 	}
 
 	if trimmed[0] == '[' {
-		var arr []ModelInfo
+		var arr []modelListEntry
 		if err := json.Unmarshal(trimmed, &arr); err != nil {
 			return nil, fmt.Errorf("cannot parse the response as a bare array of {\"id\": ...} objects "+
 				"(body starts with %q): %w", snippet(trimmed, 80), err)
 		}
-		return cleanModels(arr), nil
+		return cleanModels(fromEntries(arr)), nil
 	}
 
 	var envelope struct {
-		Data   []ModelInfo `json:"data"`
-		Models []ModelInfo `json:"models"`
+		Data   []modelListEntry `json:"data"`
+		Models []modelListEntry `json:"models"`
 	}
 	if err := json.Unmarshal(trimmed, &envelope); err != nil {
 		return nil, fmt.Errorf("cannot parse the response as {\"data\": [...]}, {\"models\": [...]} or a bare array "+
@@ -132,12 +185,22 @@ func parseModels(body []byte) ([]ModelInfo, error) {
 	}
 	switch {
 	case envelope.Data != nil:
-		return cleanModels(envelope.Data), nil
+		return cleanModels(fromEntries(envelope.Data)), nil
 	case envelope.Models != nil:
-		return cleanModels(envelope.Models), nil
+		return cleanModels(fromEntries(envelope.Models)), nil
 	}
 	return nil, fmt.Errorf("unexpected response shape: expected an object with a \"data\" array, "+
 		"an object with a \"models\" array, or a bare array (body starts with %q)", snippet(trimmed, 80))
+}
+
+// fromEntries resolves each wire entry into the shape the rest of the package
+// uses, including the context window when the provider publishes one.
+func fromEntries(in []modelListEntry) []ModelInfo {
+	out := make([]ModelInfo, 0, len(in))
+	for _, e := range in {
+		out = append(out, ModelInfo{ID: e.ID, OwnedBy: e.OwnedBy, ContextWindow: e.window()})
+	}
+	return out
 }
 
 // cleanModels drops entries without an id and duplicates, keeping the order the

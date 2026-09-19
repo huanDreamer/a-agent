@@ -43,6 +43,13 @@ type mockProvider struct {
 	modelsStatus int
 	// failChat, when true, answers a chat request with 500.
 	failChat bool
+	// chatReply overrides what a chat completion answers with. The window probe
+	// is a chat call whose answer is parsed, so a test needs to control it.
+	chatReply string
+	// modelWindows maps a model id to the context_length the /models listing
+	// reports for it. Absent means the listing reports none, which is what most
+	// providers do and what the probe exists for.
+	modelWindows map[string]int
 	// authHeaders records the Authorization header of every request.
 	authHeaders []string
 }
@@ -63,9 +70,13 @@ func newMockProvider(t *testing.T, models ...string) *mockProvider {
 				_, _ = w.Write([]byte(`{"error":"nope"}`))
 				return
 			}
-			data := make([]map[string]string, 0, len(m.models))
+			data := make([]map[string]any, 0, len(m.models))
 			for _, id := range m.models {
-				data = append(data, map[string]string{"id": id, "object": "model"})
+				entry := map[string]any{"id": id, "object": "model"}
+				if w, ok := m.modelWindows[id]; ok {
+					entry["context_length"] = w
+				}
+				data = append(data, entry)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
@@ -83,6 +94,10 @@ func newMockProvider(t *testing.T, models ...string) *mockProvider {
 				_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
 				return
 			}
+			reply := m.chatReply
+			if reply == "" {
+				reply = "pong"
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id":      "chatcmpl-mock",
@@ -91,7 +106,7 @@ func newMockProvider(t *testing.T, models ...string) *mockProvider {
 				"model":   body["model"],
 				"choices": []map[string]any{{
 					"index":         0,
-					"message":       map[string]string{"role": "assistant", "content": "pong"},
+					"message":       map[string]string{"role": "assistant", "content": reply},
 					"finish_reason": "stop",
 				}},
 				"usage": map[string]int{"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},

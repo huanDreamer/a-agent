@@ -20,6 +20,7 @@ import (
 
 	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/config"
+	gctx "github.com/huan/huan-agent/internal/context"
 	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/memory"
 	"github.com/huan/huan-agent/internal/metrics"
@@ -67,6 +68,9 @@ type botHandler struct {
 	memStore memory.Store
 	// metrics may be nil when observability is disabled.
 	metrics *metrics.Metrics
+	// windowSpec resolves a model's context window for this bot's sessions,
+	// including whatever the model catalog recorded for it.
+	windowSpec gctx.WindowSpec
 
 	// wsMgr is the workspace layer (nil when it is unavailable or switched off).
 	// The manager owns which workspace each sender is in, and the runner's
@@ -251,7 +255,7 @@ func (h *botHandler) session(uid string) *botSession {
 		return s
 	}
 	sid := uuid.NewString()
-	mem, err := newSessionMemory(h.cfg, h.cm, h.systemPrompt(), sid, h.logger, h.memStore, adminDisplayModel(h.cfg))
+	mem, err := newSessionMemory(h.cfg, h.cm, h.systemPrompt(), sid, h.logger, h.memStore, adminDisplayModel(h.cfg), h.windowSpec)
 	if err != nil {
 		h.logger.Error("new session memory", zap.Error(err))
 		mem = nil
@@ -724,6 +728,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	handler := newBotHandler(cfg, logger, cm, cfg.LLM.DefaultProvider, cfg.LLM.DefaultProvider, st, rec, memStore)
 	handler.sender = sender
 	handler.downloader = downloader
+	handler.windowSpec = windowSpecFor(cfg, st, logger)
 
 	// Tools and workspaces. Off means the bot answers with a plain chat model —
 	// exactly what it did before either existed — so an operator who does not
@@ -750,7 +755,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 
 		// The bot answers on the deployment's default model, so its window is the
 		// one to resolve.
-		condenser, cErr := turnCondenser(cfg, cm, logger, adminDisplayModel(cfg))
+		condenser, cErr := turnCondenser(cfg, cm, logger, adminDisplayModel(cfg), windowSpecFor(cfg, st, logger))
 		if cErr != nil {
 			// Not fatal: the bot keeps answering, with a window that grows with
 			// the turn instead of being condensed.

@@ -450,6 +450,83 @@ func TestSpawnStepsCappedBothWays(t *testing.T) {
 	}
 }
 
+// TestSpawnInheritsTheParentTurnsStepBudget: a subagent gets as much room as the
+// conversation it belongs to, unless the deployment or the spawn says otherwise.
+//
+// This is the fix for a shape a real turn produced: two reconnaissance spawns on
+// a fixed 8-step cap both ended mid-sentence with "已达到本轮最大工具调用步数 8",
+// the parent read the same files again itself, and the delegation cost a call
+// while saving nothing.
+func TestSpawnInheritsTheParentTurnsStepBudget(t *testing.T) {
+	parentWith := func(steps int) tool.TurnResources {
+		res := parent(t)
+		res.MaxSteps = steps
+		return res
+	}
+
+	// The parent turn had 500 steps (a console override); nothing else is
+	// configured, so that is what the subagent runs with.
+	runner := &scriptedRunner{result: NestedResult{Text: "ok"}}
+	a := newAgent(t, runner, Limits{})
+	if _, err := a.Spawn(context.Background(), Options{Prompt: "x", Parent: parentWith(500)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.lastRequest(t).MaxSteps; got != 500 {
+		t.Errorf("nested steps = %d, want the parent turn's 500", got)
+	}
+
+	// A deployment that configured a cap keeps it.
+	capped := newAgent(t, runner, Limits{MaxSteps: 40})
+	if _, err := capped.Spawn(context.Background(), Options{Prompt: "x", Parent: parentWith(500)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.lastRequest(t).MaxSteps; got != 40 {
+		t.Errorf("nested steps = %d, want the configured 40", got)
+	}
+
+	// A spawn that asks for less gets less.
+	if _, err := capped.Spawn(context.Background(), Options{Prompt: "x", Parent: parentWith(500), MaxSteps: 12}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.lastRequest(t).MaxSteps; got != 12 {
+		t.Errorf("nested steps = %d, want the per-spawn 12", got)
+	}
+
+	// Nothing configured and no turn in hand: the small default, so a nested run
+	// is never open-ended by accident.
+	bare := newAgent(t, runner, Limits{})
+	if _, err := bare.Spawn(context.Background(), Options{Prompt: "x", Parent: parent(t)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.lastRequest(t).MaxSteps; got != DefaultMaxSteps {
+		t.Errorf("nested steps = %d, want the default %d", got, DefaultMaxSteps)
+	}
+}
+
+// TestSpawnCarriesTheModelName: the nested loop sizes its context window from
+// the model it runs on, so the name has to travel with the run — the parent's
+// name when nothing overrides it.
+func TestSpawnCarriesTheModelName(t *testing.T) {
+	runner := &scriptedRunner{result: NestedResult{Text: "ok"}}
+	a := newAgent(t, runner, Limits{})
+
+	res := parent(t)
+	res.ModelName = "deepseek/deepseek-v4.1-flash"
+	if _, err := a.Spawn(context.Background(), Options{Prompt: "x", Parent: res}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.lastRequest(t).ModelName; got != "deepseek/deepseek-v4.1-flash" {
+		t.Errorf("nested model name = %q, want the parent's", got)
+	}
+
+	if _, err := a.Spawn(context.Background(), Options{Prompt: "x", Parent: res, ModelName: "cheap/model"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.lastRequest(t).ModelName; got != "cheap/model" {
+		t.Errorf("nested model name = %q, want the override", got)
+	}
+}
+
 // TestSpawnNamesTheRun: the log and the card need something to call it.
 func TestSpawnNamesTheRun(t *testing.T) {
 	runner := &scriptedRunner{result: NestedResult{Text: "ok"}}

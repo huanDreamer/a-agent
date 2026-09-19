@@ -197,7 +197,7 @@ func TestCompressWithPinsWithoutMutatingCaller(t *testing.T) {
 // path does not use: a head pin with no user pin must behave like Compress.
 func TestCompressKeepingWithoutUserPin(t *testing.T) {
 	m, _ := NewManager(Budget{MaxTokens: 100, KeepRecent: 2, Summarizer: &fakeSummarizer{}}, nil, chainEstimator)
-	out, _, err := m.CompressKeeping(context.Background(), msgs(6), 1, false)
+	out, _, err := m.CompressKeeping(context.Background(), msgs(6), 1, false, 0)
 	if err != nil {
 		t.Fatalf("CompressKeeping: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestCompressKeepingWithoutUserPin(t *testing.T) {
 // than it has from producing an empty window.
 func TestCompressKeepingHeadBeyondWindow(t *testing.T) {
 	m, _ := NewManager(Budget{MaxTokens: 100, KeepRecent: 2, Summarizer: &fakeSummarizer{}}, nil, chainEstimator)
-	out, _, err := m.CompressKeeping(context.Background(), msgs(3), 99, true)
+	out, _, err := m.CompressKeeping(context.Background(), msgs(3), 99, true, 0)
 	if err != nil {
 		t.Fatalf("CompressKeeping: %v", err)
 	}
@@ -252,8 +252,73 @@ func TestShouldCompress(t *testing.T) {
 }
 
 func TestDefaultEstimator(t *testing.T) {
-	// each 20-char msg -> 20/4 + 4 = 9 tokens: 2 msgs = 18 tokens.
-	if n := DefaultEstimator(msgs(2)); n != 18 {
-		t.Fatalf("expected 18 tokens, got %d", n)
+	// ASCII runs about four characters to a token, plus the per-message
+	// scaffolding. The count is deliberately pessimistic: under-counting is what
+	// lets a window reach the provider's real limit.
+	if n := DefaultEstimator(msgs(2)); n < 18 || n > 30 {
+		t.Fatalf("estimate for two 20-character messages = %d, want roughly 20", n)
+	}
+	if n := DefaultEstimator(nil); n != 0 {
+		t.Fatalf("empty window = %d, want 0", n)
+	}
+	// A Chinese message costs about one token per character, so the same
+	// *character* count is an entirely different number of tokens. The old
+	// bytes/4 estimate called both of these the same size.
+	zh := []*schema.Message{{Role: schema.User, Content: strings.Repeat("中", 40)}}
+	en := []*schema.Message{{Role: schema.User, Content: strings.Repeat("a", 40)}}
+	zhN, enN := DefaultEstimator(zh), DefaultEstimator(en)
+	if zhN <= enN*2 {
+		t.Fatalf("Chinese estimate %d is not meaningfully above ASCII %d", zhN, enN)
+	}
+	if zhN < 40 || zhN > 60 {
+		t.Fatalf("40 Chinese characters estimate to %d, want about 40", zhN)
+	}
+	// Tool-call arguments are counted: they are JSON the provider tokenizes like
+	// any other text, and the old estimator ignored them entirely.
+	withCall := []*schema.Message{{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{
+		ID: "c1", Function: schema.FunctionCall{Name: "bash", Arguments: strings.Repeat("x", 400)},
+	}}}}
+	if n := DefaultEstimator(withCall); n < 100 {
+		t.Fatalf("a 400-character tool call estimated to %d, want it counted", n)
+	}
+}
+
+// TestEstimateSchemas: the tool definitions are resent on every step and appear
+// in no message, so a condenser that only measures messages fires late.
+func TestEstimateSchemas(t *testing.T) {
+	tools := []ToolSchema{
+		{Name: "bash", Description: strings.Repeat("描述", 40), ParametersJSON: `{"type":"object"}`},
+		{Name: "read_file", Description: strings.Repeat("x", 200)},
+	}
+	got := EstimateToolSchemas(tools)
+	if got < 80 {
+		t.Fatalf("EstimateToolSchemas = %d, want the schemas counted", got)
+	}
+	// The whole point: a window that would fit the messages alone is over budget
+	// once the schemas are counted.
+	m, _ := NewManager(Budget{MaxTokens: 200}, nil, DefaultEstimator)
+	small := []*schema.Message{{Role: schema.User, Content: strings.Repeat("a", 600)}}
+	if !m.ShouldCompressWith(small, got) {
+		t.Error("the schemas were not counted towards the budget")
+	}
+}
+
+// TestEstimateToolSchemasCountsTheParameters pins the bug this function had: a
+// tool schema measured by marshalling eino's ParamsOneOf reports a fraction of
+// the real size, because its fields are unexported and its jsonschema marshaller
+// emits only part of a large schema. The parameter schema is the largest part of
+// a tool definition, so the estimate is taken from the raw JSON text.
+func TestEstimateToolSchemasCountsTheParameters(t *testing.T) {
+	params := `{"type":"object","properties":{` +
+		strings.Repeat(`"p_name_long_enough":{"type":"string","description":"a long description here"},`, 20) +
+		`"x":{"type":"string"}}}`
+	withParams := EstimateToolSchemas([]ToolSchema{{Name: "bash", Description: "run a command", ParametersJSON: params}})
+	withoutParams := EstimateToolSchemas([]ToolSchema{{Name: "bash", Description: "run a command"}})
+	if withParams <= withoutParams+200 {
+		t.Fatalf("a 1.7KB parameter schema cost %d, only %d more than none: it was not counted",
+			withParams, withParams-withoutParams)
+	}
+	if EstimateToolSchemas(nil) != 0 {
+		t.Error("no tools must cost nothing")
 	}
 }

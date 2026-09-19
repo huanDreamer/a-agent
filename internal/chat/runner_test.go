@@ -596,19 +596,23 @@ func TestRun_TokenBudgetNeedsReportedUsage(t *testing.T) {
 // fakeCondenser records what it was asked to compress and folds the middle away,
 // so a test can see the window the model actually received.
 type fakeCondenser struct {
-	mu    sync.Mutex
-	calls int
-	heads []int
-	pins  []bool
-	err   error
+	// overheads records what the runner told it the tool schemas cost, so a test
+	// can prove the invisible part of the window reaches the compressor.
+	overheads []int
+	mu        sync.Mutex
+	calls     int
+	heads     []int
+	pins      []bool
+	err       error
 }
 
-func (f *fakeCondenser) CompressKeeping(_ context.Context, msgs []*schema.Message, head int, pinLastUser bool) ([]*schema.Message, string, error) {
+func (f *fakeCondenser) CompressKeeping(_ context.Context, msgs []*schema.Message, head int, pinLastUser bool, overhead int) ([]*schema.Message, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.heads = append(f.heads, head)
 	f.pins = append(f.pins, pinLastUser)
+	f.overheads = append(f.overheads, overhead)
 	if f.err != nil {
 		return nil, "", f.err
 	}

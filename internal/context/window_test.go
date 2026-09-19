@@ -189,3 +189,46 @@ func TestKnownWindowsIsACopy(t *testing.T) {
 		}
 	}
 }
+
+// TestWindowSpecPrefersWhatTheCatalogRecorded: the model's own entry beats the
+// built-in table (a gateway may route to a smaller window than the vendor
+// advertises), and an operator override still beats both.
+func TestWindowSpecPrefersWhatTheCatalogRecorded(t *testing.T) {
+	recorded := map[string]int{"deepseek/deepseek-v4.1-flash": 64_000, "acme/mystery": 32_768}
+	spec := WindowSpec{}.WithLookup(func(model string) int { return recorded[model] })
+
+	got := spec.Resolve("deepseek/deepseek-v4.1-flash")
+	if got.Tokens != 64_000 || got.Source != WindowSourceModel {
+		t.Fatalf("Resolve = %+v, want the recorded 64000 from %q", got, WindowSourceModel)
+	}
+	if got.Cap != derived(64_000) {
+		t.Errorf("Cap = %d, want %d", got.Cap, derived(64_000))
+	}
+
+	// A model the table knows but the catalog does not falls back to the table.
+	if got := spec.Resolve("claude-sonnet-4"); got.Tokens != 200_000 || got.Source != WindowSourceKnown {
+		t.Errorf("Resolve(claude) = %+v, want the built-in table", got)
+	}
+	// A model neither knows gets the default.
+	if got := spec.Resolve("nobody/knows-this"); got.Tokens != DefaultModelWindow || got.Source != WindowSourceDefault {
+		t.Errorf("Resolve(unknown) = %+v, want the default window", got)
+	}
+
+	// The operator's override wins over the catalog.
+	override := spec.WithLookup(func(string) int { return 999 }).Overrides
+	_ = override
+	both := WindowSpec{Overrides: map[string]int{"deepseek": 8_192}}.WithLookup(func(string) int { return 64_000 })
+	if got := both.Resolve("deepseek/deepseek-v4.1-flash"); got.Tokens != 8_192 || got.Source != WindowSourceConfig {
+		t.Errorf("Resolve with an override = %+v, want the operator's value", got)
+	}
+}
+
+// TestWindowSpecLookupZeroIsNotAnAnswer: a catalog with no recorded window must
+// not turn into "the window is 0" — the table has to answer.
+func TestWindowSpecLookupZeroIsNotAnAnswer(t *testing.T) {
+	spec := WindowSpec{}.WithLookup(func(string) int { return 0 })
+	got := spec.Resolve("deepseek/deepseek-v4.1-flash")
+	if got.Tokens != 131_072 || got.Source != WindowSourceKnown {
+		t.Fatalf("Resolve = %+v, want the built-in table", got)
+	}
+}

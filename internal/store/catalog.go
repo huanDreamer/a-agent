@@ -155,6 +155,18 @@ type Model struct {
 	DisplayName  string       `json:"display_name"`
 	Capabilities Capabilities `json:"capabilities"`
 	Enabled      bool         `json:"enabled"`
+	// ContextWindow is the model's context window in tokens, 0 when nobody has
+	// said. It is what an agent turn sizes its in-loop window from, so it is
+	// recorded rather than recomputed: see migration 16.
+	ContextWindow int `json:"context_window"`
+	// ContextWindowSource says who answered: ModelWindowSourceAPI (the
+	// provider's /models listing), ModelWindowSourceAsked (the model itself,
+	// asked directly) or ModelWindowSourceUser (typed in the console). Empty
+	// when ContextWindow is 0.
+	ContextWindowSource string `json:"context_window_source"`
+	// ContextWindowCheckedAt is when that answer was recorded, so the console
+	// can show how stale it is.
+	ContextWindowCheckedAt *time.Time `json:"context_window_checked_at,omitempty"`
 	// Source is "fetched" for one discovered from the provider's /models
 	// endpoint, or "user" for one added by hand (a provider that lists nothing,
 	// or a model it omits).
@@ -284,7 +296,21 @@ func (s *sqliteStore) DeleteProvider(ctx context.Context, id string) error {
 
 // ------------------------------------------------------------------- models --
 
-const modelCols = `provider_id, model_id, display_name, capabilities, enabled, source, fetched_at`
+const modelCols = `provider_id, model_id, display_name, capabilities, enabled, source, fetched_at, ` +
+	`context_window, context_window_source, context_window_checked_at`
+
+// Where a model's context window came from. The distinction is not decoration:
+// a number the provider published is authoritative for that deployment, while
+// one the model answered about itself is a hint that may be a different
+// generation's window.
+const (
+	// ModelWindowSourceAPI is the provider's own /models listing.
+	ModelWindowSourceAPI = "api"
+	// ModelWindowSourceAsked is the model's answer to being asked directly.
+	ModelWindowSourceAsked = "asked"
+	// ModelWindowSourceUser is a value the operator set.
+	ModelWindowSourceUser = "user"
+)
 
 // ReplaceFetchedModels records the result of a /models call. Models the user
 // added or edited by hand are preserved: a refresh must not silently discard
@@ -302,12 +328,16 @@ func (s *sqliteStore) ReplaceFetchedModels(ctx context.Context, providerID strin
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO llm_models (`+modelCols+`)
-			VALUES (?, ?, ?, ?, ?, 'fetched', CURRENT_TIMESTAMP)
+			VALUES (?, ?, ?, ?, ?, 'fetched', CURRENT_TIMESTAMP, ?, ?, ?)
 			ON CONFLICT(provider_id, model_id) DO UPDATE SET
 				display_name = CASE WHEN excluded.display_name = '' THEN llm_models.display_name ELSE excluded.display_name END,
-				fetched_at   = CURRENT_TIMESTAMP
+				fetched_at   = CURRENT_TIMESTAMP,
+				context_window = CASE WHEN excluded.context_window > 0 THEN excluded.context_window ELSE llm_models.context_window END,
+				context_window_source = CASE WHEN excluded.context_window > 0 THEN excluded.context_window_source ELSE llm_models.context_window_source END,
+				context_window_checked_at = CASE WHEN excluded.context_window > 0 THEN CURRENT_TIMESTAMP ELSE llm_models.context_window_checked_at END
 			WHERE llm_models.source = 'fetched'`,
-			providerID, m.ModelID, m.DisplayName, m.Capabilities.String(), boolToInt(m.Enabled)); err != nil {
+			providerID, m.ModelID, m.DisplayName, m.Capabilities.String(), boolToInt(m.Enabled),
+			m.ContextWindow, m.ContextWindowSource, checkedAtValue(m.ContextWindow)); err != nil {
 			return fmt.Errorf("store: upsert fetched model: %w", err)
 		}
 	}
@@ -324,17 +354,90 @@ func (s *sqliteStore) UpsertModel(ctx context.Context, m Model) error {
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO llm_models (`+modelCols+`)
-		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
 		ON CONFLICT(provider_id, model_id) DO UPDATE SET
 			display_name = excluded.display_name,
 			capabilities = excluded.capabilities,
 			enabled      = excluded.enabled,
 			source       = CASE WHEN llm_models.source = 'fetched' AND excluded.source = 'fetched' THEN llm_models.source ELSE excluded.source END`,
-		m.ProviderID, m.ModelID, m.DisplayName, m.Capabilities.String(), boolToInt(m.Enabled), m.Source)
+		m.ProviderID, m.ModelID, m.DisplayName, m.Capabilities.String(), boolToInt(m.Enabled), m.Source,
+		m.ContextWindow, m.ContextWindowSource, checkedAtValue(m.ContextWindow))
 	if err != nil {
 		return fmt.Errorf("store: upsert model: %w", err)
 	}
 	return nil
+}
+
+// checkedAtValue is the timestamp to record beside a window: now when there is
+// one, and nothing when there is not — a checked_at with no number would make
+// the console say "asked, no answer" forever.
+func checkedAtValue(tokens int) any {
+	if tokens <= 0 {
+		return nil
+	}
+	return time.Now().UTC()
+}
+
+// SetModelContextWindow records what a model's context window is, and who said
+// so. A zero or negative value clears it, which is what a refresh that can no
+// longer get an answer should do — the built-in table is then used instead of a
+// stale number.
+func (s *sqliteStore) SetModelContextWindow(ctx context.Context, providerID, modelID string, tokens int, source string) error {
+	if strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
+		return errors.New("store: set model window: provider and model are required")
+	}
+	if tokens < 0 {
+		tokens, source = 0, ""
+	}
+	if tokens == 0 {
+		source = ""
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE llm_models SET context_window = ?, context_window_source = ?, context_window_checked_at = ?
+		WHERE provider_id = ? AND model_id = ?`,
+		tokens, source, checkedAtValue(tokens), providerID, modelID)
+	if err != nil {
+		return fmt.Errorf("store: set model window: %w", err)
+	}
+	if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ModelContextWindows returns the recorded window of every model that has one,
+// keyed by model id.
+//
+// The key is the model id alone because that is what the agent has at the point
+// it needs the number (a session stores the model, not the provider), and a
+// model id is effectively unique across the providers a deployment configures.
+// When two providers disagree, the first enabled one in a deterministic order
+// wins, and context.model_windows is the documented way to settle it.
+func (s *sqliteStore) ModelContextWindows(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT model_id, context_window FROM llm_models
+		WHERE context_window > 0 AND enabled = 1
+		ORDER BY provider_id, model_id`)
+	if err != nil {
+		return nil, fmt.Errorf("store: model windows: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[string]int, 32)
+	for rows.Next() {
+		var id string
+		var window int
+		if err := rows.Scan(&id, &window); err != nil {
+			return nil, fmt.Errorf("store: scan model window: %w", err)
+		}
+		if _, seen := out[id]; !seen {
+			out[id] = window
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: model windows: %w", err)
+	}
+	return out, nil
 }
 
 // ListModels returns a provider's models; an empty providerID lists all.
@@ -473,7 +576,9 @@ func scanModel(sc rowScanner) (Model, error) {
 	var caps, source string
 	var enabled int
 	var fetchedAt sql.NullTime
-	if err := sc.Scan(&m.ProviderID, &m.ModelID, &m.DisplayName, &caps, &enabled, &source, &fetchedAt); err != nil {
+	var checkedAt sql.NullTime
+	if err := sc.Scan(&m.ProviderID, &m.ModelID, &m.DisplayName, &caps, &enabled, &source, &fetchedAt,
+		&m.ContextWindow, &m.ContextWindowSource, &checkedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Model{}, ErrNotFound
 		}
@@ -485,6 +590,10 @@ func scanModel(sc rowScanner) (Model, error) {
 	if fetchedAt.Valid {
 		t := fetchedAt.Time
 		m.FetchedAt = &t
+	}
+	if checkedAt.Valid {
+		t := checkedAt.Time
+		m.ContextWindowCheckedAt = &t
 	}
 	return m, nil
 }

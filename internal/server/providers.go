@@ -361,7 +361,7 @@ func (s *Server) handleRefreshProviderModels(ctx context.Context, c *app.Request
 	if !ok {
 		return
 	}
-	saved, err := refreshProviderModels(ctx, s.store, s.logger, p)
+	saved, err := refreshProviderModels(ctx, s.store, s.logger, p, s.windowAsker())
 	if err != nil {
 		msg := err.Error()
 		s.recordProviderError(ctx, p.ID, msg)

@@ -41,7 +41,13 @@ type Condenser interface {
 	// the first head messages and — when pinLastUser is set — the most recent
 	// user message verbatim. It returns the messages unchanged when nothing
 	// needed folding.
-	CompressKeeping(ctx context.Context, msgs []*schema.Message, head int, pinLastUser bool) ([]*schema.Message, string, error)
+	//
+	// overheadTokens is what the window costs on top of the messages: the tool
+	// schemas, which the provider counts on every step and which no message
+	// shows. A condenser that ignored it would fire late, and late is the
+	// expensive direction — the window reaches the provider's real limit and the
+	// turn ends in a context-limit error instead of a summary.
+	CompressKeeping(ctx context.Context, msgs []*schema.Message, head int, pinLastUser bool, overheadTokens int) ([]*schema.Message, string, error)
 }
 
 // turnBudget is one turn's resolved limits. A zero field means that dimension is

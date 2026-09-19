@@ -74,8 +74,16 @@ type WindowSpec struct {
 	Default int
 	// Overrides maps a model id — or a fragment of one, matched
 	// case-insensitively as a substring, longest key first — to a window. It is
-	// the operator's answer, so it beats the built-in table.
+	// the operator's answer, so it beats everything else.
 	Overrides map[string]int
+	// Lookup returns the window recorded for a model by the catalog: what the
+	// provider published, or what the model answered when asked. Nil means
+	// nothing has been recorded — which is the state of a deployment whose
+	// providers publish nothing and whose models have never been asked.
+	//
+	// It is a function rather than a map so the caller decides how fresh the
+	// answer has to be; the caller owns the store and the caching.
+	Lookup func(model string) int
 }
 
 // Window is a resolved window: what the model can hold, and what the history is
@@ -102,6 +110,11 @@ const (
 	// WindowSourceConfig is an explicit configuration (a fixed max_tokens, or a
 	// model_windows entry).
 	WindowSourceConfig = "config"
+	// WindowSourceModel is what the model's catalog entry records: the provider's
+	// published window, or the model's own answer to being asked. It beats the
+	// built-in table because it is about *this* deployment's model — a gateway
+	// may route to a smaller window than the vendor's headline number.
+	WindowSourceModel = "model"
 	// WindowSourceKnown is the built-in table.
 	WindowSourceKnown = "known"
 	// WindowSourceDefault is the fallback for an unknown model.
@@ -210,6 +223,15 @@ func (s WindowSpec) Resolve(model string) Window {
 	return out
 }
 
+// WithLookup returns the spec with the catalog lookup attached. It exists so a
+// caller can hand the same resolver to several places (the turn condenser, the
+// console panel, a session's memory window) without rebuilding the config half
+// three times.
+func (s WindowSpec) WithLookup(fn func(model string) int) WindowSpec {
+	s.Lookup = fn
+	return s
+}
+
 // window returns just the window size, for the paths that report it without
 // deriving a cap from it.
 func (s WindowSpec) window(model string) int {
@@ -221,6 +243,11 @@ func (s WindowSpec) window(model string) int {
 func (s WindowSpec) lookup(model string) (int, string) {
 	if n := matchWindow(s.Overrides, model); n > 0 {
 		return n, WindowSourceConfig
+	}
+	if s.Lookup != nil {
+		if n := s.Lookup(model); n > 0 {
+			return n, WindowSourceModel
+		}
 	}
 	if n := matchKnown(model); n > 0 {
 		return n, WindowSourceKnown

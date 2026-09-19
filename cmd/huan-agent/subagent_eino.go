@@ -117,7 +117,9 @@ func spawnerForEino(cfg *config.Config, st store.Store, session string, rec *usa
 	agent, err := subagent.NewWithTracker(
 		einoNestedRunner{recorder: rec, audit: audit, session: session, logger: logger},
 		subagent.Limits{
-			MaxSteps:       cfg.Subagent.MaxStepsOr(),
+			// No turn in hand on this path (a one-shot `run` with the Eino loop),
+			// so the deployment's own chat cap is the budget to inherit.
+			MaxSteps:       cfg.Subagent.MaxStepsOr(cfg.Chat.MaxSteps),
 			MaxConcurrent:  cfg.Subagent.MaxConcurrentOr(),
 			MaxReportChars: cfg.Subagent.MaxReportCharsOr(),
 		},

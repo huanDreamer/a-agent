@@ -35,6 +35,18 @@ import (
 type nestedChatRunner struct {
 	tracer chatTracer
 	logger *zap.Logger
+	// guard and toolResult are the deployment's own policy. A nested run must
+	// obey them for the same reason the parent does — and, until this was wired,
+	// it silently used the built-in defaults instead: a deployment that turned
+	// the guard off still had it inside every subagent.
+	guard      chat.GuardConfig
+	toolResult int
+	// condenserFor builds the in-loop window bound for the model a nested run
+	// ends up on. Without it a subagent with the parent's step budget would
+	// resend its whole history on every step, which is the quadratic cost the
+	// condenser exists to remove — and it is the shape that hits a provider's
+	// context limit at the worst moment.
+	condenserFor func(cm einomodel.BaseChatModel, provider, name string) (chat.Condenser, error)
 }
 
 // chatTracer is the tracer interface the chat package wants, named here so this
@@ -43,6 +55,17 @@ type chatTracer = chat.Tracer
 
 // RunNested implements subagent.Runner.
 func (r nestedChatRunner) RunNested(ctx context.Context, in subagent.NestedRequest) (subagent.NestedResult, error) {
+	var condenser chat.Condenser
+	if r.condenserFor != nil {
+		c, cerr := r.condenserFor(in.Model, "", in.ModelName)
+		if cerr != nil {
+			// Not fatal: a nested run with an unbounded window still answers, it
+			// just costs more the longer it goes.
+			r.logger.Warn("nested run: resolving the model's context window failed", zap.Error(cerr))
+		} else {
+			condenser = c
+		}
+	}
 	runner, err := chat.New(chat.Config{
 		Model:    in.Model,
 		Tools:    in.Tools,
@@ -52,7 +75,15 @@ func (r nestedChatRunner) RunNested(ctx context.Context, in subagent.NestedReque
 		// the parent's point of view, and letting it fan out again is how a
 		// bounded cost becomes an unbounded one.
 		MaxParallel: 1,
-		Logger:      r.logger,
+		// The same in-loop policy the parent runs under: a bounded window and the
+		// loop guard, so a subagent that starts repeating itself or reading
+		// without acting is steered and, if it keeps going, stopped — instead of
+		// spending the whole budget it was given.
+		Condenser:          condenser,
+		Guard:              r.guard,
+		ToolResultMaxChars: r.toolResult,
+		ModelName:          in.ModelName,
+		Logger:             r.logger,
 	})
 	if err != nil {
 		return subagent.NestedResult{}, fmt.Errorf("nested runner: %w", err)
@@ -118,9 +149,22 @@ func spawnerFor(cfg *config.Config, tracer chatTracer, logger *zap.Logger) (*sub
 		return subagentAgent, nil
 	}
 	agent, err := subagent.NewWithTracker(
-		nestedChatRunner{tracer: tracer, logger: logger},
+		nestedChatRunner{
+			tracer: tracer,
+			logger: logger,
+			guard:  chatGuardFor(cfg),
+			// The deployment's own bound, so a subagent's history is trimmed the
+			// same way its parent's is.
+			toolResult:   toolResultCapFor(cfg),
+			condenserFor: turnCondenserFactory(cfg, logger, windowSpecFor(cfg, nil, logger)),
+		},
 		subagent.Limits{
-			MaxSteps:       cfg.Subagent.MaxStepsOr(),
+			// 0 means "no limit of this package's own": the nested run then uses
+			// the parent turn's budget, so a subagent has as much room as the
+			// conversation it belongs to.
+			// Inherited per spawn from the turn's own budget (see TurnResources);
+			// the value here is only what a caller with no turn falls back to.
+			MaxSteps:       cfg.Subagent.MaxStepsOr(cfg.Chat.MaxSteps),
 			MaxConcurrent:  cfg.Subagent.MaxConcurrentOr(),
 			MaxReportChars: cfg.Subagent.MaxReportCharsOr(),
 		},

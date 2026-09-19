@@ -13,6 +13,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 	"go.uber.org/zap"
 
+	gctx "github.com/huan/huan-agent/internal/context"
 	"github.com/huan/huan-agent/internal/retry"
 	"github.com/huan/huan-agent/internal/tool"
 )
@@ -126,7 +127,12 @@ type Config struct {
 	// built-in default; negative leaves it unbounded. The stored and displayed
 	// result is never truncated — this is the copy replayed on every later step.
 	ToolResultMaxChars int
-	Logger             *zap.Logger
+	// ModelName is the name of the model this runner drives, when the caller
+	// knows it (the console does: it builds a runner per provider+model). It
+	// travels to the tools so a subagent can size its own window from the same
+	// model, and is empty for a caller that only has a model instance.
+	ModelName string
+	Logger    *zap.Logger
 }
 
 // Runner drives a streaming tool-calling conversation.
@@ -143,6 +149,7 @@ type Runner struct {
 	condenser   Condenser
 	guard       GuardConfig
 	toolResult  int
+	modelName   string
 	logger      *zap.Logger
 }
 
@@ -187,6 +194,7 @@ func New(cfg Config) (*Runner, error) {
 		condenser:   cfg.Condenser,
 		guard:       cfg.Guard,
 		toolResult:  resolvedToolResultCap(cfg.ToolResultMaxChars),
+		modelName:   cfg.ModelName,
 		logger:      logger,
 	}, nil
 }
@@ -239,6 +247,27 @@ func (r *Runner) resolveTools(ctx context.Context) (*tool.Registry, error) {
 		return nil, fmt.Errorf("chat: resolve tools: %w", err)
 	}
 	return reg, nil
+}
+
+// toolSchemas is the same tool set in the shape the window estimator wants: the
+// raw definitions, measured as the text the provider is sent.
+func toolSchemas(reg *tool.Registry, ctx context.Context) []gctx.ToolSchema {
+	if reg == nil {
+		return nil
+	}
+	specs, err := reg.List(ctx)
+	if err != nil {
+		return nil
+	}
+	out := make([]gctx.ToolSchema, 0, len(specs))
+	for _, s := range specs {
+		out = append(out, gctx.ToolSchema{
+			Name:           s.Name,
+			Description:    s.Description,
+			ParametersJSON: s.ParametersJSONSchema,
+		})
+	}
+	return out
 }
 
 // toolInfos returns the model-facing specs for the permitted tools. It returns
@@ -310,11 +339,20 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		SessionID:    req.SessionID,
 		Scope:        req.Scope,
 		SystemPrompt: systemPromptOf(req.Messages),
+		ModelName:    r.modelName,
+		MaxSteps:     budget.maxSteps,
 	})
 	infos, err := r.toolInfos(ctx, reg)
 	if err != nil {
 		return nil, err
 	}
+	// The schemas are part of every request and are invisible to the message
+	// estimator, so they are measured here and handed to the condenser: a
+	// thirty-tool turn carries a few thousand tokens nobody would otherwise
+	// count. The calibration corrects the rest of the gap from what the provider
+	// reports it actually counted (see calibration.go).
+	schemaTokens := gctx.EstimateToolSchemas(toolSchemas(reg, ctx))
+	var calibration windowCalibration
 
 	// Bind tools once per run. A model that does not support tool calling
 	// silently degrades to pure chat rather than failing the turn.
@@ -386,7 +424,8 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		// below would be discarded at the end of each iteration — the model would
 		// never see its own tool results.
 		var folded bool
-		history, folded = r.condense(ctx, req, res, emit, history, head)
+		overhead := calibration.overhead(estimateMessages(history), schemaTokens)
+		history, folded = r.condense(ctx, req, res, emit, history, head, overhead)
 		if folded {
 			history = withLedger(history, head, ledger.render())
 		}
@@ -409,6 +448,12 @@ func (r *Runner) Run(ctx context.Context, req Request, emit Emitter) (*Result, e
 		// Accumulate usage and reasoning across every model call in the turn,
 		// so the caller can bill the whole turn and the UI can show the full
 		// thinking trace rather than only the last step's.
+		// What the provider counted for this very window is the only exact
+		// measurement of the estimate's error, so it is taken before the
+		// numbers are folded into the turn's totals.
+		if callUsage.PromptTokens > 0 {
+			calibration.observe(callUsage.PromptTokens, estimateMessages(history)+schemaTokens)
+		}
 		res.Usage.PromptTokens += callUsage.PromptTokens
 		res.Usage.CompletionTokens += callUsage.CompletionTokens
 		res.Usage.TotalTokens += callUsage.TotalTokens
@@ -546,13 +591,13 @@ func (r *Runner) stopOnBudget(req Request, res *Result, emit Emitter,
 // not something the reader has to act on, so the web chat page renders nothing
 // for the event — which makes this line the only place the window size of a
 // turn can be read back afterwards, hence the session id on it.
-func (r *Runner) condense(ctx context.Context, req Request, res *Result, emit Emitter, history []*schema.Message, head int) ([]*schema.Message, bool) {
+func (r *Runner) condense(ctx context.Context, req Request, res *Result, emit Emitter, history []*schema.Message, head, overheadTokens int) ([]*schema.Message, bool) {
 	if r.condenser == nil {
 		return history, false
 	}
 	before := len(history)
 
-	out, summary, err := r.condenser.CompressKeeping(ctx, history, head, true)
+	out, summary, err := r.condenser.CompressKeeping(ctx, history, head, true, overheadTokens)
 	if err != nil {
 		r.logger.Warn("chat: condensing the history failed; sending it whole",
 			zap.Int("step", res.Steps+1), zap.Int("messages", before), zap.Error(err))

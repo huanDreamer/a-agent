@@ -738,7 +738,19 @@ func (c WebConfig) CacheTTL() time.Duration {
 type SubagentConfig struct {
 	// Enable registers spawn_agent. Off means the tool is not on the menu at all.
 	Enable bool `mapstructure:"enable" json:"enable"`
-	// MaxSteps bounds a nested run's iterations. 0 uses the default (8).
+	// MaxSteps bounds a nested run's iterations. 0 — the default — means "as many
+	// as the turn that spawned it", so a subagent inherits the conversation's own
+	// budget (chat.max_steps, including a console override) instead of a number
+	// chosen here.
+	//
+	// It is deliberately the same budget rather than a smaller one. A subagent's
+	// job is reconnaissance or a self-contained sub-task, and both need room: the
+	// fixed 8 this used to default to left two real reconnaissance spawns
+	// truncated mid-sentence, after which the parent did the work itself — the
+	// delegation cost a call and saved nothing.
+	//
+	// A positive value caps every nested run at that number instead. It is a way
+	// to make subagents cheaper, not a way to make them work.
 	MaxSteps int `mapstructure:"max_steps" json:"max_steps"`
 	// MaxConcurrent bounds how many subagents run at once across the whole
 	// process. 0 uses the default (2).
@@ -757,10 +769,19 @@ const (
 	DefaultSubagentMaxReportChars = 8000
 )
 
-// MaxStepsOr returns the nested step cap.
-func (c SubagentConfig) MaxStepsOr() int {
+// MaxStepsOr returns the nested step cap: the configured one, or inherit when
+// the configuration says nothing.
+//
+// inherit is what the caller can offer instead — the parent turn's budget for a
+// spawn inside a turn, or the deployment's chat cap for a caller that has no turn
+// in hand. A zero inherit falls back to DefaultSubagentMaxSteps, so a nested run
+// is never open-ended by accident.
+func (c SubagentConfig) MaxStepsOr(inherit int) int {
 	if c.MaxSteps > 0 {
 		return c.MaxSteps
+	}
+	if inherit > 0 {
+		return inherit
 	}
 	return DefaultSubagentMaxSteps
 }

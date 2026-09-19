@@ -584,6 +584,33 @@ function selectProvider(provider) {
   confirmKey.value = ''
 }
 
+/**
+ * Where a model's context window came from.
+ *
+ * `api` is the provider's own /models listing — the number it will enforce.
+ * `asked` is the model's answer to being asked directly, which is a hint: it may
+ * be describing a different generation of itself. The distinction is shown
+ * because an agent turn sizes its whole in-loop window from this number
+ * (context.window_ratio), and an operator debugging "why does it compress so
+ * often" needs to know which number it was.
+ */
+function windowSourceLabel(source) {
+  if (source === 'api') return '接口'
+  if (source === 'asked') return '模型自报'
+  if (source === 'user') return '手填'
+  return ''
+}
+
+function windowTitle(model) {
+  const window = Number(model.context_window) || 0
+  if (window <= 0) {
+    return '还没有记录窗口大小：点「刷新模型」后，会先用 provider 的 /models 接口询问，接口不给就直接问模型自己'
+  }
+  const when = model.context_window_checked_at ? `，记录于 ${String(model.context_window_checked_at).slice(0, 19).replace('T', ' ')}` : ''
+  const source = model.context_window_source === 'api' ? '来自 provider 的 /models 接口' : '由模型自己回答'
+  return `${formatCount(window)} tokens（${source}${when}）；agent 一轮的窗口预算按 context.window_ratio 从这个数算出来`
+}
+
 /** Inferred capabilities are a guess; the note under the table says so. */
 const inferredCount = computed(
   () => providerModels.value.filter((m) => m.source === 'fetched').length,
@@ -976,7 +1003,8 @@ const inferredCount = computed(
           <span class="dot" />
           {{ selected.name || selected.id }} 的模型
           <span class="card-sub">
-            共 {{ formatCount(providerModels.length) }} 个 · 能力由模型名推断，请自行确认
+            共 {{ formatCount(providerModels.length) }} 个 · 能力由模型名推断，请自行确认 ·
+            窗口大小由 provider 接口或模型自报写入目录
           </span>
         </div>
         <button
@@ -1017,6 +1045,24 @@ const inferredCount = computed(
               @change="saveModel(model)"
               @keyup.enter="$event.target.blur()"
             />
+
+            <!-- 上下文窗口：agent 一轮的窗口预算就是用它算的（internal/context）。
+                 来源标注不是装饰：provider 自己在 /models 里报的数与模型自报的数
+                 值得不同程度的信任。 -->
+            <span class="model-window" :title="windowTitle(model)">
+              <template v-if="Number(model.context_window) > 0">
+                <span class="mono">{{ formatCount(model.context_window) }}</span>
+                <span
+                  class="tag"
+                  :class="model.context_window_source === 'api' ? 'blue' : 'purple'"
+                >
+                  {{ windowSourceLabel(model.context_window_source) }}
+                </span>
+              </template>
+              <span v-else class="dimmer" title="刷新模型时会让 provider 报告，或直接问模型自己">
+                未知
+              </span>
+            </span>
 
             <span class="model-caps">
               <button

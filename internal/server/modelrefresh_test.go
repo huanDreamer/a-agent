@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,7 +168,7 @@ func TestRefreshProviderModels_StoresAndInfersCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetProvider: %v", err)
 	}
-	saved, err := refreshProviderModels(context.Background(), st, zap.NewNop(), p)
+	saved, err := refreshProviderModels(context.Background(), st, zap.NewNop(), p, nil)
 	if err != nil {
 		t.Fatalf("refreshProviderModels: %v", err)
 	}
@@ -211,7 +214,7 @@ func TestRefreshProviderModels_FailureKeepsTheStoredList(t *testing.T) {
 		t.Fatalf("GetProvider: %v", err)
 	}
 
-	if _, err := refreshProviderModels(context.Background(), st, zap.NewNop(), p); err == nil {
+	if _, err := refreshProviderModels(context.Background(), st, zap.NewNop(), p, nil); err == nil {
 		t.Fatal("want an error when the provider answers 401")
 	}
 	// The stored list must survive: empty is a worse answer than stale.
@@ -254,7 +257,7 @@ func TestRefreshProviderSet_OneFailureDoesNotAbortThePass(t *testing.T) {
 		t.Fatalf("targets = %d, want 3 enabled providers with a key", len(targets))
 	}
 
-	results := refreshProviderSet(context.Background(), st, zap.NewNop(), targets)
+	results := refreshProviderSet(context.Background(), st, zap.NewNop(), targets, nil)
 	if len(results) != 3 {
 		t.Fatalf("results = %d, want one per provider", len(results))
 	}
@@ -346,7 +349,7 @@ func TestRefreshStaleModels_OnlyRefreshesWhatIsStale(t *testing.T) {
 	ageModels(t, st, "stale", 48*time.Hour)
 	fetchedModels(t, st, "fresh", "f1")
 
-	results := RefreshStaleModels(context.Background(), st, zap.NewNop(), 24*time.Hour)
+	results := refreshStaleModels(context.Background(), st, zap.NewNop(), 24*time.Hour, nil)
 	if len(results) != 1 {
 		t.Fatalf("results = %+v, want only the stale provider", results)
 	}
@@ -406,7 +409,7 @@ func TestRefreshStaleModels_FailureDoesNotAbort(t *testing.T) {
 	withKey(t, st, "broken", "sk-broken")
 	withKey(t, st, "ok", "sk-ok")
 
-	results := RefreshStaleModels(context.Background(), st, zap.NewNop(), time.Hour)
+	results := refreshStaleModels(context.Background(), st, zap.NewNop(), time.Hour, nil)
 	if len(results) != 2 {
 		t.Fatalf("results = %+v, want both providers attempted", results)
 	}
@@ -434,7 +437,7 @@ func TestRefreshStaleModels_ZeroTTLDoesNothing(t *testing.T) {
 	st := catalogStore(t, []store.Provider{providerRow("p", true, mock.srv.URL)}, nil)
 	withKey(t, st, "p", "sk-p")
 
-	if got := RefreshStaleModels(context.Background(), st, zap.NewNop(), 0); got != nil {
+	if got := refreshStaleModels(context.Background(), st, zap.NewNop(), 0, nil); got != nil {
 		t.Errorf("results = %+v, want nothing refreshed when the TTL is zero", got)
 	}
 	if len(mock.paths()) != 0 {
@@ -516,5 +519,164 @@ func TestHandleRefreshAllModels(t *testing.T) {
 	}
 	if got := providerByID(t, ModelCatalog{Providers: cat.Providers}, "broken"); got.LastError == "" {
 		t.Error("the failure must be visible on the provider summary")
+	}
+}
+
+/* ------------------------------------------------------- context windows --- */
+
+// TestRefreshProviderModels_RecordsTheWindowFromTheListing: a provider that
+// publishes context_length has answered exactly, for free, and that answer is
+// what it will enforce — so nothing is asked.
+func TestRefreshProviderModels_RecordsTheWindowFromTheListing(t *testing.T) {
+	mock := newMockProvider(t, "big-model", "small-model")
+	mock.modelWindows = map[string]int{"big-model": 1_000_000, "small-model": 131_072}
+	st := catalogStore(t, []store.Provider{providerRow("p", true, mock.srv.URL)}, nil)
+	withKey(t, st, "p", "sk-p")
+
+	if _, err := refreshProviderModels(context.Background(), st, zap.NewNop(), providerRow("p", true, mock.srv.URL), nil); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	for id, want := range map[string]int{"big-model": 1_000_000, "small-model": 131_072} {
+		got, err := st.GetModel(context.Background(), "p", id)
+		if err != nil {
+			t.Fatalf("GetModel(%s): %v", id, err)
+		}
+		if got.ContextWindow != want {
+			t.Errorf("%s window = %d, want %d", id, got.ContextWindow, want)
+		}
+		if got.ContextWindowSource != store.ModelWindowSourceAPI {
+			t.Errorf("%s source = %q, want %q", id, got.ContextWindowSource, store.ModelWindowSourceAPI)
+		}
+		if got.ContextWindowCheckedAt == nil {
+			t.Errorf("%s has no checked_at", id)
+		}
+	}
+	if len(mock.chatPaths()) != 0 {
+		t.Errorf("chat calls = %v, want none: the listing already answered", mock.chatPaths())
+	}
+}
+
+// TestRefreshProviderModels_KeepsAWindowTheListingDoesNotMention: a provider
+// that stops publishing context_length (or a model it lists differently) must
+// not erase what an earlier answer recorded.
+func TestRefreshProviderModels_KeepsAWindowTheListingDoesNotMention(t *testing.T) {
+	mock := newMockProvider(t, "m")
+	st := catalogStore(t, []store.Provider{providerRow("p", true, mock.srv.URL)}, nil)
+	withKey(t, st, "p", "sk-p")
+	p := providerRow("p", true, mock.srv.URL)
+	if _, err := refreshProviderModels(context.Background(), st, zap.NewNop(), p, nil); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+	if err := st.SetModelContextWindow(context.Background(), "p", "m", 262_144, store.ModelWindowSourceAsked); err != nil {
+		t.Fatalf("SetModelContextWindow: %v", err)
+	}
+
+	if _, err := refreshProviderModels(context.Background(), st, zap.NewNop(), p, nil); err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	got, err := st.GetModel(context.Background(), "p", "m")
+	if err != nil {
+		t.Fatalf("GetModel: %v", err)
+	}
+	if got.ContextWindow != 262_144 || got.ContextWindowSource != store.ModelWindowSourceAsked {
+		t.Fatalf("window = %d (%s), want the earlier answer kept", got.ContextWindow, got.ContextWindowSource)
+	}
+}
+
+// fakeAsker stands in for the model probe.
+type fakeAsker struct {
+	mu     sync.Mutex
+	wanted map[string]int
+	fail   bool
+	asked  []string
+}
+
+func (f *fakeAsker) AskContextWindow(_ context.Context, provider, name string) (int, error) {
+	f.mu.Lock()
+	f.asked = append(f.asked, provider+"/"+name)
+	f.mu.Unlock()
+	if f.fail {
+		return 0, errors.New("boom")
+	}
+	return f.wanted[name], nil
+}
+
+func (f *fakeAsker) askedModels() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.asked...)
+}
+
+// TestFillModelWindows_AsksOnlyWhatIsMissing: the probe costs a real model call,
+// so it runs for the models nobody has an answer for — not for the ones the
+// listing described, and not twice for the same one.
+func TestFillModelWindows_AsksOnlyWhatIsMissing(t *testing.T) {
+	mock := newMockProvider(t, "known", "asked", "unknown")
+	mock.modelWindows = map[string]int{"known": 200_000}
+	st := catalogStore(t, []store.Provider{providerRow("p", true, mock.srv.URL)}, nil)
+	withKey(t, st, "p", "sk-p")
+	if _, err := refreshProviderModels(context.Background(), st, zap.NewNop(), providerRow("p", true, mock.srv.URL), nil); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	asker := &fakeAsker{wanted: map[string]int{"asked": 131_072}}
+	models, err := st.ListModels(context.Background(), "p")
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	asked, filled := fillModelWindows(context.Background(), st, zap.NewNop(), asker, models, 10)
+	if asked != 2 || filled != 1 {
+		t.Fatalf("asked=%d filled=%d, want 2 asked (asked, unknown) and 1 filled", asked, filled)
+	}
+	got := map[string]string{}
+	for _, id := range asker.askedModels() {
+		got[id] = id
+	}
+	if _, ok := got["p/known"]; ok {
+		t.Error("the model the listing described was asked again")
+	}
+	row, err := st.GetModel(context.Background(), "p", "asked")
+	if err != nil {
+		t.Fatalf("GetModel: %v", err)
+	}
+	if row.ContextWindow != 131_072 || row.ContextWindowSource != store.ModelWindowSourceAsked {
+		t.Errorf("asked model window = %d (%s)", row.ContextWindow, row.ContextWindowSource)
+	}
+	// The one that did not answer keeps no window: the built-in table is a
+	// better answer than a number nobody gave.
+	unknown, err := st.GetModel(context.Background(), "p", "unknown")
+	if err != nil {
+		t.Fatalf("GetModel: %v", err)
+	}
+	if unknown.ContextWindow != 0 || unknown.ContextWindowSource != "" {
+		t.Errorf("unknown model window = %d (%s), want none", unknown.ContextWindow, unknown.ContextWindowSource)
+	}
+
+	// A second pass asks nobody: the answers are recorded.
+	again, _ := st.ListModels(context.Background(), "p")
+	second := &fakeAsker{wanted: map[string]int{"asked": 131_072}}
+	if asked, _ := fillModelWindows(context.Background(), st, zap.NewNop(), second, again, 10); asked != 1 {
+		t.Errorf("second pass asked %d models, want 1 (only the one that never answered)", asked)
+	}
+}
+
+// TestFillModelWindows_RespectsTheBudget: one pass spends at most its budget of
+// model calls, however big the catalog is.
+func TestFillModelWindows_RespectsTheBudget(t *testing.T) {
+	ids := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		ids = append(ids, "m"+strconv.Itoa(i))
+	}
+	mock := newMockProvider(t, ids...)
+	st := catalogStore(t, []store.Provider{providerRow("p", true, mock.srv.URL)}, nil)
+	withKey(t, st, "p", "sk-p")
+	if _, err := refreshProviderModels(context.Background(), st, zap.NewNop(), providerRow("p", true, mock.srv.URL), nil); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	models, _ := st.ListModels(context.Background(), "p")
+	asker := &fakeAsker{wanted: map[string]int{}}
+	asked, filled := fillModelWindows(context.Background(), st, zap.NewNop(), asker, models, 3)
+	if asked != 3 || filled != 0 {
+		t.Fatalf("asked=%d filled=%d, want exactly the budget (3) asked", asked, filled)
 	}
 }

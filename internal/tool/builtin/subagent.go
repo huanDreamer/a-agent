@@ -35,7 +35,7 @@ type SpawnAgentInput struct {
 	// wording uses semicolons instead.
 	Tools          []string `json:"tools,omitempty" jsonschema:"description=Extra tool names to grant beyond the read-only set; needed only if the subagent must write or run commands"`
 	Model          string   `json:"model,omitempty" jsonschema:"description=Model to run the subagent on; a cheaper one for exploration is the usual reason to set it"`
-	MaxSteps       int      `json:"max_steps,omitempty" jsonschema:"description=Iteration cap for this subagent; it can only lower the configured cap"`
+	MaxSteps       int      `json:"max_steps,omitempty" jsonschema:"description=可选。只用来降低上限；不填时子 agent 与当前这一轮用同样的步数预算"`
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"description=Wall-clock cap for this subagent; still bounded by the current turn's deadline"`
 }
 
@@ -147,6 +147,9 @@ func spawnAgent(ctx context.Context, spawner Spawner, resolve agenttool.ModelRes
 			return SpawnAgentOutput{}, err
 		}
 		opts.Model = m
+		// The nested loop sizes its context window from the model it runs on, so
+		// an override travels with its name.
+		opts.ModelName = name
 	}
 
 	report, err := spawner.Spawn(ctx, opts)

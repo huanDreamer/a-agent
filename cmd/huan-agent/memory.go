@@ -38,7 +38,7 @@ type sessionMemory struct {
 // mirror batches turns across sessions, so it belongs to the process. A nil
 // store means "no long-term persistence" (memory off, or no directory
 // configured) and every write becomes a no-op.
-func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, ns string, logger *zap.Logger, st memory.Store, modelName string) (*sessionMemory, error) {
+func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, ns string, logger *zap.Logger, st memory.Store, modelName string, spec gctx.WindowSpec) (*sessionMemory, error) {
 	m := &sessionMemory{
 		buffer:       memory.NewBuffer(cfg.Memory.MaxTurns),
 		ns:           ns,
@@ -66,7 +66,7 @@ func newSessionMemory(cfg *config.Config, cm model.BaseChatModel, systemPrompt, 
 	// A negative value must never reach the manager: Budget.Validate refuses it,
 	// and the CLI would fail to start over a setting that only asked for less
 	// compression.
-	window := cfg.Context.WindowSpecFor().Resolve(modelName)
+	window := spec.Resolve(modelName)
 	capTokens := window.Cap
 	if capTokens < 0 {
 		capTokens = 0

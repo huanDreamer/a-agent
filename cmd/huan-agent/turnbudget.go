@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"go.uber.org/zap"
@@ -9,7 +12,14 @@ import (
 	"github.com/huan/huan-agent/internal/chat"
 	"github.com/huan/huan-agent/internal/config"
 	gctx "github.com/huan/huan-agent/internal/context"
+	"github.com/huan/huan-agent/internal/store"
 )
+
+// windowLookupTTL is how long a catalog read is reused. The value changes only
+// when the model list is refreshed, and a refresh is a human action; a turn
+// asking the database on every step would be a query per step for a number that
+// has not moved.
+const windowLookupTTL = 30 * time.Second
 
 // longTurnSteps is the step count above which a turn is treated as long enough
 // to need a bounded window. It is a heuristic for one warning, not a limit:
@@ -43,11 +53,10 @@ const longTurnSteps = 24
 // cm is the model used to summarize. It may be nil, in which case a rolled-up
 // window gets a placeholder summary instead of a written one: still bounded,
 // just less informative.
-func turnCondenser(cfg *config.Config, cm model.BaseChatModel, logger *zap.Logger, modelName string) (chat.Condenser, error) {
+func turnCondenser(cfg *config.Config, cm model.BaseChatModel, logger *zap.Logger, modelName string, spec gctx.WindowSpec) (chat.Condenser, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	spec := cfg.Context.WindowSpecFor()
 	window := spec.Resolve(modelName)
 
 	if window.Cap <= 0 {
@@ -95,9 +104,60 @@ func turnCondenser(cfg *config.Config, cm model.BaseChatModel, logger *zap.Logge
 // is built there too, and a conversation that switches model gets the window of
 // the model it switched to. One condenser built at startup would be the fixed
 // number this change removes.
-func turnCondenserFactory(cfg *config.Config, logger *zap.Logger) func(model.BaseChatModel, string, string) (chat.Condenser, error) {
+func turnCondenserFactory(cfg *config.Config, logger *zap.Logger, spec gctx.WindowSpec) func(model.BaseChatModel, string, string) (chat.Condenser, error) {
 	return func(cm model.BaseChatModel, _ string, name string) (chat.Condenser, error) {
-		return turnCondenser(cfg, cm, logger, name)
+		return turnCondenser(cfg, cm, logger, name, spec)
+	}
+}
+
+// windowSpecFor builds the resolver a deployment's turns and console use: the
+// config's own settings, plus the windows the model catalog recorded.
+//
+// The catalog half is what makes "充分利用窗口填充率" true for a model nobody has
+// heard of: a provider that publishes context_length, or a model that answered
+// when asked, is a better source than a table maintained by hand here.
+func windowSpecFor(cfg *config.Config, st store.Store, logger *zap.Logger) gctx.WindowSpec {
+	spec := cfg.Context.WindowSpecFor()
+	if st == nil {
+		return spec
+	}
+	return spec.WithLookup(modelWindowLookup(st, logger))
+}
+
+// modelWindowLookup reads the recorded windows, with a short cache.
+//
+// A failure is not fatal and is not remembered as an answer: the built-in table
+// is used instead, which is exactly the behaviour of a deployment whose catalog
+// says nothing.
+func modelWindowLookup(st store.Store, logger *zap.Logger) func(string) int {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	var (
+		mu     sync.Mutex
+		cached map[string]int
+		at     time.Time
+		warned bool
+	)
+	return func(model string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		if cached == nil || time.Since(at) > windowLookupTTL {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			windows, err := st.ModelContextWindows(ctx)
+			cancel()
+			if err != nil {
+				if !warned {
+					// Once per process: this runs per turn, and a broken store
+					// would otherwise fill the log with the same line.
+					warned = true
+					logger.Warn("reading model context windows failed; using the built-in table", zap.Error(err))
+				}
+				return 0
+			}
+			cached, at = windows, time.Now()
+		}
+		return cached[model]
 	}
 }
 
@@ -131,11 +191,11 @@ func toolResultCapFor(cfg *config.Config) int {
 // the model: "60000" and "91750, derived from deepseek/deepseek-v4.1-flash's 128k
 // window" are very different answers to "why does it compress so often", and
 // only the second one is actionable.
-func contextBudgetForPanel(cfg *config.Config, modelName string) (capTokens int, auto bool, resolvedFor string) {
+func contextBudgetForPanel(cfg *config.Config, modelName string, spec gctx.WindowSpec) (capTokens int, auto bool, resolvedFor string) {
 	if cfg.Context.MaxTokens > 0 {
 		return cfg.Context.MaxTokens, false, ""
 	}
-	window := cfg.Context.WindowSpecFor().Resolve(modelName)
+	window := spec.Resolve(modelName)
 	if window.Cap <= 0 {
 		// Compression off (a negative max_tokens). Reporting it as "auto" would
 		// tell the panel's reader that a window is being managed when none is.

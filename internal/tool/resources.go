@@ -33,6 +33,15 @@ type TurnResources struct {
 	// the usage table alike.
 	SessionID string
 	Scope     string
+	// ModelName is the model this turn runs on, when the surface knows it. A
+	// subagent inherits it, and with it the context window its own loop is sized
+	// from: a nested run that guessed a different window would either waste the
+	// model's capacity or overrun it.
+	ModelName string
+	// MaxSteps is the step budget this turn is actually running under — the
+	// effective value after any console override, not the configured default.
+	// A subagent that starts with as much room as its parent reads it from here.
+	MaxSteps int
 	// SystemPrompt is the prompt this turn was given, so a nested run can inherit
 	// it rather than starting from nothing.
 	SystemPrompt string
