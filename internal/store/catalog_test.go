@@ -412,3 +412,115 @@ func TestLatestSessionModel(t *testing.T) {
 }
 
 func ptrString(s string) *string { return &s }
+
+// TestModelCapabilities_PrecedenceAndTriState pins the two rules that keep a
+// probe from doing damage: a stronger source is never overwritten by a weaker
+// one, and "the model did not answer" is not "the model said no".
+func TestModelCapabilities_PrecedenceAndTriState(t *testing.T) {
+	ctx := context.Background()
+	s := newCatalogStore(t)
+	if err := s.UpsertProvider(ctx, Provider{ID: "p"}); err != nil {
+		t.Fatalf("UpsertProvider: %v", err)
+	}
+
+	if err := s.UpsertModel(ctx, Model{
+		ProviderID: "p", ModelID: "m", Source: "fetched",
+		Capabilities: Capabilities{CapChat, CapVision}, CapabilitiesSource: ModelCapabilitySourceInferred,
+	}); err != nil {
+		t.Fatalf("UpsertModel: %v", err)
+	}
+
+	// A probe that answers about two of the three: chat stays, vision is denied,
+	// tools is added, and embedding (never mentioned) is left alone.
+	if err := s.SetModelCapabilitiesFromProbe(ctx, "p", "m", map[Capability]bool{
+		CapChat: true, CapVision: false, CapTools: true,
+	}, ModelCapabilitySourceAsked); err != nil {
+		t.Fatalf("SetModelCapabilitiesFromProbe: %v", err)
+	}
+	got, _ := s.GetModel(ctx, "p", "m")
+	if got.Capabilities.Contains(CapVision) {
+		t.Errorf("the model denied vision and it is still set: %v", got.Capabilities)
+	}
+	if !got.Capabilities.Contains(CapChat) || !got.Capabilities.Contains(CapTools) {
+		t.Errorf("capabilities = %v, want chat + tools", got.Capabilities)
+	}
+	if got.CapabilitiesSource != ModelCapabilitySourceAsked {
+		t.Errorf("source = %q", got.CapabilitiesSource)
+	}
+
+	// An operator sets something by hand; a later probe must not undo it.
+	if err := s.SetModelCapabilities(ctx, "p", "m", Capabilities{CapChat, CapVision, CapTools}, ModelCapabilitySourceUser); err != nil {
+		t.Fatalf("SetModelCapabilities(user): %v", err)
+	}
+	if err := s.SetModelCapabilitiesFromProbe(ctx, "p", "m", map[Capability]bool{CapVision: false}, ModelCapabilitySourceAsked); err != nil {
+		t.Fatalf("SetModelCapabilitiesFromProbe: %v", err)
+	}
+	after, _ := s.GetModel(ctx, "p", "m")
+	if !after.Capabilities.Contains(CapVision) {
+		t.Error("a probe overruled the operator's own choice")
+	}
+	if after.CapabilitiesSource != ModelCapabilitySourceUser {
+		t.Errorf("source = %q, want the operator's", after.CapabilitiesSource)
+	}
+
+	// Being asked is recorded even when the answer was "I do not know", so the
+	// model is not asked again on every pass.
+	if err := s.MarkModelCapabilitiesChecked(ctx, "p", "m"); err != nil {
+		t.Fatalf("MarkModelCapabilitiesChecked: %v", err)
+	}
+	checked, _ := s.GetModel(ctx, "p", "m")
+	if checked.CapabilitiesCheckedAt == nil {
+		t.Error("checked_at was not recorded")
+	}
+}
+
+// TestModelContextWindow_ApiBeatsASelfReport: the number a provider publishes is
+// the limit it will enforce, so a model's own guess may fill an empty slot and
+// must never take a filled one.
+func TestModelContextWindow_ApiBeatsASelfReport(t *testing.T) {
+	ctx := context.Background()
+	s := newCatalogStore(t)
+	if err := s.UpsertProvider(ctx, Provider{ID: "p"}); err != nil {
+		t.Fatalf("UpsertProvider: %v", err)
+	}
+	if err := s.UpsertModel(ctx, Model{ProviderID: "p", ModelID: "m"}); err != nil {
+		t.Fatalf("UpsertModel: %v", err)
+	}
+
+	// The provider published 1M.
+	if err := s.SetModelContextWindow(ctx, "p", "m", 1_000_000, ModelWindowSourceAPI); err != nil {
+		t.Fatalf("SetModelContextWindow(api): %v", err)
+	}
+	// A model that claims 32k does not get to take it.
+	if err := s.SetModelContextWindow(ctx, "p", "m", 32_768, ModelWindowSourceAsked); err != nil {
+		t.Fatalf("SetModelContextWindow(asked): %v", err)
+	}
+	row, _ := s.GetModel(ctx, "p", "m")
+	if row.ContextWindow != 1_000_000 || row.ContextWindowSource != ModelWindowSourceAPI {
+		t.Fatalf("window = %d (%s), want the published 1000000", row.ContextWindow, row.ContextWindowSource)
+	}
+
+	// An operator's value is protected the same way, from every automatic source.
+	if err := s.SetModelContextWindow(ctx, "p", "m", 4_096, ModelWindowSourceUser); err != nil {
+		t.Fatalf("SetModelContextWindow(user): %v", err)
+	}
+	if err := s.SetModelContextWindow(ctx, "p", "m", 200_000, ModelWindowSourceAsked); err != nil {
+		t.Fatalf("SetModelContextWindow(asked): %v", err)
+	}
+	row, _ = s.GetModel(ctx, "p", "m")
+	if row.ContextWindow != 4_096 || row.ContextWindowSource != ModelWindowSourceUser {
+		t.Fatalf("window = %d (%s), want the operator's 4096", row.ContextWindow, row.ContextWindowSource)
+	}
+
+	// A self-report still fills an empty slot — that is what it is for.
+	if err := s.UpsertModel(ctx, Model{ProviderID: "p", ModelID: "empty"}); err != nil {
+		t.Fatalf("UpsertModel: %v", err)
+	}
+	if err := s.SetModelContextWindow(ctx, "p", "empty", 131_072, ModelWindowSourceAsked); err != nil {
+		t.Fatalf("SetModelContextWindow(asked, empty): %v", err)
+	}
+	row, _ = s.GetModel(ctx, "p", "empty")
+	if row.ContextWindow != 131_072 || row.ContextWindowSource != ModelWindowSourceAsked {
+		t.Fatalf("window = %d (%s), want the self-reported 131072", row.ContextWindow, row.ContextWindowSource)
+	}
+}

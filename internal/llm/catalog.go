@@ -37,6 +37,11 @@ const maxErrorBody = 512
 type ModelInfo struct {
 	ID      string `json:"id"`
 	OwnedBy string `json:"owned_by,omitempty"`
+	// Endpoints are the API paths the provider says this model can be called
+	// on, when it says. They imply capabilities ("/chat/completions" proves text
+	// chat) but never disprove one: an endpoint list that omits /audio/speech
+	// does not prove the model cannot speak, so absence is not evidence.
+	Endpoints []string `json:"-"`
 	// ContextWindow is the context window the provider publishes for this model,
 	// in tokens, or 0 when it publishes none.
 	//
@@ -53,15 +58,16 @@ type ModelInfo struct {
 // resolved. The OpenAI shape is not standardised past `id`, so every spelling
 // seen in the wild is decoded and the first non-zero one wins.
 type modelListEntry struct {
-	ID      string `json:"id"`
-	OwnedBy string `json:"owned_by,omitempty"`
+	ID        string   `json:"id"`
+	OwnedBy   string   `json:"owned_by,omitempty"`
+	Endpoints []string `json:"supported_endpoints,omitempty"`
 
-	ContextLength      int `json:"context_length"`
-	ContextWindow      int `json:"context_window"`
-	MaxContextLength   int `json:"max_context_length"`
-	MaxContextTokens   int `json:"max_context_tokens"`
-	MaxInputTokens     int `json:"max_input_tokens"`
-	MaxPositionEmbeds  int `json:"max_position_embeddings"`
+	ContextLength     int `json:"context_length"`
+	ContextWindow     int `json:"context_window"`
+	MaxContextLength  int `json:"max_context_length"`
+	MaxContextTokens  int `json:"max_context_tokens"`
+	MaxInputTokens    int `json:"max_input_tokens"`
+	MaxPositionEmbeds int `json:"max_position_embeddings"`
 	// Some gateways nest it, as OpenRouter does.
 	TopProvider struct {
 		ContextLength int `json:"context_length"`
@@ -198,7 +204,12 @@ func parseModels(body []byte) ([]ModelInfo, error) {
 func fromEntries(in []modelListEntry) []ModelInfo {
 	out := make([]ModelInfo, 0, len(in))
 	for _, e := range in {
-		out = append(out, ModelInfo{ID: e.ID, OwnedBy: e.OwnedBy, ContextWindow: e.window()})
+		out = append(out, ModelInfo{
+			ID:            e.ID,
+			OwnedBy:       e.OwnedBy,
+			Endpoints:     e.Endpoints,
+			ContextWindow: e.window(),
+		})
 	}
 	return out
 }

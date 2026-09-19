@@ -31,7 +31,7 @@ import AsyncBlock from './AsyncBlock.vue'
 import BindingEditor from './BindingEditor.vue'
 import Icon from './Icon.vue'
 import { api } from '../api.js'
-import { CAPABILITIES, checkBaseUrl, checkProviderId, normalizeCapabilities } from '../llm.js'
+import { CAPABILITIES, capabilitySourceLabel, checkBaseUrl, checkProviderId, normalizeCapabilities } from '../llm.js'
 import {
   catalogProviderStats,
   claimAutoRefresh,
@@ -601,6 +601,15 @@ function windowSourceLabel(source) {
   return ''
 }
 
+function capabilitiesTitle(model) {
+  const source = capabilitySourceLabel(model.capabilities_source)
+  const when = model.capabilities_checked_at
+    ? `，记录于 ${String(model.capabilities_checked_at).slice(0, 19).replace('T', ' ')}`
+    : ''
+  const origin = source ? `能力${source}` : '能力还没有明确来源'
+  return `${origin}${when}。点芯片可以手动改，手动设置优先于任何自动来源；模型自报是模型对自己能力的回答，可能答成整个系列的能力，请自行确认`
+}
+
 function windowTitle(model) {
   const window = Number(model.context_window) || 0
   if (window <= 0) {
@@ -1064,7 +1073,9 @@ const inferredCount = computed(
               </span>
             </span>
 
-            <span class="model-caps">
+            <!-- 能力来源：provider 接口说的、模型自己说的、按名字猜的，还是人点的。
+                 同一个「图像理解」标签，来源不同需要的信任程度完全不同。 -->
+            <span class="model-caps" :title="capabilitiesTitle(model)">
               <button
                 v-for="cap in CAPABILITIES"
                 :key="cap.key"
@@ -1080,6 +1091,9 @@ const inferredCount = computed(
             </span>
 
             <span class="model-flags">
+              <span v-if="capabilitySourceLabel(model.capabilities_source)" class="dimmer nowrap">
+                {{ capabilitySourceLabel(model.capabilities_source) }}
+              </span>
               <span class="tag" :class="model.source === 'fetched' ? 'blue' : 'purple'">
                 {{ model.source === 'fetched' ? '抓取' : '自定义' }}
               </span>

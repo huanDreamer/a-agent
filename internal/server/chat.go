@@ -236,10 +236,14 @@ type ModelChoice struct {
 	Model string `json:"model"`
 	// DisplayName is what the operator sees; the model id when unnamed.
 	DisplayName string `json:"display_name"`
-	// Capabilities are the model's stored capabilities. They are inferred from
-	// the model name on a fetch and corrected by the operator, so they are a
-	// hint rather than a guarantee.
+	// Capabilities are the model's stored capabilities.
 	Capabilities []string `json:"capabilities"`
+	// CapabilitiesSource says where that set came from: the provider's listing,
+	// the model's own answer about itself, the model-name heuristics, or the
+	// operator. The distinction decides how much the UI should hedge — "由模型名
+	// 推断，请自行确认" is right for the heuristics and wrong for a value the
+	// provider published.
+	CapabilitiesSource string `json:"capabilities_source,omitempty"`
 	// ChatCapable reports whether the model declares the chat capability.
 	//
 	// ChatCapable=false is possible and meaningful: when a provider has no

@@ -12,6 +12,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/huan/huan-agent/internal/llm"
 	"github.com/huan/huan-agent/internal/store"
 )
 
@@ -583,34 +584,49 @@ func TestRefreshProviderModels_KeepsAWindowTheListingDoesNotMention(t *testing.T
 	}
 }
 
-// fakeAsker stands in for the model probe.
+// fakeAsker stands in for the model probe: it answers whatever the test says the
+// models claim about themselves.
 type fakeAsker struct {
-	mu     sync.Mutex
-	wanted map[string]int
-	fail   bool
-	asked  []string
+	mu       sync.Mutex
+	wanted   map[string]int
+	caps     map[string]map[store.Capability]bool
+	fail     bool
+	answered bool
+	asked    []string
 }
 
 func (f *fakeAsker) AskContextWindow(_ context.Context, provider, name string) (int, error) {
 	f.mu.Lock()
-	f.asked = append(f.asked, provider+"/"+name)
-	f.mu.Unlock()
-	if f.fail {
-		return 0, errors.New("boom")
-	}
+	defer f.mu.Unlock()
+	// The fallback is only reached when the combined probe gave no window.
 	return f.wanted[name], nil
 }
 
-func (f *fakeAsker) askedModels() []string {
+func (f *fakeAsker) AskModelFacts(_ context.Context, provider, name string) (llm.ModelFacts, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.asked...)
+	f.asked = append(f.asked, provider+"/"+name)
+	f.mu.Unlock()
+	if f.fail {
+		return llm.ModelFacts{}, errors.New("boom")
+	}
+	facts := llm.ModelFacts{
+		ContextWindow: f.wanted[name],
+		Capabilities:  f.caps[name],
+		Answered:      f.answered,
+	}
+	if facts.Capabilities == nil {
+		facts.Capabilities = map[store.Capability]bool{}
+	}
+	return facts, nil
 }
 
-// TestFillModelWindows_AsksOnlyWhatIsMissing: the probe costs a real model call,
-// so it runs for the models nobody has an answer for — not for the ones the
-// listing described, and not twice for the same one.
-func TestFillModelWindows_AsksOnlyWhatIsMissing(t *testing.T) {
+// TestFillModelFacts_AsksExactlyWhatIsOpen: the probe costs a real model call, so
+// it runs for the models that still have an open question and for nobody else.
+//
+// "Open" is two questions, not one: a provider's listing can describe a model's
+// window and still say nothing about whether it sees images, and a model nobody
+// has asked has an open capability question even when its window is known.
+func TestFillModelFacts_AsksExactlyWhatIsOpen(t *testing.T) {
 	mock := newMockProvider(t, "known", "asked", "unknown")
 	mock.modelWindows = map[string]int{"known": 200_000}
 	st := catalogStore(t, []store.Provider{providerRow("p", true, mock.srv.URL)}, nil)
@@ -619,44 +635,80 @@ func TestFillModelWindows_AsksOnlyWhatIsMissing(t *testing.T) {
 		t.Fatalf("refresh: %v", err)
 	}
 
-	asker := &fakeAsker{wanted: map[string]int{"asked": 131_072}}
+	asker := &fakeAsker{
+		wanted:   map[string]int{"asked": 131_072},
+		caps:     map[string]map[store.Capability]bool{"asked": {store.CapChat: true, store.CapVision: true, store.CapAudioSpeech: false}},
+		answered: true,
+	}
 	models, err := st.ListModels(context.Background(), "p")
 	if err != nil {
 		t.Fatalf("ListModels: %v", err)
 	}
-	asked, filled := fillModelWindows(context.Background(), st, zap.NewNop(), asker, models, 10)
-	if asked != 2 || filled != 1 {
-		t.Fatalf("asked=%d filled=%d, want 2 asked (asked, unknown) and 1 filled", asked, filled)
+	asked, filled := fillModelFacts(context.Background(), st, zap.NewNop(), asker, models, 10)
+	// All three are asked: the listing answered the window of one of them and
+	// nobody's capabilities.
+	if asked != 3 || filled != 1 {
+		t.Fatalf("asked=%d filled=%d, want 3 asked (the capability question is open for all) and 1 filled", asked, filled)
 	}
-	got := map[string]string{}
-	for _, id := range asker.askedModels() {
-		got[id] = id
-	}
-	if _, ok := got["p/known"]; ok {
-		t.Error("the model the listing described was asked again")
-	}
-	row, err := st.GetModel(context.Background(), "p", "asked")
+
+	// The window the listing published survives the probe untouched.
+	known, err := st.GetModel(context.Background(), "p", "known")
 	if err != nil {
 		t.Fatalf("GetModel: %v", err)
 	}
-	if row.ContextWindow != 131_072 || row.ContextWindowSource != store.ModelWindowSourceAsked {
-		t.Errorf("asked model window = %d (%s)", row.ContextWindow, row.ContextWindowSource)
+	if known.ContextWindow != 200_000 || known.ContextWindowSource != store.ModelWindowSourceAPI {
+		t.Errorf("known window = %d (%s), want the published 200000", known.ContextWindow, known.ContextWindowSource)
 	}
-	// The one that did not answer keeps no window: the built-in table is a
-	// better answer than a number nobody gave.
+	if known.CapabilitiesCheckedAt == nil {
+		t.Error("the model was probed but not marked as asked")
+	}
+
+	// What the probe answered landed, and only what it answered about.
+	probed, err := st.GetModel(context.Background(), "p", "asked")
+	if err != nil {
+		t.Fatalf("GetModel: %v", err)
+	}
+	if probed.ContextWindow != 131_072 || probed.ContextWindowSource != store.ModelWindowSourceAsked {
+		t.Errorf("window = %d (%s), want the self-reported 131072", probed.ContextWindow, probed.ContextWindowSource)
+	}
+	if !probed.Capabilities.Contains(store.CapVision) || !probed.Capabilities.Contains(store.CapChat) {
+		t.Errorf("capabilities = %v, want chat+vision", probed.Capabilities)
+	}
+	if probed.Capabilities.Contains(store.CapAudioSpeech) {
+		t.Errorf("a capability the model denied (tts) is still set: %v", probed.Capabilities)
+	}
+	if probed.CapabilitiesSource != store.ModelCapabilitySourceAsked {
+		t.Errorf("capabilities source = %q", probed.CapabilitiesSource)
+	}
+
+	// A model that answered nothing (neither a window nor a capability) is still
+	// marked as asked: "I do not know" is an answer, and re-asking on every pass
+	// would spend a call per model per pass for the same nothing.
 	unknown, err := st.GetModel(context.Background(), "p", "unknown")
 	if err != nil {
 		t.Fatalf("GetModel: %v", err)
 	}
-	if unknown.ContextWindow != 0 || unknown.ContextWindowSource != "" {
-		t.Errorf("unknown model window = %d (%s), want none", unknown.ContextWindow, unknown.ContextWindowSource)
+	if unknown.ContextWindow != 0 || unknown.CapabilitiesCheckedAt == nil {
+		t.Errorf("unknown: window=%d checked=%v, want no window but marked asked",
+			unknown.ContextWindow, unknown.CapabilitiesCheckedAt)
 	}
 
-	// A second pass asks nobody: the answers are recorded.
+	// So a second pass asks nobody.
 	again, _ := st.ListModels(context.Background(), "p")
-	second := &fakeAsker{wanted: map[string]int{"asked": 131_072}}
-	if asked, _ := fillModelWindows(context.Background(), st, zap.NewNop(), second, again, 10); asked != 1 {
-		t.Errorf("second pass asked %d models, want 1 (only the one that never answered)", asked)
+	second := &fakeAsker{wanted: map[string]int{}, answered: true}
+	if asked, _ := fillModelFacts(context.Background(), st, zap.NewNop(), second, again, 10); asked != 0 {
+		t.Errorf("second pass asked %d models, want none: every question was answered", asked)
+	}
+	// The listing-described model was asked too — about its capabilities, which no
+	// listing answers — but its published window was left alone.
+	foundKnown := false
+	for _, id := range asker.asked {
+		if id == "p/known" {
+			foundKnown = true
+		}
+	}
+	if !foundKnown {
+		t.Error("the model whose window the listing described was never asked anything")
 	}
 }
 
@@ -674,8 +726,8 @@ func TestFillModelWindows_RespectsTheBudget(t *testing.T) {
 		t.Fatalf("refresh: %v", err)
 	}
 	models, _ := st.ListModels(context.Background(), "p")
-	asker := &fakeAsker{wanted: map[string]int{}}
-	asked, filled := fillModelWindows(context.Background(), st, zap.NewNop(), asker, models, 3)
+	asker := &fakeAsker{wanted: map[string]int{}, answered: true}
+	asked, filled := fillModelFacts(context.Background(), st, zap.NewNop(), asker, models, 3)
 	if asked != 3 || filled != 0 {
 		t.Fatalf("asked=%d filled=%d, want exactly the budget (3) asked", asked, filled)
 	}

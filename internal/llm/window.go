@@ -53,7 +53,16 @@ const windowAskPrompt = "你的上下文窗口（context window，输入 token �
 
 const windowAskSystem = "你是一个模型元数据接口。用户问你的运行参数时，只回答被要求的那个数字，不要任何其他文字。"
 
-// AskContextWindow asks a chat model how large its context window is.
+// AskContextWindow asks a chat model how large its context window is, as a
+// single-number question.
+//
+// It is the *fallback* to AskModelFacts, and the fallback exists because of what
+// the two prompts measurably do: asked for a JSON object with a null escape
+// hatch, models hedge and answer `null` for the window; asked for one integer
+// and nothing else, the same models commit to a number. A real pair answered
+// `null` to the combined question and 128000/200000 to this one, so a model that
+// hedged is asked a second time in the shape it finds easier — one extra call,
+// only for the models that need it.
 //
 // It returns 0 and no error when the model does not know (it answered 0), and an
 // error only when the call itself failed — the two are different facts and the

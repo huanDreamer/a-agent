@@ -38,6 +38,20 @@ const (
 	// calls, and a pass that never finishes is worse than a column that fills in
 	// over a couple of refreshes.
 	windowAskBudget = 12
+	// windowRetryAfter is how long a model that gave no window is left alone
+	// before being asked again. A week: the answer can improve (a model that
+	// stays silent today may answer next week), while asking every pass costs a
+	// call per model per pass for the same nothing.
+	windowRetryAfter = 7 * 24 * time.Hour
+	// factsFillTimeout bounds the fact-filling half of a pass.
+	//
+	// It is deliberately not refreshPassTimeout: asking twelve models two at a
+	// time, each with its own twenty-second bound, can legitimately take minutes,
+	// and sharing the refresh's ninety seconds meant the probes of every provider
+	// but the first were cancelled mid-flight and reported as nothing. A provider
+	// whose listing is slow to fetch should not cost another provider its
+	// answers.
+	factsFillTimeout = 5 * time.Minute
 )
 
 // modelSourceFetched mirrors the source value store.ReplaceFetchedModels writes.
@@ -115,7 +129,7 @@ func providerModelsStale(models []store.Model, ttl time.Duration) bool {
 // empty is a worse answer than stale, because a stale list still lets the
 // operator bind a capability while a network blip must not wipe their
 // configuration.
-func refreshProviderModels(ctx context.Context, st store.Store, logger *zap.Logger, p store.Provider, asker WindowAsker) ([]store.Model, error) {
+func refreshProviderModels(ctx context.Context, st store.Store, logger *zap.Logger, p store.Provider, asker FactsAsker) ([]store.Model, error) {
 	if st == nil {
 		return nil, fmt.Errorf("server: refresh %q: no store configured", p.ID)
 	}
@@ -164,6 +178,14 @@ func refreshProviderModels(ctx context.Context, st store.Store, logger *zap.Logg
 			row.ContextWindow = info.ContextWindow
 			row.ContextWindowSource = store.ModelWindowSourceAPI
 		}
+		// The endpoints a model is served on are evidence for what it can do
+		// ("/chat/completions" proves text chat). They only ever add: a listing
+		// that does not mention /audio/speech has not said the model cannot
+		// speak.
+		if fromAPI := llm.CapabilitiesFromEndpoints(info.Endpoints); len(fromAPI) > 0 {
+			row.Capabilities = fromAPI
+			row.CapabilitiesSource = store.ModelCapabilitySourceAPI
+		}
 		rows = append(rows, row)
 	}
 	if err := st.ReplaceFetchedModels(ctx, p.ID, rows); err != nil {
@@ -181,7 +203,7 @@ func refreshProviderModels(ctx context.Context, st store.Store, logger *zap.Logg
 	// provider that publishes context_length (any of the big gateways) needs no
 	// probe at all, which is the common case and the reason this is a fallback.
 	if asker != nil {
-		fillModelWindows(ctx, st, logger, asker, saved, windowAskBudget)
+		fillModelFacts(ctx, st, logger, asker, saved, windowAskBudget)
 	}
 
 	// Read back again when something was learned, so the caller (and the
@@ -194,22 +216,41 @@ func refreshProviderModels(ctx context.Context, st store.Store, logger *zap.Logg
 	return saved, nil
 }
 
-// WindowAsker answers what a model's context window is by asking it. It is an
-// interface rather than a *llm call so this package does not need a provider
-// client: the server implements it on top of the model builder, and a caller
-// with no builder passes nil and simply gets no probing.
-type WindowAsker interface {
+// FactsAsker asks a model about itself: its context window and what it can do.
+// It is an interface rather than a direct llm call so this package does not need
+// a provider client: the server implements it on top of the model builder, and a
+// caller with no builder passes nil and simply gets no probing.
+type FactsAsker interface {
+	// AskModelFacts is the one call that asks about everything.
+	AskModelFacts(ctx context.Context, provider, name string) (llm.ModelFacts, error)
+	// AskContextWindow is the single-number fallback for the window, for a model
+	// that hedged on the combined question.
 	AskContextWindow(ctx context.Context, provider, name string) (int, error)
 }
 
-// fillModelWindows asks the enabled models that have no recorded window.
+// canAnswerAProbe reports whether a model could answer a chat probe at all.
+//
+// A transcription or speech model has no text chat endpoint — asking it "what can
+// you do" is a guaranteed 400. Its capabilities come from the provider's listing
+// and from its name, which is exactly what those sources are for.
+func canAnswerAProbe(m store.Model) bool {
+	if m.Capabilities.Contains(store.CapChat) {
+		return true
+	}
+	// Nothing known about it: try. A probe that fails costs one call and is not
+	// recorded, so the model is not blacklisted by a single failure.
+	return len(m.Capabilities) == 0
+}
+
+// fillModelFacts asks the enabled models that have no recorded window or have
+// never been asked what they are: one call answers both questions.
 //
 // It is bounded three ways — how many models one pass asks, how many are in
 // flight, and how long one answer may take — because it spends real money on a
-// real endpoint for a number that is a hint. A model that does not answer (or
-// answers something implausible) is simply left without one: the built-in table
-// covers it, and the next refresh will ask again.
-func fillModelWindows(ctx context.Context, st store.Store, logger *zap.Logger, asker WindowAsker, models []store.Model, budget int) (asked, filled int) {
+// real endpoint for facts that are hints. A model that does not answer is simply
+// left as it was: the provider's listing and the name heuristics still cover it,
+// and the next refresh may get an answer.
+func fillModelFacts(ctx context.Context, st store.Store, logger *zap.Logger, asker FactsAsker, models []store.Model, budget int) (asked, filled int) {
 	if asker == nil || st == nil {
 		return 0, 0
 	}
@@ -218,7 +259,20 @@ func fillModelWindows(ctx context.Context, st store.Store, logger *zap.Logger, a
 	}
 	pending := make([]store.Model, 0, budget)
 	for _, m := range models {
-		if !m.Enabled || m.ContextWindow > 0 {
+		// A model is asked when either question is still open: a window nobody
+		// recorded, or capabilities that have never been probed. Once it has
+		// answered (or answered "I do not know"), capabilities_checked_at says so
+		// and it is not asked again.
+		needsWindow := m.ContextWindow <= 0 &&
+			(m.ContextWindowCheckedAt == nil || time.Since(*m.ContextWindowCheckedAt) > windowRetryAfter)
+		needsCaps := m.CapabilitiesCheckedAt == nil
+		if !m.Enabled || (!needsWindow && !needsCaps) {
+			continue
+		}
+		// A model that cannot chat cannot answer a chat probe. Its capabilities
+		// come from the listing and the name, and asking would only waste a call
+		// on an error.
+		if !canAnswerAProbe(m) {
 			continue
 		}
 		pending = append(pending, m)
@@ -240,33 +294,78 @@ func fillModelWindows(ctx context.Context, st store.Store, logger *zap.Logger, a
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			tokens, err := asker.AskContextWindow(ctx, m.ProviderID, m.ModelID)
+			facts, err := asker.AskModelFacts(ctx, m.ProviderID, m.ModelID)
 			mu.Lock()
 			asked++
 			mu.Unlock()
 			if err != nil {
-				logger.Debug("asking a model for its context window failed",
+				logger.Debug("asking a model about itself failed",
 					zapString("provider", m.ProviderID), zapString("model", m.ModelID), zapError(err))
 				return
 			}
-			if tokens <= 0 {
-				// The model said it does not know. Recorded as nothing rather
-				// than as a wrong number.
-				logger.Debug("a model did not know its context window",
+			if !facts.Answered && facts.ContextWindow == 0 {
+				// Nothing usable came back. Not recorded as checked, so the next
+				// pass asks again.
+				logger.Debug("a model did not answer questions about itself",
 					zapString("provider", m.ProviderID), zapString("model", m.ModelID))
 				return
 			}
-			if serr := st.SetModelContextWindow(ctx, m.ProviderID, m.ModelID, tokens, store.ModelWindowSourceAsked); serr != nil {
-				logger.Warn("recording a model's context window failed",
-					zapString("provider", m.ProviderID), zapString("model", m.ModelID), zapError(serr))
-				return
+			// The probe answered, even if the answer was "I do not know": that
+			// is recorded so the model is not asked again on every refresh (the
+			// window is retried after windowRetryAfter, the capabilities only
+			// when something changes).
+			if merr := st.MarkModelCapabilitiesChecked(ctx, m.ProviderID, m.ModelID); merr != nil {
+				logger.Warn("recording that a model was asked failed",
+					zapString("provider", m.ProviderID), zapString("model", m.ModelID), zapError(merr))
 			}
-			mu.Lock()
-			filled++
-			mu.Unlock()
-			logger.Info("model context window recorded",
+			if facts.ContextWindow <= 0 && m.ContextWindow <= 0 {
+				if merr := st.MarkModelWindowChecked(ctx, m.ProviderID, m.ModelID); merr != nil {
+					logger.Warn("recording that a model was asked for its window failed",
+						zapString("provider", m.ProviderID), zapString("model", m.ModelID), zapError(merr))
+				}
+			}
+
+			// A model that hedged on the combined question is asked the simpler
+			// one: the shape of the question decides whether it answers.
+			if facts.ContextWindow <= 0 && m.ContextWindow <= 0 {
+				if tokens, werr := asker.AskContextWindow(ctx, m.ProviderID, m.ModelID); werr != nil {
+					logger.Debug("the window-only fallback failed",
+						zapString("provider", m.ProviderID), zapString("model", m.ModelID), zapError(werr))
+				} else if tokens > 0 {
+					facts.ContextWindow = tokens
+				}
+			}
+
+			recordedWindow := false
+			if facts.ContextWindow > 0 {
+				if serr := st.SetModelContextWindow(ctx, m.ProviderID, m.ModelID,
+					facts.ContextWindow, store.ModelWindowSourceAsked); serr != nil {
+					logger.Warn("recording a model's context window failed",
+						zapString("provider", m.ProviderID), zapString("model", m.ModelID), zapError(serr))
+				} else {
+					recordedWindow = true
+				}
+			}
+			recordedCaps := 0
+			if len(facts.Capabilities) > 0 {
+				if serr := st.SetModelCapabilitiesFromProbe(ctx, m.ProviderID, m.ModelID,
+					facts.Capabilities, store.ModelCapabilitySourceAsked); serr != nil {
+					logger.Warn("recording a model's capabilities failed",
+						zapString("provider", m.ProviderID), zapString("model", m.ModelID), zapError(serr))
+				} else {
+					recordedCaps = len(facts.Capabilities)
+				}
+			}
+			if recordedWindow || recordedCaps > 0 {
+				mu.Lock()
+				filled++
+				mu.Unlock()
+			}
+			logger.Info("model facts recorded",
 				zapString("provider", m.ProviderID), zapString("model", m.ModelID),
-				zap.Int("context_window", tokens), zap.String("source", store.ModelWindowSourceAsked))
+				zap.Int("context_window", facts.ContextWindow),
+				zap.Int("capabilities_answered", len(facts.Capabilities)),
+				zap.Bool("window_recorded", recordedWindow))
 		}(m)
 	}
 	wg.Wait()
@@ -293,7 +392,7 @@ func setProviderError(ctx context.Context, st store.Store, logger *zap.Logger, i
 //
 // Every provider is isolated: one failure records its reason and continues, so a
 // broken key never stops the rest of a pass.
-func refreshProviderSet(ctx context.Context, st store.Store, logger *zap.Logger, targets []store.Provider, asker WindowAsker) []ModelRefreshResult {
+func refreshProviderSet(ctx context.Context, st store.Store, logger *zap.Logger, targets []store.Provider, asker FactsAsker) []ModelRefreshResult {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -409,21 +508,22 @@ func (s *Server) RefreshStaleModels(ctx context.Context, ttl time.Duration) []Mo
 	passCtx, cancel := context.WithTimeout(ctx, refreshPassTimeout)
 	defer cancel()
 
-	results := refreshStaleModels(passCtx, s.store, logger, ttl, s.windowAsker())
+	results := refreshStaleModels(passCtx, s.store, logger, ttl, s.factsAsker())
 
-	// The window is a separate question from the model list: a provider whose
-	// list is fresh can still have no windows recorded — a deployment that just
-	// upgraded to this version, or a provider that publishes none. This is the
-	// "初始化时问一遍" half, and it is skipped entirely when compression is off,
-	// because then nothing reads the number.
-	s.fillMissingWindows(passCtx, logger)
+	// The facts are a separate question from the model list: a provider whose
+	// list is fresh can still have no window or capabilities recorded — a
+	// deployment that just upgraded, or a provider that publishes neither. This
+	// is the "初始化时问一遍" half.
+	//
+	// It gets its own deadline rather than the refresh's: see factsFillTimeout.
+	s.fillMissingFacts(passCtx, logger)
 	return results
 }
 
 // refreshStaleModels is the pass itself, without a Server: the parts that need
 // one are the asker (which needs a model builder) and the compression check, and
 // both are optional.
-func refreshStaleModels(ctx context.Context, st store.Store, logger *zap.Logger, ttl time.Duration, asker WindowAsker) []ModelRefreshResult {
+func refreshStaleModels(ctx context.Context, st store.Store, logger *zap.Logger, ttl time.Duration, asker FactsAsker) []ModelRefreshResult {
 	if st == nil || ttl <= 0 {
 		return nil
 	}
@@ -443,23 +543,28 @@ func refreshStaleModels(ctx context.Context, st store.Store, logger *zap.Logger,
 	return refreshProviderSet(ctx, st, logger, targets, asker)
 }
 
-// fillMissingWindows asks the models that have no recorded context window, one
-// provider at a time, under a single pass-wide budget.
+// fillMissingFacts asks the models that have no recorded context window or have
+// never been asked about themselves, one provider at a time, under a single
+// pass-wide budget.
 //
 // The budget is shared rather than per provider so that adding providers does
 // not multiply the number of paid calls a startup makes.
-func (s *Server) fillMissingWindows(ctx context.Context, logger *zap.Logger) {
+func (s *Server) fillMissingFacts(ctx context.Context, logger *zap.Logger) {
 	if s.store == nil {
 		return
 	}
-	asker := s.windowAsker()
+	asker := s.factsAsker()
 	if asker == nil {
 		return
 	}
-	// Compression off means nothing reads a window: no reason to spend a call.
-	if s.cfg.ContextMaxTokens <= 0 {
-		return
-	}
+	// Probing is detached from the caller's deadline but not from its
+	// cancellation: a shutdown should stop the pass, while a refresh that has
+	// already run out of time should not.
+	fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), factsFillTimeout)
+	defer cancel()
+	// Capabilities are read whatever the compression setting (a vision flag
+	// decides whether an attachment is inlined), so this pass no longer skips
+	// when compression is off — but it still asks only for what is missing.
 	providers, err := refreshTargets(ctx, s.store)
 	if err != nil {
 		logger.Warn("model window fill: cannot list providers", zapError(err))
@@ -471,47 +576,65 @@ func (s *Server) fillMissingWindows(ctx context.Context, logger *zap.Logger) {
 		if remaining <= 0 || ctx.Err() != nil {
 			break
 		}
-		models, lerr := s.store.ListModels(ctx, p.ID)
+		models, lerr := s.store.ListModels(fillCtx, p.ID)
 		if lerr != nil {
-			logger.Warn("model window fill: cannot list models", zapString("provider", p.ID), zapError(lerr))
+			logger.Warn("model facts fill: cannot list models", zapString("provider", p.ID), zapError(lerr))
 			continue
 		}
-		asked, filled := fillModelWindows(ctx, s.store, logger, asker, models, remaining)
+		asked, filled := fillModelFacts(fillCtx, s.store, logger, asker, models, remaining)
 		remaining -= asked
 		totalAsked += asked
 		totalFilled += filled
 	}
 	if totalAsked > 0 {
-		logger.Info("model windows filled",
+		logger.Info("model facts filled",
 			zap.Int("asked", totalAsked), zap.Int("recorded", totalFilled))
 	}
 }
 
-// windowAsker adapts the console's model builder into a WindowAsker.
+// factsAsker adapts the console's model builder into a FactsAsker.
 //
 // Nil when chat is disabled or no builder is wired: probing needs to construct a
 // real client for a real provider, and a deployment without one simply keeps the
 // built-in table.
-func (s *Server) windowAsker() WindowAsker {
+func (s *Server) factsAsker() FactsAsker {
 	if s.chat.Builder == nil {
 		return nil
 	}
-	return builderWindowAsker{builder: s.chat.Builder}
+	return builderFactsAsker{builder: s.chat.Builder}
 }
 
-// builderWindowAsker asks a model, built on demand, what its window is.
-type builderWindowAsker struct{ builder ModelBuilder }
+// builderFactsAsker asks a model, built on demand, about itself.
+type builderFactsAsker struct{ builder ModelBuilder }
 
-func (a builderWindowAsker) AskContextWindow(ctx context.Context, provider, name string) (int, error) {
-	built, err := a.builder.Build(ctx, provider, name)
+func (a builderFactsAsker) AskModelFacts(ctx context.Context, provider, name string) (llm.ModelFacts, error) {
+	cm, err := a.chatModel(ctx, provider, name)
+	if err != nil {
+		return llm.ModelFacts{}, err
+	}
+	return llm.AskModelFacts(ctx, cm, windowAskTimeout)
+}
+
+func (a builderFactsAsker) AskContextWindow(ctx context.Context, provider, name string) (int, error) {
+	cm, err := a.chatModel(ctx, provider, name)
 	if err != nil {
 		return 0, err
 	}
+	return llm.AskContextWindow(ctx, cm, windowAskTimeout)
+}
+
+// chatModel builds the client one probe runs on. Building per call rather than
+// caching is deliberate: the builder caches the clients, and a probe is rare.
+func (a builderFactsAsker) chatModel(ctx context.Context, provider, name string) (model.BaseChatModel, error) {
+	built, err := a.builder.Build(ctx, provider, name)
+	if err != nil {
+		return nil, err
+	}
 	cm, ok := built.(model.BaseChatModel)
 	if !ok {
-		return 0, fmt.Errorf("server: %q is not a chat model", name)
+		return nil, fmt.Errorf("server: %q is not a chat model", name)
 	}
-	return llm.AskContextWindow(ctx, cm, windowAskTimeout)
+	return cm, nil
 }
 
 // handleRefreshAllModels refreshes every enabled provider that has a key.
@@ -528,7 +651,7 @@ func (s *Server) handleRefreshAllModels(ctx context.Context, c *app.RequestConte
 		s.fail(c, "list providers to refresh", err)
 		return
 	}
-	results := refreshProviderSet(passCtx, s.store, s.logger, targets, s.windowAsker())
+	results := refreshProviderSet(passCtx, s.store, s.logger, targets, s.factsAsker())
 	if results == nil {
 		results = []ModelRefreshResult{}
 	}

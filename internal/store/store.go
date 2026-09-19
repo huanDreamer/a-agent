@@ -41,6 +41,18 @@ type Store interface {
 	// ModelContextWindows returns every recorded window, keyed by model id. It
 	// is what an agent turn sizes its in-loop window from.
 	ModelContextWindows(ctx context.Context) (map[string]int, error)
+	// SetModelCapabilities records what a model can do and where that came from.
+	// A weaker source never overwrites a stronger one (see ModelCapabilityRank).
+	SetModelCapabilities(ctx context.Context, providerID, modelID string, caps Capabilities, source string) error
+	// SetModelCapabilitiesFromProbe applies a probe's definite answers to the
+	// stored set, leaving what it did not answer alone.
+	SetModelCapabilitiesFromProbe(ctx context.Context, providerID, modelID string, answers map[Capability]bool, source string) error
+	// MarkModelCapabilitiesChecked records that a model was asked about itself,
+	// whether or not it answered.
+	MarkModelCapabilitiesChecked(ctx context.Context, providerID, modelID string) error
+	// MarkModelWindowChecked records that a model was asked for its window and
+	// gave none, so it is not asked again on every pass.
+	MarkModelWindowChecked(ctx context.Context, providerID, modelID string) error
 
 	// LatestSessionModel reports the most recently used conversation's model.
 	LatestSessionModel(ctx context.Context) (provider, model string, ok bool)

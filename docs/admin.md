@@ -487,6 +487,59 @@ Endpoints (session cookie required):
 | `POST /api/llm/providers/{id}/models/refresh` | refetch one provider's list |
 | `POST /api/llm/models/refresh-all` | refetch every enabled provider that has a key |
 | `GET/PUT/DELETE /api/llm/models` | list / edit capabilities / delete a model |
+
+### 窗口大小与模型能力是从哪来的
+
+`llm_models` 里除了能力集合，还记着**它是怎么知道的**：`capabilities_source` /
+`context_window_source` 取 `api`（provider 的 `/models` 自己报的）、`asked`（**直接问
+模型自己**）、`inferred`（按模型名猜的）、`user`（人在控制台点的）。模型管理那一列会
+把来源标出来——同一个「图像理解」标签，来源不同需要的信任程度完全不同。
+
+来源之间的规则有两条，都不复杂：
+
+- **手动设置是唯一不会被自动覆盖的**（`internal/store`：任何自动写入遇到
+  `capabilities_source = 'user'` 就放弃）。运维点的能力就是最终答案，探针与刷新都改不动它。
+- **接口与自报互补，不排序**。它们回答的是不同问题：`/models` 说这个模型挂在哪个端点上
+  （"能对话"来自这里，这是硬证据），模型自己说的是它有哪些模态（图像/工具/音频——端点列表
+  从不提这些）。如果给它们排名，那么网关给每个模型都写了 `/chat/completions` 时，
+  「图像理解」这类标签永远填不上——这正是第一版的做法，实测就是这样卡住的。
+
+窗口那一列多一条：**provider 发布的窗口不会被模型自报覆盖**。发布值是网关真正会执行的限制，
+自报只是线索，而且很不稳定——同一批实测里，同一个模型上一轮说 200000、下一轮说 128000，
+另一个模型给自家网关标着 1,000,000 的模型回了个 32768。自报可以填空位，但不能顶掉已有的数。
+
+问模型自己时一次调用问两件事：窗口 + 能力（`internal/llm/facts.go`）。prompt 的三条
+设计要点：
+
+1. **问的是"你自己"**。模型被问"你支持看图吗"时，倾向回答整个产品系列（"Claude 支持"），
+   于是只有文本能力的兄弟模型也被标成能看图。prompt 里明确写了"你自己这一份权重，
+   不是产品系列、不是同系列其他模型、也不是你的网关"。
+2. **必须承认"不知道"**。不确定就写 `null`，并把字段名放进 `unsure` 数组；窗口那项例外，
+   要求给出最好的估计（可以不准），信心写进 `window_confidence`。这两条是实测调出来的：
+   早期版本对窗口也允许 null，结果 deepseek 两个模型一律回 null，而只问窗口的老 prompt
+   能拿到 128000 / 200000 —— 有无退路决定了模型是"给个数字"还是"躲开"。
+3. **null 不等于 false**。解析只接受明确答案：`null`、字段缺失、"不确定"都当作**没有回答**，
+   保持原有值。把未知当 false 会悄悄摘掉模型真有的能力。探针同时回报"它被问过了"
+   （`capabilities_checked_at`），所以答"不知道"的模型不会每次刷新都被问一遍。
+
+实测（真实 provider）：`deepseek-flash` → 窗口 200000、能力 chat+vision+tools；
+`deepseek-v4-pro` → 窗口 128000、能力只有 chat（它把 vision/tools/asr 列进了 `unsure`）。
+两个模型对自己的认知确实不一样，所以来源标注不是装饰。
+
+触发时机：**刷新模型**（单个 / 全部）之后，以及**启动时**补一次；一轮最多问 12 个、
+同时 2 个、每个 20 秒超时，补事实这一遍有自己独立的 5 分钟预算（跟刷新共用 90 秒的话，
+第二个 provider 的探针会被中途取消，实测踩过）。不能对话的模型不会被问（转写/语音模型
+没有 chat 端点，问必失败），它们的能力只来自 provider 接口与名称推断。
+
+真实结果（一次跑完两个 provider）：`deepseek-flash` 窗口 128000（来源 asked，接口没报）+
+能力 chat；`MiniMaxAI/MiniMax-M3` 窗口 1,000,000（来源 api——模型自报 128000 被挡下）
++ 能力 chat、tools（探针补上的）；`Qwen/Qwen3.8-27B` 窗口 262144（api）+ 能力 chat。
+也就是说：接口能答的它答，接口答不了的（模态）由模型自己补，两边的来源都摆在面板上。
+
+> 能力被真正使用的地方目前是 `vision`：它决定一张附件是被内联进请求，还是让模型用
+> `describe_image` 去看（`sessionSupportsVision`）。`tools` / `tts` / `asr` / `image_gen`
+> 现在只是记录与展示——平台还没有音频链路，而工具调用的支持情况仍由运行时的类型断言决定
+> （不支持时 runner 会降级成纯对话并告警）。
 | `GET/PUT /api/llm/bindings` | the capability → provider/model bindings |
 
 `GET /api/chat/models` answers:

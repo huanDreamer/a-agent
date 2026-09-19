@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -22,6 +23,10 @@ const (
 	CapVision Capability = "vision"
 	// CapImageGen produces images from a prompt.
 	CapImageGen Capability = "image_gen"
+	// CapTools calls functions/tools (function calling). It is what lets a
+	// model drive the agent's whole tool set, so a model without it is a chat
+	// partner rather than an agent.
+	CapTools Capability = "tools"
 	// CapAudioTranscribe turns speech into text.
 	CapAudioTranscribe Capability = "audio_transcribe"
 	// CapAudioSpeech turns text into speech.
@@ -32,7 +37,7 @@ const (
 
 // AllCapabilities is the set the UI offers, in display order.
 var AllCapabilities = []Capability{
-	CapChat, CapVision, CapImageGen, CapAudioTranscribe, CapAudioSpeech, CapEmbedding,
+	CapChat, CapVision, CapTools, CapImageGen, CapAudioTranscribe, CapAudioSpeech, CapEmbedding,
 }
 
 // ValidCapability reports whether c is a capability this build understands.
@@ -167,6 +172,13 @@ type Model struct {
 	// ContextWindowCheckedAt is when that answer was recorded, so the console
 	// can show how stale it is.
 	ContextWindowCheckedAt *time.Time `json:"context_window_checked_at,omitempty"`
+	// CapabilitiesSource says where the capability set came from: a provider's
+	// listing, the model's own answer, the model-name heuristics, or an operator.
+	// See ModelCapabilitySource*.
+	CapabilitiesSource string `json:"capabilities_source,omitempty"`
+	// CapabilitiesCheckedAt is when a probe last asked. It is what keeps a model
+	// that answered "I do not know" from being asked on every pass.
+	CapabilitiesCheckedAt *time.Time `json:"capabilities_checked_at,omitempty"`
 	// Source is "fetched" for one discovered from the provider's /models
 	// endpoint, or "user" for one added by hand (a provider that lists nothing,
 	// or a model it omits).
@@ -297,7 +309,7 @@ func (s *sqliteStore) DeleteProvider(ctx context.Context, id string) error {
 // ------------------------------------------------------------------- models --
 
 const modelCols = `provider_id, model_id, display_name, capabilities, enabled, source, fetched_at, ` +
-	`context_window, context_window_source, context_window_checked_at`
+	`context_window, context_window_source, context_window_checked_at, capabilities_source, capabilities_checked_at`
 
 // Where a model's context window came from. The distinction is not decoration:
 // a number the provider published is authoritative for that deployment, while
@@ -311,6 +323,37 @@ const (
 	// ModelWindowSourceUser is a value the operator set.
 	ModelWindowSourceUser = "user"
 )
+
+// Where a model's capability set came from, strongest first.
+//
+// The order is the order of authority, and it is why a probe never overwrites an
+// operator's own toggle: a person who has tested a model knows more about it than
+// the model does.
+const (
+	// ModelCapabilitySourceUser is an operator's decision (the console's chips).
+	ModelCapabilitySourceUser = "user"
+	// ModelCapabilitySourceAPI is what the provider's listing says, e.g. the
+	// endpoints a model is served on.
+	ModelCapabilitySourceAPI = "api"
+	// ModelCapabilitySourceAsked is the model's answer about itself.
+	ModelCapabilitySourceAsked = "asked"
+	// ModelCapabilitySourceInferred is the model-name heuristics.
+	ModelCapabilitySourceInferred = "inferred"
+)
+
+// Automatic capability writes never override an operator's own set.
+//
+// Between the automatic sources there is deliberately no pecking order. They
+// answer *different* questions rather than competing ones: a provider's listing
+// says which endpoint a model is served on (that is where "chat" comes from, and
+// it is hard evidence), while the model's own answer says what modalities it has
+// (vision, tools, audio) — which no endpoint list mentions. Ranking them would
+// mean the process of learning anything new stopped the moment the other source
+// had said anything at all, and a gateway that lists "/chat/completions" for
+// every model would never get a vision flag.
+func automaticCapabilityWriteAllowed(stored, incoming string) bool {
+	return stored != ModelCapabilitySourceUser || incoming == ModelCapabilitySourceUser
+}
 
 // ReplaceFetchedModels records the result of a /models call. Models the user
 // added or edited by hand are preserved: a refresh must not silently discard
@@ -328,7 +371,7 @@ func (s *sqliteStore) ReplaceFetchedModels(ctx context.Context, providerID strin
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO llm_models (`+modelCols+`)
-			VALUES (?, ?, ?, ?, ?, 'fetched', CURRENT_TIMESTAMP, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, 'fetched', CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
 			ON CONFLICT(provider_id, model_id) DO UPDATE SET
 				display_name = CASE WHEN excluded.display_name = '' THEN llm_models.display_name ELSE excluded.display_name END,
 				fetched_at   = CURRENT_TIMESTAMP,
@@ -337,7 +380,13 @@ func (s *sqliteStore) ReplaceFetchedModels(ctx context.Context, providerID strin
 				context_window_checked_at = CASE WHEN excluded.context_window > 0 THEN CURRENT_TIMESTAMP ELSE llm_models.context_window_checked_at END
 			WHERE llm_models.source = 'fetched'`,
 			providerID, m.ModelID, m.DisplayName, m.Capabilities.String(), boolToInt(m.Enabled),
-			m.ContextWindow, m.ContextWindowSource, checkedAtValue(m.ContextWindow)); err != nil {
+			m.ContextWindow, m.ContextWindowSource, checkedAtValue(m.ContextWindow),
+			// A fetch never marks capabilities as *checked*. What a listing says
+			// about a model ("it is served on /chat/completions") is a starting
+			// point, not an answer: it can say a model chats, and cannot say
+			// whether it sees images. Only a probe or an operator finishes that
+			// question, and only those may set capabilities_checked_at.
+			m.CapabilitiesSource, nil); err != nil {
 			return fmt.Errorf("store: upsert fetched model: %w", err)
 		}
 	}
@@ -354,14 +403,15 @@ func (s *sqliteStore) UpsertModel(ctx context.Context, m Model) error {
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO llm_models (`+modelCols+`)
-		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
 		ON CONFLICT(provider_id, model_id) DO UPDATE SET
 			display_name = excluded.display_name,
 			capabilities = excluded.capabilities,
 			enabled      = excluded.enabled,
 			source       = CASE WHEN llm_models.source = 'fetched' AND excluded.source = 'fetched' THEN llm_models.source ELSE excluded.source END`,
 		m.ProviderID, m.ModelID, m.DisplayName, m.Capabilities.String(), boolToInt(m.Enabled), m.Source,
-		m.ContextWindow, m.ContextWindowSource, checkedAtValue(m.ContextWindow))
+		m.ContextWindow, m.ContextWindowSource, checkedAtValue(m.ContextWindow),
+		m.CapabilitiesSource, nil)
 	if err != nil {
 		return fmt.Errorf("store: upsert model: %w", err)
 	}
@@ -382,6 +432,14 @@ func checkedAtValue(tokens int) any {
 // so. A zero or negative value clears it, which is what a refresh that can no
 // longer get an answer should do — the built-in table is then used instead of a
 // stale number.
+//
+// A number the *provider published* is not overwritten by one a model answered
+// about itself, and an operator's value is not overwritten at all. The published
+// number is the limit the provider will enforce; a self-report is a hint, and a
+// noisy one — a real run had the same model claim 200000 in one pass and 128000
+// in the next, and another claim 32768 for a model its gateway publishes as
+// 1000000. Filling an empty slot is what a hint is for; taking a filled one is
+// how a working 1M window becomes a 32k one.
 func (s *sqliteStore) SetModelContextWindow(ctx context.Context, providerID, modelID string, tokens int, source string) error {
 	if strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
 		return errors.New("store: set model window: provider and model are required")
@@ -394,13 +452,19 @@ func (s *sqliteStore) SetModelContextWindow(ctx context.Context, providerID, mod
 	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE llm_models SET context_window = ?, context_window_source = ?, context_window_checked_at = ?
-		WHERE provider_id = ? AND model_id = ?`,
-		tokens, source, checkedAtValue(tokens), providerID, modelID)
+		WHERE provider_id = ? AND model_id = ?
+		  AND NOT (? = ? AND context_window_source IN (?, ?))`,
+		tokens, source, checkedAtValue(tokens), providerID, modelID,
+		source, ModelWindowSourceAsked, ModelWindowSourceAPI, ModelWindowSourceUser)
 	if err != nil {
 		return fmt.Errorf("store: set model window: %w", err)
 	}
 	if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
-		return ErrNotFound
+		// Either there is no such row, or a stronger source already answered.
+		// The caller treats both as "nothing to do"; the console shows which.
+		if _, gerr := s.GetModel(ctx, providerID, modelID); gerr != nil {
+			return gerr
+		}
 	}
 	return nil
 }
@@ -576,9 +640,9 @@ func scanModel(sc rowScanner) (Model, error) {
 	var caps, source string
 	var enabled int
 	var fetchedAt sql.NullTime
-	var checkedAt sql.NullTime
+	var checkedAt, capsCheckedAt sql.NullTime
 	if err := sc.Scan(&m.ProviderID, &m.ModelID, &m.DisplayName, &caps, &enabled, &source, &fetchedAt,
-		&m.ContextWindow, &m.ContextWindowSource, &checkedAt); err != nil {
+		&m.ContextWindow, &m.ContextWindowSource, &checkedAt, &m.CapabilitiesSource, &capsCheckedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Model{}, ErrNotFound
 		}
@@ -594,6 +658,10 @@ func scanModel(sc rowScanner) (Model, error) {
 	if checkedAt.Valid {
 		t := checkedAt.Time
 		m.ContextWindowCheckedAt = &t
+	}
+	if capsCheckedAt.Valid {
+		t := capsCheckedAt.Time
+		m.CapabilitiesCheckedAt = &t
 	}
 	return m, nil
 }
@@ -639,4 +707,128 @@ func (s *sqliteStore) LatestSessionModel(ctx context.Context) (string, string, b
 		return "", "", false
 	}
 	return provider, model, true
+}
+
+// SetModelCapabilities records a capability set and where it came from.
+//
+// It refuses to let a weaker source overwrite a stronger one (see
+// ModelCapabilityRank): an operator's decision stands until an operator changes
+// it, and a provider's listing stands over a probe. "Overwrite" here is
+// deliberately conservative — the caller passes the *whole* set it believes, and
+// a refusal leaves the stored one alone.
+func (s *sqliteStore) SetModelCapabilities(ctx context.Context, providerID, modelID string,
+	caps Capabilities, source string) error {
+
+	if strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
+		return errors.New("store: set model capabilities: provider and model are required")
+	}
+	// The guard lives in the WHERE clause rather than in Go so it holds under
+	// concurrent writers (a refresh and a probe can overlap).
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE llm_models
+		SET capabilities = ?, capabilities_source = ?, capabilities_checked_at = CURRENT_TIMESTAMP
+		WHERE provider_id = ? AND model_id = ?
+		  AND (? = 'user' OR capabilities_source <> 'user')`,
+		caps.String(), source, providerID, modelID, source)
+	if err != nil {
+		return fmt.Errorf("store: set model capabilities: %w", err)
+	}
+	if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
+		// Nothing was written: either the row is missing or an operator set this
+		// model's capabilities by hand. Both are "leave it as it is", which is
+		// what the caller does.
+		_ = n
+	}
+	return nil
+}
+
+// MarkModelWindowChecked records that a model was asked about its window and did
+// not give one.
+//
+// It exists so a model that never answers is not asked on every pass — the fill
+// retries it after a while (a model that says nothing today may know tomorrow;
+// a real pair did exactly that), but a refresh loop should not spend a call per
+// model per pass on the same silence.
+func (s *sqliteStore) MarkModelWindowChecked(ctx context.Context, providerID, modelID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE llm_models SET context_window_checked_at = CURRENT_TIMESTAMP
+		WHERE provider_id = ? AND model_id = ? AND context_window <= 0`, providerID, modelID)
+	if err != nil {
+		return fmt.Errorf("store: mark window checked: %w", err)
+	}
+	return nil
+}
+
+// MarkModelCapabilitiesChecked records that a model was asked, whether or not it
+// answered anything. It is separate from SetModelCapabilities because a model
+// that said "I do not know" must not be asked again on every pass, and the fact
+// that it was asked is not a capability.
+func (s *sqliteStore) MarkModelCapabilitiesChecked(ctx context.Context, providerID, modelID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE llm_models SET capabilities_checked_at = CURRENT_TIMESTAMP
+		WHERE provider_id = ? AND model_id = ?`, providerID, modelID)
+	if err != nil {
+		return fmt.Errorf("store: mark capabilities checked: %w", err)
+	}
+	return nil
+}
+
+// SetModelCapabilitiesFromProbe applies a probe's *definite* answers to the
+// stored set, leaving unanswered capabilities exactly as they were.
+//
+// That is the difference between this and SetModelCapabilities: a probe reports a
+// patch (true/false/unknown per capability), and "unknown" must not become
+// "false". A model that answers three of the seven fields is believed about
+// those three and about nothing else.
+func (s *sqliteStore) SetModelCapabilitiesFromProbe(ctx context.Context, providerID, modelID string,
+	answers map[Capability]bool, source string) error {
+
+	m, err := s.GetModel(ctx, providerID, modelID)
+	if err != nil {
+		return err
+	}
+	if !automaticCapabilityWriteAllowed(m.CapabilitiesSource, source) {
+		// An operator has decided what this model can do. A probe does not get to
+		// overrule that; the console says where each set came from, so the
+		// operator can still change their mind by hand.
+		return nil
+	}
+	next := make(Capabilities, 0, len(m.Capabilities)+len(answers))
+	for _, c := range m.Capabilities {
+		if v, answered := answers[c]; answered && !v {
+			continue
+		}
+		next = append(next, c)
+	}
+	for c, v := range answers {
+		if !v || next.Contains(c) {
+			continue
+		}
+		next = append(next, c)
+	}
+	sort.SliceStable(next, func(i, j int) bool {
+		return capabilityOrder(next[i]) < capabilityOrder(next[j])
+	})
+	return s.SetModelCapabilities(ctx, providerID, modelID, next, source)
+}
+
+// Contains reports whether the set has a capability.
+func (c Capabilities) Contains(want Capability) bool {
+	for _, have := range c {
+		if have == want {
+			return true
+		}
+	}
+	return false
+}
+
+// capabilityOrder is the display order of a capability, or a large number for
+// anything unknown to this build.
+func capabilityOrder(c Capability) int {
+	for i, known := range AllCapabilities {
+		if known == c {
+			return i
+		}
+	}
+	return len(AllCapabilities)
 }

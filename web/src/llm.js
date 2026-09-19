@@ -22,11 +22,30 @@
 export const CAPABILITIES = [
   { key: 'chat', label: '对话' },
   { key: 'vision', label: '图像理解' },
+  { key: 'tools', label: '工具调用' },
   { key: 'image_gen', label: '图像生成' },
   { key: 'audio_transcribe', label: '语音转写' },
   { key: 'audio_speech', label: '语音合成' },
   { key: 'embedding', label: '向量嵌入' },
 ]
+
+/**
+ * Where a capability set came from, as the server records it.
+ *
+ * The panel has to say this out loud rather than hedge everything: a value the
+ * provider published and one guessed from a model name deserve different amounts
+ * of trust, and a single "请自行确认" for both trains the reader to ignore it.
+ */
+export const CAPABILITY_SOURCES = {
+  api: '来自 provider 接口',
+  asked: '模型自报',
+  inferred: '按模型名推断',
+  user: '手动设置',
+}
+
+export function capabilitySourceLabel(source) {
+  return CAPABILITY_SOURCES[source] || ''
+}
 
 /**
  * The capabilities that can be bound to a model, and the tools they switch on.
@@ -100,6 +119,7 @@ export function catalogEntry(raw) {
     model,
     displayName: String(raw.display_name || model),
     capabilities: normalizeCapabilities(raw.capabilities),
+    capabilitiesSource: typeof raw.capabilities_source === 'string' ? raw.capabilities_source : '',
     isDefault: Boolean(raw.default),
     // A server that does not report the flag is assumed to have a key, so an
     // older response cannot make every model look unconfigured.
@@ -207,8 +227,10 @@ export function modelOptionHint(entry) {
   const parts = []
   if (entry.displayName !== entry.model) parts.push(entry.model)
   if (entry.capabilities.length) {
+    const source = capabilitySourceLabel(entry.capabilitiesSource)
     parts.push(
-      `能力：${entry.capabilities.map((key) => capabilityLabel(key)).join('、')}（由模型名推断，请自行确认）`,
+      `能力：${entry.capabilities.map((key) => capabilityLabel(key)).join('、')}` +
+        (source ? `（${source}）` : ''),
     )
   }
   if (!entry.hasKey) parts.push('该 provider 未配置 API Key，调用会失败')

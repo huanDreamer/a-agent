@@ -1030,7 +1030,7 @@ func TestProviders_CapabilityVocabularyIsReturned(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if fmt.Sprint(out.Capabilities) != fmt.Sprint([]string{
-		"chat", "vision", "image_gen", "audio_transcribe", "audio_speech", "embedding",
+		"chat", "vision", "tools", "image_gen", "audio_transcribe", "audio_speech", "embedding",
 	}) {
 		t.Errorf("capabilities = %v", out.Capabilities)
 	}

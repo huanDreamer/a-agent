@@ -472,6 +472,24 @@ var migrations = []migration{
 		ALTER TABLE llm_models ADD COLUMN context_window_source TEXT NOT NULL DEFAULT '';
 		ALTER TABLE llm_models ADD COLUMN context_window_checked_at TIMESTAMP;`,
 	},
+	{
+		version: 17,
+		name:    "model_capability_source",
+		// 能力是从哪来的 —— provider 接口说的、模型自己说的、按名字猜的，还是人手点的。
+		//
+		// The set itself already lives in llm_models.capabilities; what was missing
+		// is *provenance*. Two rows can both say "vision" while one is a vendor's
+		// published fact and the other is a substring match on a model name, and
+		// the console has to be able to say which — the difference decides whether
+		// an operator needs to verify it by hand.
+		//
+		// capabilities_checked_at is what stops a probe from being repeated
+		// forever: a model that answered "I do not know" has been asked, and
+		// asking again on every refresh would spend a call per model per pass for
+		// the same nothing.
+		up: `ALTER TABLE llm_models ADD COLUMN capabilities_source TEXT NOT NULL DEFAULT '';
+		ALTER TABLE llm_models ADD COLUMN capabilities_checked_at TIMESTAMP;`,
+	},
 }
 
 // Migrate applies any pending migrations idempotently.
